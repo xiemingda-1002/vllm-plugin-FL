@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 _ASCEND_TRITON_CACHE_EPOCH = "vllm-fl-ascend-v1"
 
 
+def _configure_ascend_hccl() -> None:
+    """Use HCCL's AIV communication expansion mode by default on Ascend.
+
+    AIV is implemented by HCCL rather than by a vLLM-Ascend Python or C++
+    operator.  Selecting it before worker processes are spawned is therefore
+    sufficient for FL's HCCL process groups.  Keep an explicitly supplied
+    value untouched so deployments can opt out for compatibility/debugging.
+    """
+    os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
+
+
 def _configure_ascend_triton_cache() -> None:
     """Keep FL Ascend kernels out of incompatible shared Triton caches.
 
@@ -137,6 +148,7 @@ def register():
         # current vLLM-Ascend implementations. Do not let a parent process or
         # an old launch script reactivate FlagGems globally on NPU.
         os.environ["USE_FLAGGEMS"] = "0"
+        _configure_ascend_hccl()
         _configure_ascend_triton_cache()
 
     _init_vendor_device()

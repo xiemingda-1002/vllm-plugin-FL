@@ -38,6 +38,26 @@ def test_ascend_triton_cache_preserves_explicit_override(monkeypatch):
     assert os.environ["TRITON_CACHE_DIR"] == "/tmp/user-triton-cache"
 
 
+def test_ascend_hccl_preserves_explicit_override(monkeypatch):
+    import vllm_fl
+
+    monkeypatch.setenv("HCCL_OP_EXPANSION_MODE", "AICPU")
+
+    vllm_fl._configure_ascend_hccl()
+
+    assert os.environ["HCCL_OP_EXPANSION_MODE"] == "AICPU"
+
+
+def test_ascend_hccl_defaults_to_aiv(monkeypatch):
+    import vllm_fl
+
+    monkeypatch.delenv("HCCL_OP_EXPANSION_MODE", raising=False)
+
+    vllm_fl._configure_ascend_hccl()
+
+    assert os.environ["HCCL_OP_EXPANSION_MODE"] == "AIV"
+
+
 def test_ascend_platform_hook_installs_hybrid_cache_patch_early(monkeypatch):
     if PlatformFL.device_type != "npu":
         pytest.skip("Ascend-only entrypoint behavior")
