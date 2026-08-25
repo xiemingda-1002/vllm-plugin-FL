@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_dp_group,
     get_pp_group,
     get_tp_group,
     GraphCaptureContext,
@@ -388,6 +389,11 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
+    """Select one concrete graph runtime mode across every DP rank."""
+    return int(tensor[1, :].min().item())
 
 
 def _make_sampler(
@@ -4643,6 +4649,78 @@ class ModelRunnerFL(
             else force_uniform_decode
         )
 
+    def _sync_metadata_across_dp(
+        self,
+        num_tokens: int,
+        is_draft_model: bool = False,
+        cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        force_dp_padding: bool = False,
+    ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
+        """Synchronize Ascend token and graph metadata over the CPU DP group.
+
+        Ascend graph replay and MoE communication require every DP replica to
+        enter the same concrete runtime mode. Read the topology for every call:
+        elastic DP/EP reinitialization mutates ``parallel_config`` in place, so
+        runner-local cached ranks or world sizes would become stale.
+        """
+        dp_size = self.parallel_config.data_parallel_size
+        dp_rank = self.parallel_config.data_parallel_rank
+        if dp_size == 1:
+            return num_tokens, None, cudagraph_mode
+
+        dp_group = get_dp_group()
+        group_world_size = getattr(dp_group, "world_size", dp_size)
+        group_rank = getattr(dp_group, "rank_in_group", dp_rank)
+        if group_world_size != dp_size or group_rank != dp_rank:
+            raise RuntimeError(
+                "DP topology mismatch between parallel_config and the active "
+                f"group: config=({dp_rank}/{dp_size}), "
+                f"group=({group_rank}/{group_world_size})"
+            )
+
+        packed_tensor = torch.zeros(
+            2,
+            dp_size,
+            device="cpu",
+            dtype=torch.int32,
+        )
+        packed_tensor[0, dp_rank] = num_tokens
+        packed_tensor[1, dp_rank] = cudagraph_mode.value
+        torch.distributed.all_reduce(
+            packed_tensor,
+            group=dp_group.cpu_group,
+        )
+
+        num_tokens_across_dp = packed_tensor[0, :]
+        max_tokens_across_dp = int(num_tokens_across_dp.max().item())
+        synced_cudagraph_mode = CUDAGraphMode(
+            _post_process_cudagraph_mode(packed_tensor)
+        )
+        # Every rank must derive this decision from identical state. The
+        # concrete graph mode is only known after the collective; using the
+        # rank-local pre-sync mode makes mixed FULL/NONE steps produce
+        # different vectors on different ranks. ``force_dp_padding`` is
+        # reserved for rank-invariant configuration such as sequence
+        # parallelism.
+        if (
+            synced_cudagraph_mode != CUDAGraphMode.NONE
+            or force_dp_padding
+            or is_draft_model
+        ):
+            num_tokens_after_padding = torch.tensor(
+                [max_tokens_across_dp] * dp_size,
+                device="cpu",
+                dtype=torch.int32,
+            )
+        else:
+            num_tokens_after_padding = num_tokens_across_dp.cpu()
+
+        return (
+            max_tokens_across_dp,
+            num_tokens_after_padding,
+            synced_cudagraph_mode,
+        )
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4716,8 +4794,22 @@ class ModelRunnerFL(
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
+            if current_platform.device_type == "npu":
+                (
+                    _,
+                    num_tokens_across_dp,
+                    synced_cudagraph_mode,
+                ) = self._sync_metadata_across_dp(
+                    num_tokens=num_tokens_padded,
+                    cudagraph_mode=cudagraph_mode,
+                    force_dp_padding=self.compilation_config.pass_config.enable_sp,
+                )
+            else:
+                (
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    synced_cudagraph_mode_value,
+                ) = coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
                     parallel_config=self.parallel_config,
                     allow_microbatching=allow_microbatching,
@@ -4725,7 +4817,9 @@ class ModelRunnerFL(
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
                 )
-            )
+                synced_cudagraph_mode = CUDAGraphMode(
+                    synced_cudagraph_mode_value
+                )
 
             # Extract DP-synced values
             if num_tokens_across_dp is not None:
@@ -4734,7 +4828,7 @@ class ModelRunnerFL(
                 # Re-dispatch with DP padding so we have the correct batch_descriptor
                 cudagraph_mode, batch_descriptor = dispatch_cudagraph(
                     num_tokens_padded,
-                    valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                    valid_modes={synced_cudagraph_mode},
                 )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
@@ -6633,6 +6727,16 @@ class ModelRunnerFL(
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         )
+        num_reqs_for_query_start_loc = num_reqs
+        if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
+            # Match vLLM-Ascend's idle-DP graph contract. This branch receives
+            # a one-request dummy batch and expands only its rank-local request
+            # metadata to the captured shape. The collective's complete DP
+            # vector is already rank-invariant and must remain unchanged.
+            assert len(num_scheduled_tokens) == 1
+            num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
+            assert len(num_scheduled_tokens) == num_reqs_padded
+            num_reqs_for_query_start_loc = num_reqs_padded
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
             num_scheduled_tokens,
@@ -6693,10 +6797,12 @@ class ModelRunnerFL(
                 cum_num_tokens = self._get_cumsum_and_arange(
                     num_scheduled_tokens, self.query_pos.np
                 )
-                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.np[num_reqs + 1 :].fill(
-                    cum_num_tokens[-1]
-                )
+                self.query_start_loc.np[
+                    1 : num_reqs_for_query_start_loc + 1
+                ] = cum_num_tokens
+                self.query_start_loc.np[
+                    num_reqs_for_query_start_loc + 1 :
+                ].fill(cum_num_tokens[-1])
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
                     self.gdn_query_start_loc.np[:] = self.query_start_loc.np[
@@ -6783,13 +6889,20 @@ class ModelRunnerFL(
                     num_tokens_padded, None, False
                 )
 
+            forward_num_tokens_across_dp = num_tokens_across_dp
             if ubatch_slices_padded is not None:
                 # Adjust values to reflect a single ubatch.
                 # TODO(sage,lucas): this is cruft that should be addressed in
                 #  the padding refactor.
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
-                    num_tokens_across_dp[:] = num_tokens_padded
+                    # UBatchWrapper executes each slice under this outer
+                    # forward context. Give the model the per-ubatch DP sizes
+                    # without mutating the collective's full-batch vector.
+                    forward_num_tokens_across_dp = torch.full_like(
+                        num_tokens_across_dp,
+                        num_tokens_padded,
+                    )
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
@@ -6797,7 +6910,7 @@ class ModelRunnerFL(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
+                    num_tokens_across_dp=forward_num_tokens_across_dp,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
@@ -6807,7 +6920,7 @@ class ModelRunnerFL(
                     input_ids=input_ids,
                 ),
             ):
-                outputs = self.model(
+                outputs = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
@@ -6882,20 +6995,25 @@ class ModelRunnerFL(
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(
-            self.device, non_blocking=True
-        )
-        return hidden_states, hidden_states[logit_indices_device]
+        return hidden_states, hidden_states
 
     @managed_inference_mode()
     def _dummy_sampler_run(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Match vLLM-Ascend v0.20.2rc1 profiling semantics: account for the
-        # LM head, but do not execute sampling or speculative rejection. FL's
-        # _dummy_run already passes one terminal hidden state per request.
+        # For profile, have the maximum number of requests collectively use
+        # the maximum number of tokens. Select each request's terminal state
+        # here so _dummy_run does not allocate an NPU index tensor per replay.
+        min_tokens_per_req = self.max_num_tokens // self.max_num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * self.max_num_reqs
+        num_scheduled_tokens_list[-1] += self.max_num_tokens % self.max_num_reqs
+        num_scheduled_tokens = np.array(
+            num_scheduled_tokens_list,
+            dtype=np.int32,
+        )
+        logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        hidden_states = hidden_states[logit_indices]
         return self.model.compute_logits(hidden_states)
 
     def _dummy_pooler_run_task(

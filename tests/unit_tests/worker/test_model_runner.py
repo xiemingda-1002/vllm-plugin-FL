@@ -11,6 +11,7 @@ This module follows a layered testing strategy:
 Note: These tests require vllm >= 0.13.0 with full installation.
 """
 
+import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+
 from vllm.config import CUDAGraphMode
 
 # =============================================================================
@@ -143,36 +145,248 @@ class TestAscendSamplerSelection:
                 enable_global_stream_random_sample=True,
             )
         else:
-            selected.assert_called_once_with(
-                logprobs_mode="processed_logprobs"
-            )
+            selected.assert_called_once_with(logprobs_mode="processed_logprobs")
         rejected.assert_not_called()
 
 
 class TestProfileDummySampler:
-    def test_only_profiles_logits_without_sampling(self):
+    def test_selects_terminal_states_then_profiles_logits_without_sampling(self):
         import vllm_fl.worker.model_runner as model_runner
 
         runner = object.__new__(model_runner.ModelRunnerFL)
-        hidden_states = torch.zeros((64, 32))
-        logits = torch.randn((64, 128))
+        runner.max_num_tokens = 10
+        runner.max_num_reqs = 4
+        hidden_states = torch.arange(30, dtype=torch.float32).reshape(10, 3)
+        logits = torch.randn((4, 128))
         compute_logits = MagicMock(return_value=logits)
         runner.model = SimpleNamespace(compute_logits=compute_logits)
         runner.sampler = MagicMock(
             side_effect=AssertionError("profile must not execute sampler")
         )
         runner.rejection_sampler = MagicMock(
-            side_effect=AssertionError(
-                "profile must not execute speculative rejection"
-            )
+            side_effect=AssertionError("profile must not execute speculative rejection")
         )
 
         result = runner._dummy_sampler_run(hidden_states)
 
         assert result is logits
-        compute_logits.assert_called_once_with(hidden_states)
+        # max_num_tokens=10 is split as [2, 2, 2, 4], so the sampler must
+        # select the terminal state for each request at [1, 3, 5, 9].
+        torch.testing.assert_close(
+            compute_logits.call_args.args[0], hidden_states[[1, 3, 5, 9]]
+        )
         runner.sampler.assert_not_called()
         runner.rejection_sampler.assert_not_called()
+
+    @pytest.mark.parametrize("dp_size", [1, 2, 3, 4, 8])
+    def test_idle_dummy_propagates_graph_padding_metadata(
+        self,
+        monkeypatch,
+        dp_size,
+    ):
+        import vllm_fl.worker.model_runner as model_runner
+
+        class PaddingObserved(Exception):
+            pass
+
+        runner = object.__new__(model_runner.ModelRunnerFL)
+        runner.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(multimodal_config=None),
+            parallel_config=SimpleNamespace(num_ubatches=1),
+        )
+        runner.max_num_tokens = 8
+        runner.scheduler_config = SimpleNamespace(max_num_seqs=8)
+        runner.uniform_decode_query_len = 1
+
+        tokens_across_dp = torch.ones(dp_size, dtype=torch.int32)
+        runner._determine_batch_execution_and_padding = MagicMock(
+            return_value=(
+                CUDAGraphMode.FULL,
+                SimpleNamespace(num_tokens=4, num_reqs=4),
+                False,
+                tokens_across_dp,
+                None,
+            )
+        )
+
+        observed = {}
+
+        def observe_padding(
+            should_ubatch,
+            num_scheduled_tokens,
+            num_tokens_padded,
+            num_reqs_padded,
+            num_ubatches,
+        ):
+            observed["should_ubatch"] = should_ubatch
+            observed["num_scheduled_tokens"] = num_scheduled_tokens.copy()
+            observed["num_tokens_padded"] = num_tokens_padded
+            observed["num_reqs_padded"] = num_reqs_padded
+            observed["num_ubatches"] = num_ubatches
+            raise PaddingObserved
+
+        monkeypatch.setattr(
+            model_runner,
+            "maybe_create_ubatch_slices",
+            observe_padding,
+        )
+
+        with pytest.raises(PaddingObserved):
+            runner._dummy_run(
+                num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                uniform_decode=True,
+            )
+
+        # The matching Ascend contract reaches this branch for the one-request
+        # idle dummy. Graph padding expands it to one token per padded request.
+        assert observed["num_scheduled_tokens"].tolist() == [1, 1, 1, 1]
+        assert observed["num_reqs_padded"] == 4
+        # The dummy rank may pad its own scheduled-request metadata, but must
+        # not overwrite the complete vector produced by the DP collective.
+        assert tokens_across_dp.tolist() == [1] * dp_size
+
+    def test_dummy_run_returns_full_hidden_states_without_device_index_tensor(self):
+        import vllm_fl.worker.model_runner as model_runner
+
+        source = inspect.getsource(model_runner.ModelRunnerFL._dummy_run)
+
+        assert "logit_indices_device" not in source
+        assert "return hidden_states, hidden_states" in source
+
+    def test_dummy_run_never_mutates_complete_dp_token_vector(self):
+        import vllm_fl.worker.model_runner as model_runner
+
+        source = inspect.getsource(model_runner.ModelRunnerFL._dummy_run)
+
+        assert "num_tokens_across_dp[:]" not in source
+
+    @staticmethod
+    def _run_dummy_ubatch_forward_context_case(
+        monkeypatch,
+        *,
+        device_type,
+        should_ubatch,
+    ):
+        import vllm_fl.worker.model_runner as model_runner
+
+        runner = object.__new__(model_runner.ModelRunnerFL)
+        runner.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(multimodal_config=None),
+            parallel_config=SimpleNamespace(num_ubatches=2),
+        )
+        runner.max_num_tokens = 8
+        runner.scheduler_config = SimpleNamespace(max_num_seqs=8)
+        runner.uniform_decode_query_len = 1
+        runner.lora_config = None
+        runner.supports_mm_inputs = False
+        runner.enable_prompt_embeds = False
+        runner.uses_mrope = False
+        runner.uses_xdrope_dim = 0
+        runner.input_ids = SimpleNamespace(gpu=torch.arange(8))
+        runner.positions = torch.arange(8)
+        runner.model = object()
+        runner.use_aux_hidden_state_outputs = False
+        runner.speculative_config = None
+
+        original_dp_tokens = torch.tensor([8, 8], dtype=torch.int32)
+        runner._determine_batch_execution_and_padding = MagicMock(
+            return_value=(
+                CUDAGraphMode.NONE,
+                SimpleNamespace(num_tokens=8, num_reqs=8),
+                should_ubatch,
+                original_dp_tokens,
+                None,
+            )
+        )
+        ubatch_slices = (
+            [SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=4)]
+            if should_ubatch
+            else None
+        )
+        monkeypatch.setattr(
+            model_runner,
+            "maybe_create_ubatch_slices",
+            MagicMock(return_value=(ubatch_slices, ubatch_slices)),
+        )
+        monkeypatch.setattr(
+            model_runner,
+            "current_platform",
+            SimpleNamespace(device_type=device_type),
+        )
+        monkeypatch.setattr(
+            model_runner,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=True),
+        )
+        forward_context = MagicMock(side_effect=lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr(
+            model_runner,
+            "_set_model_forward_context",
+            forward_context,
+        )
+
+        runner._get_slot_mappings = MagicMock(return_value=(None, None))
+        runner.synchronize_input_prep = MagicMock(return_value=nullcontext())
+        runner.maybe_dummy_run_with_lora = MagicMock(return_value=nullcontext())
+        runner._init_model_kwargs = MagicMock(return_value={})
+        runner.maybe_randomize_inputs = MagicMock(return_value=nullcontext())
+        runner._model_forward = MagicMock(return_value=torch.zeros((8, 4)))
+        runner._register_layerwise_nvtx_hooks = MagicMock()
+
+        runner._dummy_run(
+            num_tokens=8,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            uniform_decode=True,
+            skip_eplb=True,
+        )
+
+        return original_dp_tokens, ubatch_slices, forward_context.call_args.kwargs
+
+    def test_non_npu_ubatch_derives_forward_dp_vector_without_mutation(
+        self,
+        monkeypatch,
+    ):
+        original, ubatch_slices, context_kwargs = (
+            self._run_dummy_ubatch_forward_context_case(
+                monkeypatch,
+                device_type="cuda",
+                should_ubatch=True,
+            )
+        )
+
+        forwarded = context_kwargs["num_tokens_across_dp"]
+        assert context_kwargs["num_tokens"] == 4
+        assert forwarded.tolist() == [4, 4]
+        assert forwarded is not original
+        assert original.tolist() == [8, 8]
+        assert context_kwargs["ubatch_slices"] is ubatch_slices
+        assert [slice_.num_tokens for slice_ in ubatch_slices] == [4, 4]
+
+    def test_npu_without_ubatching_reuses_original_dp_vector(
+        self,
+        monkeypatch,
+    ):
+        original, ubatch_slices, context_kwargs = (
+            self._run_dummy_ubatch_forward_context_case(
+                monkeypatch,
+                device_type="npu",
+                should_ubatch=False,
+            )
+        )
+
+        assert ubatch_slices is None
+        assert context_kwargs["num_tokens_across_dp"] is original
+        assert original.tolist() == [8, 8]
+        assert context_kwargs["ubatch_slices"] is None
+
+    def test_dummy_model_invocation_uses_forward_lifecycle_helper(self):
+        import vllm_fl.worker.model_runner as model_runner
+
+        source = inspect.getsource(model_runner.ModelRunnerFL._dummy_run)
+
+        assert "outputs = self._model_forward(" in source
+        assert "outputs = self.model(" not in source
 
 
 class TestGlobalStreamRandomSample:
@@ -382,13 +596,9 @@ class TestHybridSamplingStreamReturnEdge:
         event.record.side_effect = lambda: calls.append("record")
         sampling_stream = MagicMock()
         sampling_stream.wait_event.side_effect = lambda value: (
-            calls.append("wait")
-            if value is event
-            else calls.append("wrong_event")
+            calls.append("wait") if value is event else calls.append("wrong_event")
         )
-        event_factory = MagicMock(
-            side_effect=lambda: calls.append("create") or event
-        )
+        event_factory = MagicMock(side_effect=lambda: calls.append("create") or event)
         stream_context = MagicMock(return_value=nullcontext())
         monkeypatch.setattr(model_runner.torch.npu, "Event", event_factory)
         monkeypatch.setattr(model_runner.torch.npu, "stream", stream_context)
@@ -396,8 +606,7 @@ class TestHybridSamplingStreamReturnEdge:
             model_runner,
             "_global_random_sample_stream",
             MagicMock(
-                side_effect=lambda: calls.append("get_stream")
-                or sampling_stream
+                side_effect=lambda: calls.append("get_stream") or sampling_stream
             ),
         )
         monkeypatch.setattr(
@@ -570,9 +779,7 @@ class TestCompactDiscardIndices:
         ModelRunnerFL._record_discarded_requests(runner, mask, num_reqs=4)
 
         assert runner.num_discarded_requests == 4
-        np.testing.assert_array_equal(
-            runner.discard_request_mask.np[:4], mask
-        )
+        np.testing.assert_array_equal(runner.discard_request_mask.np[:4], mask)
         runner.discard_request_mask.copy_to_gpu.assert_called_once_with(4)
         runner.discard_request_indices.copy_to_gpu.assert_not_called()
         assert ModelRunnerFL._is_all_reqs_chunked_prefill(runner)
@@ -745,9 +952,7 @@ class TestInt32SlotMappingSource:
                 gpu=torch.zeros(size, dtype=torch.int64),
             )
             block_tables.append(SimpleNamespace(slot_mapping=slot_mapping))
-        return SimpleNamespace(
-            block_table=_BlockTableGroups(block_tables)
-        )
+        return SimpleNamespace(block_table=_BlockTableGroups(block_tables))
 
     def test_replaces_all_groups_once_with_independent_int32_buffers(self):
         import vllm_fl.worker.model_runner as model_runner
@@ -760,10 +965,7 @@ class TestInt32SlotMappingSource:
             pin_memory=False,
         )
 
-        buffers = [
-            table.slot_mapping
-            for table in input_batch.block_table.block_tables
-        ]
+        buffers = [table.slot_mapping for table in input_batch.block_table.block_tables]
         object_ids = [id(buffer) for buffer in buffers]
         gpu_addresses = [buffer.gpu.data_ptr() for buffer in buffers]
         assert len(set(gpu_addresses)) == 4
@@ -781,8 +983,7 @@ class TestInt32SlotMappingSource:
             pin_memory=False,
         )
         assert [
-            id(table.slot_mapping)
-            for table in input_batch.block_table.block_tables
+            id(table.slot_mapping) for table in input_batch.block_table.block_tables
         ] == object_ids
         assert [
             table.slot_mapping.gpu.data_ptr()
@@ -828,8 +1029,7 @@ class TestInt32SlotMappingSource:
                 num_tokens_unpadded=6,
             )
             first_addresses = {
-                gid: mapping.data_ptr()
-                for gid, mapping in first_by_group.items()
+                gid: mapping.data_ptr() for gid, mapping in first_by_group.items()
             }
             for gid, table in enumerate(input_batch.block_table.block_tables):
                 table.slot_mapping.gpu[:8].copy_(
@@ -889,9 +1089,7 @@ class TestInt32SlotMappingSource:
         )
         kv_cache_config = SimpleNamespace(
             kv_cache_groups=[
-                SimpleNamespace(
-                    kv_cache_spec=SimpleNamespace(block_size=32)
-                )
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32))
             ]
         )
         rebuilt_batch = self._int64_input_batch(num_groups=1)
@@ -1058,9 +1256,11 @@ class TestAsyncExponential:
 
         runner = self._runner()
 
-        with pytest.raises(RuntimeError, match="forward failed"):
-            with ModelRunnerFL._discard_async_exponential_on_error(runner):
-                raise RuntimeError("forward failed")
+        with (
+            pytest.raises(RuntimeError, match="forward failed"),
+            ModelRunnerFL._discard_async_exponential_on_error(runner),
+        ):
+            raise RuntimeError("forward failed")
 
         runner.sampler.discard_async_exponential.assert_called_once_with()
 
@@ -1082,9 +1282,11 @@ class TestAsyncExponential:
             "cleanup failed"
         )
 
-        with pytest.raises(RuntimeError, match="compute logits failed"):
-            with ModelRunnerFL._discard_async_exponential_on_error(runner):
-                raise RuntimeError("compute logits failed")
+        with (
+            pytest.raises(RuntimeError, match="compute logits failed"),
+            ModelRunnerFL._discard_async_exponential_on_error(runner),
+        ):
+            raise RuntimeError("compute logits failed")
 
 
 class _QueryStartLocBuffer:
@@ -1102,7 +1304,7 @@ class TestAscendFIAQueryStartLoc:
         runner = object.__new__(ModelRunnerFL)
         runner.max_num_reqs = max_num_reqs
         runner.query_start_loc = _QueryStartLocBuffer(max_num_reqs + 2)
-        runner.query_start_loc.np[:len(values)] = values
+        runner.query_start_loc.np[: len(values)] = values
         runner.arange_np = np.arange(max_num_reqs + 2, dtype=np.int32)
         runner.uniform_decode_query_len = 1
         runner.compilation_config = SimpleNamespace(
@@ -1151,15 +1353,9 @@ class TestAscendFIAQueryStartLoc:
             _should_pad_fia_query_start_loc,
         )
 
-        assert not _should_pad_fia_query_start_loc(
-            "npu", CUDAGraphMode.NONE
-        )
-        assert not _should_pad_fia_query_start_loc(
-            "cuda", CUDAGraphMode.FULL
-        )
-        assert _should_pad_fia_query_start_loc(
-            "npu", CUDAGraphMode.FULL
-        )
+        assert not _should_pad_fia_query_start_loc("npu", CUDAGraphMode.NONE)
+        assert not _should_pad_fia_query_start_loc("cuda", CUDAGraphMode.FULL)
+        assert _should_pad_fia_query_start_loc("npu", CUDAGraphMode.FULL)
 
     def test_gdn_builder_receives_unpadded_query_boundaries(
         self,
@@ -1235,9 +1431,9 @@ class TestPrecisionDumpHelpers:
 
         layer_names = ["model.layers.1.gdn", "model.layers.10.gdn"]
 
-        assert _select_precision_dump_layers(
-            layer_names, ["=model.layers.1.gdn"]
-        ) == [layer_names[0]]
+        assert _select_precision_dump_layers(layer_names, ["=model.layers.1.gdn"]) == [
+            layer_names[0]
+        ]
 
     def test_precision_dump_cpu_recurses_and_detaches(self):
         from vllm_fl.worker.model_runner import _precision_dump_cpu
@@ -1358,7 +1554,6 @@ class TestGetCumsumAndArange:
         expected_arange = np.array([0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
         np.testing.assert_array_equal(arange_out, expected_arange)
 
-
     def test_single_sequence(self, mock_model_runner):
         """Test with single sequence (common in generation phase)."""
         num_tokens = np.array([5])
@@ -1419,11 +1614,7 @@ class TestAscendSlotMappingBuffers:
                 ]
             ),
             input_batch=SimpleNamespace(
-                block_table=[
-                    SimpleNamespace(
-                        slot_mapping=SimpleNamespace(gpu=source)
-                    )
-                ]
+                block_table=[SimpleNamespace(slot_mapping=SimpleNamespace(gpu=source))]
             ),
             device=torch.device("cpu"),
         )
@@ -1643,13 +1834,8 @@ class TestAscendHybridKVCacheLayout:
         assert conv_state.data_ptr() == raw_ptr
         assert ssm_state.data_ptr() == raw_ptr + conv_bytes
         assert attn_cache[0].data_ptr() == raw_ptr + conv_bytes
-        assert attn_cache[1].data_ptr() == (
-            raw_ptr + conv_bytes + state_or_k_bytes
-        )
-        assert (
-            attn_cache[1].data_ptr() + state_or_k_bytes
-            == raw_ptr + raw.nbytes
-        )
+        assert attn_cache[1].data_ptr() == (raw_ptr + conv_bytes + state_or_k_bytes)
+        assert attn_cache[1].data_ptr() + state_or_k_bytes == raw_ptr + raw.nbytes
         assert (
             conv_state.untyped_storage().data_ptr()
             == ssm_state.untyped_storage().data_ptr()
@@ -1663,6 +1849,7 @@ class TestAscendHybridKVCacheLayout:
             KVCacheGroupSpec,
             UniformTypeKVCacheSpecs,
         )
+
         from vllm_fl.worker.model_runner import ModelRunnerFL
 
         config, attn_spec, _ = self._qwen_tp2_config()
@@ -1857,6 +2044,313 @@ class TestPadForSequenceParallelism:
         assert result % tp_size == 0  # Must be divisible
 
 
+class TestAscendDPMetadataSynchronization:
+    """Regression coverage for Ascend's CPU DP metadata protocol."""
+
+    @staticmethod
+    def _make_runner(model_runner, dp_size, dp_rank):
+        runner = object.__new__(model_runner.ModelRunnerFL)
+        runner.parallel_config = SimpleNamespace(
+            data_parallel_size=dp_size,
+            data_parallel_rank=dp_rank,
+        )
+        runner.vllm_config = SimpleNamespace(
+            parallel_config=runner.parallel_config,
+        )
+        return runner
+
+    @staticmethod
+    def _modes_for_scenario(dp_size, scenario):
+        if scenario == "all-full":
+            return [CUDAGraphMode.FULL] * dp_size
+        if scenario == "all-none":
+            return [CUDAGraphMode.NONE] * dp_size
+        if scenario == "full-then-none":
+            return [CUDAGraphMode.FULL] * max(dp_size - 1, 0) + [CUDAGraphMode.NONE]
+        assert scenario == "alternating-full-none"
+        return [
+            CUDAGraphMode.FULL if rank % 2 == 0 else CUDAGraphMode.NONE
+            for rank in range(dp_size)
+        ]
+
+    @pytest.mark.parametrize(
+        ("dp_size", "dp_rank"),
+        [(size, rank) for size in (1, 2, 3, 4, 8) for rank in range(size)],
+    )
+    @pytest.mark.parametrize(
+        "mode_scenario",
+        ["all-full", "full-then-none", "alternating-full-none", "all-none"],
+    )
+    @pytest.mark.parametrize(
+        "padding_force",
+        ["none", "sequence-parallel", "draft-model"],
+    )
+    def test_metadata_matrix_is_rank_invariant(
+        self,
+        monkeypatch,
+        dp_size,
+        dp_rank,
+        mode_scenario,
+        padding_force,
+    ):
+        """Every rank derives the same vector from the same packed metadata."""
+        import vllm_fl.worker.model_runner as model_runner
+
+        runner = self._make_runner(model_runner, dp_size, dp_rank)
+        tokens_by_rank = [1 if rank % 2 == 0 else rank + 4 for rank in range(dp_size)]
+        modes_by_rank = self._modes_for_scenario(dp_size, mode_scenario)
+        cpu_group = object()
+        monkeypatch.setattr(
+            model_runner,
+            "get_dp_group",
+            lambda: SimpleNamespace(
+                cpu_group=cpu_group,
+                world_size=dp_size,
+                rank_in_group=dp_rank,
+            ),
+            raising=False,
+        )
+
+        all_reduce_calls = []
+
+        def fake_all_reduce(packed_tensor, *, group):
+            assert group is cpu_group
+            assert packed_tensor.device.type == "cpu"
+            assert packed_tensor.dtype == torch.int32
+            assert tuple(packed_tensor.shape) == (2, dp_size)
+            assert int(packed_tensor[0, dp_rank]) == tokens_by_rank[dp_rank]
+            assert int(packed_tensor[1, dp_rank]) == modes_by_rank[dp_rank].value
+            packed_tensor[0].copy_(torch.tensor(tokens_by_rank, dtype=torch.int32))
+            packed_tensor[1].copy_(
+                torch.tensor(
+                    [mode.value for mode in modes_by_rank],
+                    dtype=torch.int32,
+                )
+            )
+            all_reduce_calls.append(True)
+
+        monkeypatch.setattr(
+            model_runner.torch.distributed, "all_reduce", fake_all_reduce
+        )
+
+        force_dp_padding = padding_force == "sequence-parallel"
+        is_draft_model = padding_force == "draft-model"
+        max_tokens, token_vector, synced_mode = runner._sync_metadata_across_dp(
+            num_tokens=tokens_by_rank[dp_rank],
+            cudagraph_mode=modes_by_rank[dp_rank],
+            force_dp_padding=force_dp_padding,
+            is_draft_model=is_draft_model,
+        )
+
+        assert max_tokens == max(tokens_by_rank)
+        if dp_size == 1:
+            assert synced_mode is modes_by_rank[0]
+            assert token_vector is None
+            assert not all_reduce_calls
+            return
+
+        expected_mode = CUDAGraphMode(min(mode.value for mode in modes_by_rank))
+        should_pad = (
+            expected_mode != CUDAGraphMode.NONE or force_dp_padding or is_draft_model
+        )
+        expected_vector = (
+            [max(tokens_by_rank)] * dp_size if should_pad else tokens_by_rank
+        )
+        assert synced_mode is expected_mode
+        assert token_vector.tolist() == expected_vector
+        assert all_reduce_calls == [True]
+
+    @pytest.mark.parametrize(
+        ("dp_size", "dp_rank"),
+        [(size, rank) for size in (2, 3, 4, 8) for rank in range(size)],
+    )
+    @pytest.mark.parametrize("mismatch", ["world-size", "rank"])
+    def test_rejects_active_dp_group_topology_mismatch(
+        self,
+        monkeypatch,
+        dp_size,
+        dp_rank,
+        mismatch,
+    ):
+        import vllm_fl.worker.model_runner as model_runner
+
+        runner = self._make_runner(model_runner, dp_size, dp_rank)
+        group_world_size = dp_size + 1 if mismatch == "world-size" else dp_size
+        group_rank = (dp_rank + 1) % dp_size if mismatch == "rank" else dp_rank
+        monkeypatch.setattr(
+            model_runner,
+            "get_dp_group",
+            lambda: SimpleNamespace(
+                cpu_group=object(),
+                world_size=group_world_size,
+                rank_in_group=group_rank,
+            ),
+            raising=False,
+        )
+        all_reduce = MagicMock()
+        monkeypatch.setattr(model_runner.torch.distributed, "all_reduce", all_reduce)
+
+        with pytest.raises(RuntimeError, match="DP topology mismatch"):
+            runner._sync_metadata_across_dp(
+                num_tokens=dp_rank + 1,
+                cudagraph_mode=CUDAGraphMode.NONE,
+            )
+
+        all_reduce.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("dp_size", "dp_rank"),
+        [(size, rank) for size in (2, 3, 4, 8) for rank in range(size)],
+    )
+    @pytest.mark.parametrize(
+        "mode_scenario",
+        ["all-full", "full-then-none", "alternating-full-none", "all-none"],
+    )
+    @pytest.mark.parametrize("enable_sp", [False, True])
+    def test_determine_redispatches_synced_mode_on_every_dp_rank(
+        self,
+        monkeypatch,
+        dp_size,
+        dp_rank,
+        mode_scenario,
+        enable_sp,
+    ):
+        import vllm_fl.worker.model_runner as model_runner
+
+        runner = self._make_runner(model_runner, dp_size, dp_rank)
+        runner.parallel_config.tensor_parallel_size = 2
+        runner.uniform_decode_query_len = 1
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner.input_batch = SimpleNamespace(lora_id_to_lora_request={})
+        runner.compilation_config = SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=enable_sp)
+        )
+        runner.vllm_config.observability_config = SimpleNamespace(
+            cudagraph_metrics=False
+        )
+        runner._pad_for_sequence_parallelism = MagicMock(return_value=8)
+
+        modes_by_rank = self._modes_for_scenario(dp_size, mode_scenario)
+        local_mode = modes_by_rank[dp_rank]
+        synced_mode = CUDAGraphMode(min(mode.value for mode in modes_by_rank))
+        raw_tokens = [8 + rank for rank in range(dp_size)]
+        should_pad = synced_mode != CUDAGraphMode.NONE or enable_sp
+        synced_tokens = torch.tensor(
+            [max(raw_tokens)] * dp_size if should_pad else raw_tokens,
+            dtype=torch.int32,
+        )
+        first_descriptor = model_runner.BatchDescriptor(num_tokens=8)
+        synced_descriptor = model_runner.BatchDescriptor(
+            num_tokens=int(synced_tokens[dp_rank].item())
+        )
+        runner.cudagraph_dispatcher = SimpleNamespace(
+            dispatch=MagicMock(
+                side_effect=[
+                    (local_mode, first_descriptor),
+                    (synced_mode, synced_descriptor),
+                ]
+            )
+        )
+        runner._sync_metadata_across_dp = MagicMock(
+            return_value=(max(raw_tokens), synced_tokens, synced_mode)
+        )
+
+        monkeypatch.setattr(
+            model_runner,
+            "current_platform",
+            SimpleNamespace(device_type="npu"),
+        )
+        upstream_coordinate = MagicMock()
+        monkeypatch.setattr(
+            model_runner,
+            "coordinate_batch_across_dp",
+            upstream_coordinate,
+        )
+
+        mode, descriptor, should_ubatch, tokens_across_dp, _ = (
+            runner._determine_batch_execution_and_padding(
+                num_tokens=5,
+                num_reqs=5,
+                num_scheduled_tokens_np=np.ones(5, dtype=np.int32),
+                max_num_scheduled_tokens=1,
+                use_cascade_attn=False,
+            )
+        )
+
+        # The helper receives the first dispatch's padded count, but its force
+        # flag is rank-invariant and never derived from ``local_mode``.
+        runner._sync_metadata_across_dp.assert_called_once_with(
+            num_tokens=8,
+            cudagraph_mode=local_mode,
+            force_dp_padding=enable_sp,
+        )
+        upstream_coordinate.assert_not_called()
+        assert runner.cudagraph_dispatcher.dispatch.call_args_list[1].kwargs[
+            "valid_modes"
+        ] == {synced_mode}
+        assert mode is synced_mode
+        assert descriptor is synced_descriptor
+        assert should_ubatch is False
+        assert tokens_across_dp is synced_tokens
+
+    def test_non_npu_determine_keeps_upstream_dp_coordination(
+        self,
+        monkeypatch,
+    ):
+        import vllm_fl.worker.model_runner as model_runner
+
+        runner = self._make_runner(model_runner, dp_size=2, dp_rank=1)
+        runner.parallel_config.tensor_parallel_size = 1
+        runner.parallel_config.num_ubatches = 1
+        runner.uniform_decode_query_len = 1
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner.input_batch = SimpleNamespace(lora_id_to_lora_request={})
+        runner.compilation_config = SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        )
+        runner.vllm_config.observability_config = SimpleNamespace(
+            cudagraph_metrics=False
+        )
+        runner._pad_for_sequence_parallelism = MagicMock(return_value=3)
+        descriptor = model_runner.BatchDescriptor(num_tokens=3)
+        runner.cudagraph_dispatcher = SimpleNamespace(
+            dispatch=MagicMock(return_value=(CUDAGraphMode.NONE, descriptor))
+        )
+        runner._sync_metadata_across_dp = MagicMock()
+        upstream_coordinate = MagicMock(
+            return_value=(False, torch.tensor([2, 3]), CUDAGraphMode.NONE.value)
+        )
+
+        monkeypatch.setattr(
+            model_runner,
+            "current_platform",
+            SimpleNamespace(device_type="cuda"),
+        )
+        monkeypatch.setattr(
+            model_runner,
+            "coordinate_batch_across_dp",
+            upstream_coordinate,
+        )
+
+        runner._determine_batch_execution_and_padding(
+            num_tokens=3,
+            num_reqs=3,
+            num_scheduled_tokens_np=np.ones(3, dtype=np.int32),
+            max_num_scheduled_tokens=1,
+            use_cascade_attn=False,
+        )
+
+        runner._sync_metadata_across_dp.assert_not_called()
+        upstream_coordinate.assert_called_once_with(
+            num_tokens_unpadded=3,
+            parallel_config=runner.parallel_config,
+            allow_microbatching=True,
+            num_tokens_padded=3,
+            uniform_decode=True,
+            cudagraph_mode=CUDAGraphMode.NONE.value,
+        )
+
+
 # =============================================================================
 # Layer 2: _get_positions Routing Tests
 # =============================================================================
@@ -1928,6 +2422,7 @@ class TestAscendGraphParamUpdate:
     def test_mrope_uses_padded_batch_size_for_graph_task_update(self):
         """MRoPE's leading dimension is 3, not the graph token count."""
         from vllm.config import CUDAGraphMode
+
         from vllm_fl.worker.model_runner import ModelRunnerFL
 
         runner = MagicMock(spec=ModelRunnerFL)
@@ -1966,3 +2461,66 @@ class TestAscendGraphParamUpdate:
             4,
             runner.vllm_config,
         )
+
+    @pytest.mark.parametrize(
+        ("runtime_mode", "capturing", "expected_updates"),
+        [
+            pytest.param(CUDAGraphMode.FULL, False, 1, id="full-replay"),
+            pytest.param(CUDAGraphMode.FULL, True, 0, id="full-capture"),
+            pytest.param(CUDAGraphMode.NONE, False, 0, id="eager"),
+        ],
+    )
+    def test_forward_lifecycle_updates_only_after_full_replay(
+        self,
+        runtime_mode,
+        capturing,
+        expected_updates,
+    ):
+        from vllm_fl.worker.model_runner import ModelRunnerFL
+
+        model_output = object()
+        runner = MagicMock(spec=ModelRunnerFL)
+        runner.model = MagicMock(return_value=model_output)
+        runner.update_stream = MagicMock()
+        runner.vllm_config = MagicMock()
+        runner._model_forward = ModelRunnerFL._model_forward.__get__(
+            runner, ModelRunnerFL
+        )
+
+        forward_context = SimpleNamespace(
+            cudagraph_runtime_mode=runtime_mode,
+            capturing=capturing,
+            batch_descriptor=SimpleNamespace(num_tokens=4),
+        )
+        positions = torch.zeros((1,), dtype=torch.int64)
+
+        with (
+            patch(
+                "vllm_fl.worker.model_runner.current_platform",
+                SimpleNamespace(device_type="npu"),
+            ),
+            patch(
+                "vllm_fl.worker.model_runner.get_forward_context",
+                return_value=forward_context,
+            ),
+            patch(
+                "vllm_fl.worker.model_runner.update_ascend_full_graph_params"
+            ) as update_graph_params,
+        ):
+            result = runner._model_forward(positions=positions)
+
+        assert result is model_output
+        runner.model.assert_called_once_with(
+            input_ids=None,
+            positions=positions,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+        )
+        assert update_graph_params.call_count == expected_updates
+        if expected_updates:
+            update_graph_params.assert_called_once_with(
+                runner.update_stream,
+                forward_context,
+                4,
+                runner.vllm_config,
+            )
