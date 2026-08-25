@@ -6,6 +6,9 @@ Tests for worker module.
 Note: These tests require vllm >= 0.13.0 with profiler support.
 """
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 
@@ -24,6 +27,54 @@ pytestmark = pytest.mark.skipif(
     not has_vllm_profiler(),
     reason="vllm.profiler.wrapper not available (requires vllm >= 0.13.0)",
 )
+
+
+class TestAscendCpuBindingSwitch:
+    @patch("vllm_fl.cpu_binding.bind_cpus")
+    @patch("vllm_fl.worker.worker.current_platform")
+    def test_cpu_binding_defaults_to_enabled_on_npu(
+        self, mock_platform, mock_bind_cpus
+    ):
+        from vllm_fl.worker.worker import _maybe_bind_ascend_cpus
+
+        mock_platform.device_type = "npu"
+        _maybe_bind_ascend_cpus(SimpleNamespace(additional_config={}), 1)
+
+        mock_bind_cpus.assert_called_once_with(1)
+
+    @patch("vllm_fl.cpu_binding.bind_cpus")
+    @patch("vllm_fl.worker.worker.current_platform")
+    def test_cpu_binding_honors_explicit_disable(self, mock_platform, mock_bind_cpus):
+        from vllm_fl.worker.worker import _maybe_bind_ascend_cpus
+
+        mock_platform.device_type = "npu"
+        config = SimpleNamespace(additional_config={"enable_cpu_binding": False})
+        _maybe_bind_ascend_cpus(config, 0)
+
+        mock_bind_cpus.assert_not_called()
+
+    @patch("vllm_fl.cpu_binding.bind_cpus")
+    @patch("vllm_fl.worker.worker.current_platform")
+    def test_cpu_binding_is_ascend_only(self, mock_platform, mock_bind_cpus):
+        from vllm_fl.worker.worker import _maybe_bind_ascend_cpus
+
+        mock_platform.device_type = "cuda"
+        _maybe_bind_ascend_cpus(SimpleNamespace(additional_config={}), 0)
+
+        mock_bind_cpus.assert_not_called()
+
+    @patch("vllm_fl.cpu_binding.bind_cpus", side_effect=RuntimeError("topology"))
+    @patch("vllm_fl.worker.worker.current_platform")
+    def test_cpu_binding_failure_is_non_fatal(
+        self, mock_platform, mock_bind_cpus, caplog
+    ):
+        from vllm_fl.worker.worker import _maybe_bind_ascend_cpus
+
+        mock_platform.device_type = "npu"
+        _maybe_bind_ascend_cpus(SimpleNamespace(additional_config={}), 0)
+
+        mock_bind_cpus.assert_called_once_with(0)
+        assert "Skipping CPU binding" in caplog.text
 
 
 class TestMemorySnapshot:

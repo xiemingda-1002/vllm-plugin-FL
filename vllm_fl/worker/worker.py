@@ -202,6 +202,26 @@ def memory_profiling_fl(
     )
 
 
+def _maybe_bind_ascend_cpus(vllm_config: VllmConfig, local_rank: int) -> None:
+    """Apply optional Ascend-native CPU placement after worker warmup."""
+
+    additional_config = vllm_config.additional_config or {}
+    enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
+    if current_platform.device_type != "npu" or not enable_cpu_binding:
+        return
+
+    try:
+        from vllm_fl.cpu_binding import bind_cpus
+
+        bind_cpus(local_rank)
+    except Exception as exc:
+        logger.warning(
+            "Bind cpus failed in local rank %s: %s. Skipping CPU binding.",
+            local_rank,
+            exc,
+        )
+
+
 class WorkerFL(WorkerBase):
     def __init__(
         self,
@@ -784,6 +804,14 @@ class WorkerFL(WorkerBase):
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+
+        # Match vLLM-Ascend's host-side placement policy. Bind only after all
+        # model warmup and graph capture work has materialized the worker's hot
+        # allocations, so taskset/migratepages operate on the final process.
+        # This is an optional performance optimization and must never prevent
+        # the inference service from starting when host topology or privileges
+        # are unavailable.
+        _maybe_bind_ascend_cpus(self.vllm_config, self.local_rank)
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
