@@ -7,6 +7,8 @@
 import functools
 import gc
 import itertools
+import math
+import os
 import threading
 import time
 from collections import defaultdict
@@ -15,6 +17,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -50,6 +53,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -105,6 +109,59 @@ from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
 
 
+@contextmanager
+def _set_model_forward_context(
+    attn_metadata: Any,
+    vllm_config: VllmConfig,
+    *,
+    num_tokens: int | None = None,
+    num_tokens_across_dp: torch.Tensor | None = None,
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    batch_descriptor: BatchDescriptor | None = None,
+    ubatch_slices: Any = None,
+    slot_mapping: Any = None,
+    skip_compiled: bool = False,
+    num_actual_tokens: int | None = None,
+    model_instance: torch.nn.Module | None = None,
+    input_ids: torch.Tensor | None = None,
+):
+    """Create the model context and populate FL-owned Ascend extras."""
+    if current_platform.device_type == "npu":
+        from vllm_fl.ascend_forward_context import (
+            set_ascend_forward_context,
+        )
+
+        with set_ascend_forward_context(
+            attn_metadata,
+            vllm_config,
+            num_tokens=num_tokens or 0,
+            num_tokens_across_dp=num_tokens_across_dp,
+            num_actual_tokens=num_actual_tokens,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+            model_instance=model_instance,
+            skip_compiled=skip_compiled,
+            input_ids=input_ids,
+            ubatch_slices=ubatch_slices,
+            slot_mapping=slot_mapping,
+        ):
+            yield
+        return
+
+    with set_forward_context(
+        attn_metadata,
+        vllm_config,
+        num_tokens=num_tokens,
+        num_tokens_across_dp=num_tokens_across_dp,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_descriptor=batch_descriptor,
+        ubatch_slices=ubatch_slices,
+        slot_mapping=slot_mapping,
+        skip_compiled=skip_compiled,
+    ):
+        yield
+
+
 def _accelerator_synchronize() -> None:
     """Synchronize the current device, with MUSA compatibility."""
     if current_platform.device_type == "musa":
@@ -114,7 +171,46 @@ def _accelerator_synchronize() -> None:
         torch.accelerator.synchronize()
 
 
-if current_platform.dist_backend == "flagcx" or current_platform.device_type == "musa":
+def _precision_dump_cpu(value: Any) -> Any:
+    """Detach tensors for an opt-in, offline precision comparison dump."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").contiguous()
+    if isinstance(value, tuple):
+        return tuple(_precision_dump_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_precision_dump_cpu(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _precision_dump_cpu(item) for key, item in value.items()}
+    return value
+
+
+def _select_precision_dump_layers(
+    layer_names: Sequence[str], selectors: Sequence[str]
+) -> list[str]:
+    """Resolve first/last or substring selectors while preserving layer order."""
+    if not layer_names:
+        return []
+    selected: list[str] = []
+    for selector in selectors:
+        if selector.startswith("="):
+            exact_name = selector[1:]
+            matches = [name for name in layer_names if name == exact_name]
+        elif selector == "first":
+            matches = [layer_names[0]]
+        elif selector == "last":
+            matches = [layer_names[-1]]
+        else:
+            matches = [name for name in layer_names if selector in name]
+        for name in matches:
+            if name not in selected:
+                selected.append(name)
+    return selected
+
+
+if (
+    current_platform.dist_backend == "flagcx"
+    or current_platform.device_type in ("musa", "npu")
+):
     @contextmanager
     def graph_capture(device: torch.device):
         """
@@ -170,7 +266,10 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -247,7 +346,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -259,7 +358,11 @@ from vllm.v1.worker.utils import (
 )
 
 # FL-specific imports
-from vllm_fl.compilation.graph import GraphWrapper
+from vllm_fl.compilation.graph import (
+    GraphWrapper,
+    set_ascend_graph_params,
+    update_ascend_full_graph_params,
+)
 from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.dispatch.io_dumper import (
     advance_io_step,
@@ -280,6 +383,184 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _maybe_dump_ascend_precision_state(
+    model_runner: "ModelRunnerFL",
+    forward_context: Any,
+    model_output: Any,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    inputs_embeds: torch.Tensor | None,
+) -> None:
+    """Dump output and selected GDN states for opt-in precision diagnosis.
+
+    This deliberately synchronizes and copies device tensors, so it is guarded
+    by VLLM_FL_PRECISION_DUMP_DIR and must never be enabled for benchmarking.
+    """
+    dump_dir_value = os.environ.get("VLLM_FL_PRECISION_DUMP_DIR", "").strip()
+    if not dump_dir_value or current_platform.device_type != "npu":
+        return
+
+    try:
+        max_steps = int(os.environ.get("VLLM_FL_PRECISION_DUMP_MAX_STEPS", "9"))
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_FL_PRECISION_DUMP_MAX_STEPS must be an integer"
+        ) from exc
+    if max_steps < 0:
+        raise ValueError("VLLM_FL_PRECISION_DUMP_MAX_STEPS must be non-negative")
+
+    step = getattr(model_runner, "_precision_dump_step", 0)
+    model_runner._precision_dump_step = step + 1
+    if step >= max_steps:
+        return
+
+    attn_metadata = forward_context.attn_metadata
+    if not isinstance(attn_metadata, dict):
+        raise RuntimeError(
+            "Precision dump requires per-layer attention metadata dictionary"
+        )
+
+    gdn_layers: dict[str, tuple[Any, GDNAttentionMetadata]] = {}
+    for layer_name, module in (
+        model_runner.compilation_config.static_forward_context.items()
+    ):
+        metadata = attn_metadata.get(layer_name)
+        impl = getattr(module, "impl", module)
+        kv_cache = getattr(impl, "kv_cache", None)
+        if (
+            isinstance(metadata, GDNAttentionMetadata)
+            and isinstance(kv_cache, (list, tuple))
+            and len(kv_cache) >= 2
+        ):
+            gdn_layers[layer_name] = (impl, metadata)
+
+    if not gdn_layers:
+        raise RuntimeError(
+            "Precision dump found no initialized GDN layers in static_forward_context"
+        )
+
+    selectors = [
+        selector.strip()
+        for selector in os.environ.get(
+            "VLLM_FL_PRECISION_DUMP_LAYERS", "first,last"
+        ).split(",")
+        if selector.strip()
+    ]
+    selected_layers = _select_precision_dump_layers(
+        list(gdn_layers), selectors
+    )
+    if not selected_layers:
+        raise RuntimeError(
+            "VLLM_FL_PRECISION_DUMP_LAYERS did not match any GDN layer; "
+            f"selectors={selectors!r}"
+        )
+
+    # Graph replay and GDN state updates are asynchronous. Synchronization is
+    # required before snapshotting their final values for this execution step.
+    _accelerator_synchronize()
+
+    first_metadata = gdn_layers[selected_layers[0]][1]
+    if first_metadata.num_prefills and first_metadata.num_decodes:
+        phase = "mixed"
+    elif first_metadata.num_prefills:
+        phase = "prefill"
+    elif first_metadata.num_decodes:
+        phase = "decode"
+    else:
+        phase = "other"
+
+    runtime_mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+    runtime_mode_name = getattr(runtime_mode, "name", str(runtime_mode))
+    batch_descriptor = getattr(forward_context, "batch_descriptor", None)
+    payload: dict[str, Any] = {
+        "step": step,
+        "phase": phase,
+        "cudagraph_runtime_mode": runtime_mode_name,
+        "batch_num_tokens": getattr(batch_descriptor, "num_tokens", None),
+        "input_ids": _precision_dump_cpu(input_ids),
+        "positions": _precision_dump_cpu(positions),
+        "inputs_embeds": _precision_dump_cpu(inputs_embeds),
+        "model_output": _precision_dump_cpu(model_output),
+        "layers": {},
+    }
+
+    metadata_tensor_fields = (
+        "has_initial_state",
+        "spec_query_start_loc",
+        "non_spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "non_spec_token_indx",
+        "num_accepted_tokens",
+        "chunk_indices",
+        "chunk_offsets",
+    )
+    metadata_scalar_fields = (
+        "num_prefills",
+        "num_prefill_tokens",
+        "num_decodes",
+        "num_decode_tokens",
+        "num_spec_decodes",
+        "num_spec_decode_tokens",
+        "num_actual_tokens",
+    )
+
+    for layer_name in selected_layers:
+        impl, metadata = gdn_layers[layer_name]
+        state_indices = metadata.non_spec_state_indices_tensor
+        if state_indices is None:
+            raise RuntimeError(
+                f"Precision dump requires non-spec GDN state indices for {layer_name}"
+            )
+        state_indices = state_indices.flatten()
+        state_indices = state_indices[state_indices >= 0]
+
+        conv_state, ssm_state = impl.kv_cache[:2]
+        conv_indices = state_indices.to(
+            device=conv_state.device, dtype=torch.long
+        )
+        ssm_indices = state_indices.to(
+            device=ssm_state.device, dtype=torch.long
+        )
+        layer_payload: dict[str, Any] = {
+            "state_indices": _precision_dump_cpu(state_indices),
+            "conv_state": _precision_dump_cpu(
+                conv_state.index_select(0, conv_indices)
+            ),
+            "ssm_state": _precision_dump_cpu(
+                ssm_state.index_select(0, ssm_indices)
+            ),
+            "metadata": {},
+        }
+        for field_name in metadata_scalar_fields:
+            layer_payload["metadata"][field_name] = getattr(
+                metadata, field_name
+            )
+        for field_name in metadata_tensor_fields:
+            layer_payload["metadata"][field_name] = _precision_dump_cpu(
+                getattr(metadata, field_name)
+            )
+        payload["layers"][layer_name] = layer_payload
+
+    if torch.distributed.is_initialized():
+        global_rank = torch.distributed.get_rank()
+    else:
+        global_rank = get_tp_group().rank_in_group
+    rank_dir = Path(dump_dir_value) / f"rank_{global_rank:04d}"
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    dump_path = rank_dir / f"step_{step:04d}.pt"
+    torch.save(payload, dump_path)
+    logger.warning(
+        "Saved Ascend precision dump step=%d phase=%s mode=%s to %s",
+        step,
+        phase,
+        runtime_mode_name,
+        dump_path,
+    )
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -291,6 +572,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: current_platform.torch_device_fn.Stream,
         vocab_size: int,
     ):
+        debug_forward = os.environ.get("VLLM_FL_DEBUG_FORWARD", "0") == "1"
+        if debug_forward:
+            logger.warning("FORWARD_DEBUG async output init begin")
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
 
@@ -306,24 +590,41 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = current_platform.torch_device_fn.current_stream()
         with current_platform.torch_device_fn.stream(async_output_copy_stream):
+            if debug_forward:
+                logger.warning("FORWARD_DEBUG async output wait stream begin")
             async_output_copy_stream.wait_stream(default_stream)
+            if debug_forward:
+                logger.warning("FORWARD_DEBUG async output wait stream end")
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
             )
+            if debug_forward:
+                logger.warning("FORWARD_DEBUG async output sampled copy submitted")
             self._logprobs_tensors_cpu = (
                 self._logprobs_tensors.to_cpu_nonblocking()
                 if self._logprobs_tensors
                 else None
             )
+            if debug_forward:
+                logger.warning("FORWARD_DEBUG async output logprobs copy submitted")
             self.async_copy_ready_event.record()
+            if debug_forward:
+                logger.warning("FORWARD_DEBUG async output event recorded")
+        if debug_forward:
+            logger.warning("FORWARD_DEBUG async output init end")
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
+        debug_forward = os.environ.get("VLLM_FL_DEBUG_FORWARD", "0") == "1"
+        if debug_forward:
+            logger.warning("FORWARD_DEBUG async get_output sync begin")
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
+        if debug_forward:
+            logger.warning("FORWARD_DEBUG async get_output sync end")
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -446,6 +747,104 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+
+
+def _make_dense_mamba_state_views(
+    raw_tensor: torch.Tensor,
+    num_blocks: int,
+    shapes: Sequence[tuple[int, ...]],
+    dtypes: Sequence[torch.dtype],
+) -> list[torch.Tensor]:
+    """Group every Mamba state type densely across cache blocks.
+
+    AscendC GDN kernels treat the first dimension as an array of dense state
+    rows. Upstream's page-interleaved ``as_strided`` views violate that ABI,
+    so NPU caches keep the same raw allocation but partition it by state type.
+    """
+    assert len(shapes) == len(dtypes)
+    raw_u8 = raw_tensor.view(torch.uint8)
+    storage_offset_bytes = 0
+    state_tensors: list[torch.Tensor] = []
+    for shape, dtype in zip(shapes, dtypes):
+        dtype_size = get_dtype_size(dtype)
+        assert storage_offset_bytes % dtype_size == 0
+        num_state_bytes = num_blocks * math.prod(shape) * dtype_size
+        storage_end_bytes = storage_offset_bytes + num_state_bytes
+        assert storage_end_bytes <= raw_tensor.nbytes
+        state_tensors.append(
+            raw_u8[storage_offset_bytes:storage_end_bytes]
+            .view(dtype)
+            .view(num_blocks, *shape)
+        )
+        storage_offset_bytes = storage_end_bytes
+    return state_tensors
+
+
+def _reserve_modular_moe_workspace(
+    model: nn.Module,
+    max_num_tokens: int,
+    workspace_manager: Any | None = None,
+) -> tuple[int, int]:
+    """Reserve the largest modular MoE workspace before graph capture.
+
+    NPU memory profiling skips the maximum-token dummy forward, so decode-only
+    graph warmup otherwise sizes the shared workspace only for capture batches.
+    A later eager prefill can be larger and cannot grow the buffer after it is
+    locked. Reserving before capture also keeps graph-recorded addresses valid.
+    """
+    if workspace_manager is None:
+        workspace_manager = current_workspace_manager()
+
+    reserved_bytes = 0
+    num_kernels = 0
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        if moe_kernel is None or getattr(moe_kernel, "is_monolithic", True):
+            continue
+
+        impl = getattr(moe_kernel, "impl", None)
+        fused_experts = getattr(impl, "fused_experts", None)
+        moe_config = getattr(module, "moe_config", None)
+        w13_weight = getattr(module, "w13_weight", None)
+        if fused_experts is None or moe_config is None or w13_weight is None:
+            continue
+
+        # These are the same problem dimensions passed by
+        # FusedMoEKernelModularImpl._fused_experts at runtime.
+        local_num_experts, intermediate_dim, _ = w13_weight.shape
+        hidden_dim = moe_config.hidden_dim
+        top_k = moe_config.experts_per_token
+        global_num_experts = getattr(
+            module, "global_num_experts", moe_config.num_experts
+        )
+        workspace13_shape, workspace2_shape, output_shape = (
+            fused_experts.workspace_shapes(
+                max_num_tokens,
+                intermediate_dim,
+                hidden_dim,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                None,
+                module.activation,
+            )
+        )
+        workspace_dtype = fused_experts.workspace_dtype(moe_config.in_dtype)
+        common_workspace_numel = max(
+            math.prod(workspace13_shape), math.prod(output_shape)
+        )
+        workspace_manager.get_simultaneous(
+            ((common_workspace_numel,), workspace_dtype),
+            (workspace2_shape, workspace_dtype),
+        )
+        requested_bytes = (
+            common_workspace_numel + math.prod(workspace2_shape)
+        ) * workspace_dtype.itemsize
+        reserved_bytes = max(reserved_bytes, requested_bytes)
+        num_kernels += 1
+
+    return num_kernels, reserved_bytes
 
 
 class ModelRunnerFL(
@@ -2228,23 +2627,84 @@ class ModelRunnerFL(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
-        cm_base = CommonAttentionMetadata(
-            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
-            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens[:num_reqs_padded],
-            _seq_lens_cpu=seq_lens_cpu,
-            _num_computed_tokens_cpu=num_computed_tokens_cpu,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            num_reqs=num_reqs_padded,
-            num_actual_tokens=num_tokens_padded,
-            max_query_len=max_query_len,
-            max_seq_len=max_seq_len,
-            block_table_tensor=block_table_gid_0,
-            slot_mapping=slot_mapping_gid_0,
-            causal=True,
-            is_prefilling=is_prefilling,
-            positions=self.positions[:num_tokens_padded],
-        )
+        if current_platform.device_type == "npu":
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import (
+                AscendAttentionState,
+                AscendCommonAttentionMetadata,
+            )
+
+            actual_computed_tokens = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            )
+            if np.all(actual_computed_tokens == 0):
+                ascend_attn_state = AscendAttentionState.PrefillNoCache
+            elif max_query_len <= 1:
+                ascend_attn_state = AscendAttentionState.DecodeOnly
+            elif self.scheduler_config.enable_chunked_prefill:
+                ascend_attn_state = AscendAttentionState.ChunkedPrefill
+            else:
+                ascend_attn_state = AscendAttentionState.PrefillCacheHit
+
+            # `_get_slot_mappings` owns persistent int32 buffers on Ascend so
+            # graph capture never records an address from a temporary cast.
+            assert slot_mapping_gid_0.dtype == torch.int32
+            assert all(
+                mapping.dtype == torch.int32
+                for mapping in slot_mappings.values()
+            )
+
+            is_prefilling[num_reqs:] = False
+            cm_base = AscendCommonAttentionMetadata(
+                query_start_loc=self.query_start_loc.gpu[
+                    : num_reqs_padded + 1
+                ],
+                query_start_loc_cpu=self.query_start_loc.cpu[
+                    : num_reqs_padded + 1
+                ],
+                seq_lens=self.seq_lens[:num_reqs_padded],
+                _seq_lens_cpu=self.optimistic_seq_lens_cpu[
+                    :num_reqs_padded
+                ],
+                seq_lens_cpu=seq_lens_cpu,
+                _num_computed_tokens_cpu=num_computed_tokens_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                num_reqs=num_reqs_padded,
+                num_actual_tokens=num_tokens,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                block_table_tensor=block_table_gid_0,
+                slot_mapping=slot_mapping_gid_0,
+                causal=True,
+                is_prefilling=is_prefilling,
+                num_input_tokens=num_tokens_padded,
+                positions=self.positions[:num_tokens_padded],
+                attn_state=ascend_attn_state,
+                prefill_context_parallel_metadata=None,
+                kvcomp_metadata=None,
+            )
+        else:
+            cm_base = CommonAttentionMetadata(
+                query_start_loc=self.query_start_loc.gpu[
+                    : num_reqs_padded + 1
+                ],
+                query_start_loc_cpu=self.query_start_loc.cpu[
+                    : num_reqs_padded + 1
+                ],
+                seq_lens=self.seq_lens[:num_reqs_padded],
+                _seq_lens_cpu=seq_lens_cpu,
+                _num_computed_tokens_cpu=num_computed_tokens_cpu,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                num_reqs=num_reqs_padded,
+                num_actual_tokens=num_tokens_padded,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                block_table_tensor=block_table_gid_0,
+                slot_mapping=slot_mapping_gid_0,
+                causal=True,
+                is_prefilling=is_prefilling,
+                positions=self.positions[:num_tokens_padded],
+            )
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -3580,13 +4040,69 @@ class ModelRunnerFL(
         Returns:
             Model output tensor
         """
-        return self.model(
+        debug_forward = os.environ.get("VLLM_FL_DEBUG_FORWARD", "0") == "1"
+        debug_num_tokens = (
+            positions.shape[-1]
+            if positions is not None
+            else input_ids.shape[0]
+            if input_ids is not None
+            else inputs_embeds.shape[0]
+            if inputs_embeds is not None
+            else -1
+        )
+        if debug_forward:
+            logger.warning("FORWARD_DEBUG model enter tokens=%d", debug_num_tokens)
+        model_output = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        if debug_forward:
+            logger.warning("FORWARD_DEBUG model return tokens=%d", debug_num_tokens)
+        if (
+            current_platform.device_type == "npu"
+            and hasattr(self, "update_stream")
+        ):
+            forward_context = get_forward_context()
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not getattr(forward_context, "capturing", False)
+            ):
+                batch_descriptor = forward_context.batch_descriptor
+                assert batch_descriptor is not None
+                num_tokens_padded = batch_descriptor.num_tokens
+                if debug_forward:
+                    logger.warning(
+                        "FORWARD_DEBUG graph params update begin "
+                        "padded_tokens=%d actual_tokens=%d",
+                        num_tokens_padded,
+                        debug_num_tokens,
+                    )
+                update_ascend_full_graph_params(
+                    self.update_stream,
+                    forward_context,
+                    num_tokens_padded,
+                    self.vllm_config,
+                )
+                if debug_forward:
+                    logger.warning(
+                        "FORWARD_DEBUG graph params update end "
+                        "padded_tokens=%d actual_tokens=%d",
+                        num_tokens_padded,
+                        debug_num_tokens,
+                    )
+        if os.environ.get("VLLM_FL_PRECISION_DUMP_DIR", "").strip():
+            _maybe_dump_ascend_precision_state(
+                self,
+                get_forward_context(),
+                model_output,
+                input_ids,
+                positions,
+                inputs_embeds,
+            )
+        return model_output
 
     @staticmethod
     def _is_uniform_decode(
@@ -3798,12 +4314,41 @@ class ModelRunnerFL(
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 slot_mapping = torch.zeros(
                     (num_tokens_padded,),
-                    dtype=torch.int64,
+                    dtype=(
+                        torch.int32
+                        if current_platform.device_type == "npu"
+                        else torch.int64
+                    ),
                     device=self.device,
                 )
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
-                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+                slot_mapping_gpu = blk_table.slot_mapping.gpu
+                slot_mapping = slot_mapping_gpu[:num_tokens_padded]
+                if (
+                    current_platform.device_type == "npu"
+                    and slot_mapping.dtype != torch.int32
+                ):
+                    # Ascend reshape-and-cache requires int32. A temporary
+                    # ``slot_mapping.to(int32)`` is unsafe here because its
+                    # address is retained by NPUGraph after capture.
+                    buffers = getattr(
+                        self, "_ascend_slot_mapping_buffers", None
+                    )
+                    if buffers is None:
+                        buffers = {}
+                        self._ascend_slot_mapping_buffers = buffers
+                    buffer = buffers.get(kv_cache_gid)
+                    if (
+                        buffer is None
+                        or buffer.shape != slot_mapping_gpu.shape
+                    ):
+                        buffer = torch.empty_like(
+                            slot_mapping_gpu, dtype=torch.int32
+                        )
+                        buffers[kv_cache_gid] = buffer
+                    buffer[:num_tokens_padded].copy_(slot_mapping)
+                    slot_mapping = buffer[:num_tokens_padded]
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
             # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -4090,7 +4635,7 @@ class ModelRunnerFL(
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
-            set_forward_context(
+            _set_model_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
@@ -4100,6 +4645,9 @@ class ModelRunnerFL(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                model_instance=self.model,
+                input_ids=input_ids,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4115,7 +4663,10 @@ class ModelRunnerFL(
                 **model_kwargs,
             )
 
+        debug_postprocess = os.environ.get("VLLM_FL_DEBUG_FORWARD", "0") == "1"
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            if debug_postprocess:
+                logger.warning("FORWARD_DEBUG postprocess enter")
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4143,7 +4694,11 @@ class ModelRunnerFL(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                if debug_postprocess:
+                    logger.warning("FORWARD_DEBUG hidden select complete")
                 logits = self.model.compute_logits(sample_hidden_states)
+                if debug_postprocess:
+                    logger.warning("FORWARD_DEBUG compute logits return")
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4186,6 +4741,8 @@ class ModelRunnerFL(
             cudagraph_stats,
             slot_mappings,
         )
+        if debug_postprocess:
+            logger.warning("FORWARD_DEBUG execute state stored")
         self.kv_connector_output = kv_connector_output
 
         # Now the batch has been launched we can wait for corrections from the
@@ -4199,6 +4756,9 @@ class ModelRunnerFL(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        debug_sample = os.environ.get("VLLM_FL_DEBUG_FORWARD", "0") == "1"
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG sample_tokens enter")
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
@@ -4240,13 +4800,29 @@ class ModelRunnerFL(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG sample begin")
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG sample return")
 
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG state update begin")
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG state update end")
         if self.use_async_scheduling:
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG async PP lookup begin")
             pp = get_pp_group()
+            if debug_sample:
+                logger.warning(
+                    "FORWARD_DEBUG async PP lookup end world_size=%d is_last_rank=%s",
+                    pp.world_size,
+                    pp.is_last_rank,
+                )
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
@@ -4254,6 +4830,8 @@ class ModelRunnerFL(
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG async PP handling end")
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -4278,6 +4856,10 @@ class ModelRunnerFL(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
+        if debug_sample:
+            logger.warning(
+                "FORWARD_DEBUG draft branch begin spec_config=%s", spec_config
+            )
         if spec_config is not None:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
@@ -4347,7 +4929,11 @@ class ModelRunnerFL(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG bookkeep context enter")
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG bookkeeping begin")
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -4363,6 +4949,8 @@ class ModelRunnerFL(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG bookkeeping return")
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4376,13 +4964,19 @@ class ModelRunnerFL(
             self.finalize_kv_connector()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG eplb begin")
             self.eplb_step()
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG eplb end")
 
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG output build begin")
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
                 if capturer is not None:
@@ -4403,16 +4997,26 @@ class ModelRunnerFL(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG output build end")
 
         # FL: Advance IO step after the full inference cycle
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG advance io begin")
         advance_io_step()
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG advance io end")
 
         if not self.use_async_scheduling:
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG sample_tokens sync return")
             return output
 
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG async output build begin")
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -4421,16 +5025,24 @@ class ModelRunnerFL(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
             )
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG async output build end")
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
         ):
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG set async sampled ids begin")
             # Save ref of sampled_token_ids CPU tensor if the batch contains
             # any requests with sampling params that require output ids.
             self.input_batch.set_async_sampled_token_ids(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
+            if debug_sample:
+                logger.warning("FORWARD_DEBUG set async sampled ids end")
 
+        if debug_sample:
+            logger.warning("FORWARD_DEBUG sample_tokens async return")
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -4941,6 +5553,23 @@ class ModelRunnerFL(
         )
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
+            if (
+                current_platform.device_type == "npu"
+                and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            ):
+                num_moe_kernels, moe_workspace_bytes = (
+                    _reserve_modular_moe_workspace(
+                        self.model,
+                        self.scheduler_config.max_num_batched_tokens,
+                    )
+                )
+                logger.info(
+                    "Reserved %.2f MiB modular MoE workspace for %d NPU "
+                    "kernels at max_num_batched_tokens=%d before graph capture",
+                    moe_workspace_bytes / (1 << 20),
+                    num_moe_kernels,
+                    self.scheduler_config.max_num_batched_tokens,
+                )
             # FL: register IO dumper module hooks
             register_io_module_hooks(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
@@ -4987,6 +5616,8 @@ class ModelRunnerFL(
             cudagraph_mode.has_full_cudagraphs()
             and not self.parallel_config.use_ubatching
         ):
+            if current_platform.device_type == "npu":
+                self.update_stream = torch.npu.Stream()
             self.model = GraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
@@ -5085,7 +5716,7 @@ class ModelRunnerFL(
             logger.warning_once(
                 "Reloading with `is_checkpoint_format=True` requires that "
                 "weights be in kernel format and already sharded",
-                
+
             )
             loaded_weights = set()
             for name, loaded_weight in weights_iterator:
@@ -5099,7 +5730,7 @@ class ModelRunnerFL(
         logger.info_once(
             "Reloading and processing weights took %.2f seconds",
             diff_seconds,
-            
+
         )
         if self.model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
@@ -5585,7 +6216,7 @@ class ModelRunnerFL(
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
-                set_forward_context(
+                _set_model_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
@@ -5594,6 +6225,9 @@ class ModelRunnerFL(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    num_actual_tokens=num_tokens_padded,
+                    model_instance=self.model,
+                    input_ids=input_ids,
                 ),
             ):
                 outputs = self.model(
@@ -5883,7 +6517,7 @@ class ModelRunnerFL(
                             encoder_budget,
                             max_mm_items_per_batch,
                             dummy_modality,
-                            
+
                         )
 
                         # Create dummy batch of multimodal inputs.
@@ -6019,6 +6653,10 @@ class ModelRunnerFL(
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+        if current_platform.device_type == "npu":
+            set_ascend_graph_params(
+                [desc.num_tokens for _, descs in capture_descs for desc in descs]
+            )
 
         total_graphs = sum(len(descs) for _, descs in capture_descs)
         if total_graphs == 0:
@@ -6152,6 +6790,12 @@ class ModelRunnerFL(
 
         start_time = time.perf_counter()
 
+        if current_platform.device_type == "npu":
+            capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+            set_ascend_graph_params(
+                [desc.num_tokens for _, descs in capture_descs for desc in descs]
+            )
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -6200,7 +6844,7 @@ class ModelRunnerFL(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
             elapsed_time,
             cuda_graph_size / (1 << 30),
-            
+
         )
         return cuda_graph_size
 
@@ -6763,25 +7407,40 @@ class ModelRunnerFL(
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
-                    state_tensors = []
-                    storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
+                    if current_platform.device_type == "npu":
+                        state_tensors = _make_dense_mamba_state_views(
+                            raw_tensor,
+                            num_blocks,
+                            kv_cache_spec.shapes,
+                            kv_cache_spec.dtypes,
                         )
-                        target_shape = (num_blocks, *shape)
-                        stride = torch.empty(target_shape).stride()
-                        target_stride = (num_element_per_page, *stride[1:])
-                        assert storage_offset_bytes % dtype_size == 0
-                        tensor = torch.as_strided(
-                            raw_tensor.view(dtype),
-                            size=target_shape,
-                            stride=target_stride,
-                            storage_offset=storage_offset_bytes // dtype_size,
-                        )
-                        state_tensors.append(tensor)
-                        storage_offset_bytes += stride[0] * dtype_size
+                    else:
+                        state_tensors = []
+                        storage_offset_bytes = 0
+                        for shape, dtype in zip(
+                            kv_cache_spec.shapes, kv_cache_spec.dtypes
+                        ):
+                            dtype_size = get_dtype_size(dtype)
+                            target_shape = (num_blocks, *shape)
+                            assert storage_offset_bytes % dtype_size == 0
+                            num_element_per_page = (
+                                kv_cache_spec.page_size_bytes // dtype_size
+                            )
+                            stride = torch.empty(target_shape).stride()
+                            target_stride = (
+                                num_element_per_page,
+                                *stride[1:],
+                            )
+                            tensor = torch.as_strided(
+                                raw_tensor.view(dtype),
+                                size=target_shape,
+                                stride=target_stride,
+                                storage_offset=storage_offset_bytes // dtype_size,
+                            )
+                            storage_offset_bytes += stride[0] * dtype_size
+                            state_tensors.append(tensor)
+
+                        assert storage_offset_bytes <= raw_tensor.nbytes
 
                     kv_caches[layer_name] = state_tensors
                 else:
@@ -6922,7 +7581,7 @@ class ModelRunnerFL(
         self,
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
-    ) -> None:        
+    ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
@@ -7084,6 +7743,28 @@ class ModelRunnerFL(
             # Skip modules that don't need KV cache (eg encoder-only attention)
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                 kv_cache_spec[layer_name] = spec
+
+        # vLLM-Ascend pads attention specs to the hybrid Mamba page instead
+        # of asking upstream's generic KV-cache grouping code to change block
+        # sizes.  The Ascend page contains the aligned attention state plus a
+        # separately stored convolution state, so the two raw page sizes are
+        # intentionally not integer multiples before this padding.
+        if current_platform.device_type == "npu":
+            mamba_page_sizes = [
+                spec.page_size_bytes
+                for spec in kv_cache_spec.values()
+                if isinstance(spec, MambaSpec)
+            ]
+            if mamba_page_sizes:
+                mamba_page_size_padded = max(mamba_page_sizes)
+                for spec in kv_cache_spec.values():
+                    if (
+                        isinstance(spec, AttentionSpec)
+                        and spec.page_size_bytes < mamba_page_size_padded
+                    ):
+                        object.__setattr__(
+                            spec, "page_size_padded", mamba_page_size_padded
+                        )
 
         return kv_cache_spec
 
