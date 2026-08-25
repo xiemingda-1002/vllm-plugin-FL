@@ -410,7 +410,8 @@ class PlatformFL(Platform):
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         if (
-            parallel_config.data_parallel_size > 1
+            parallel_config.all2all_backend == "deepep_high_throughput"
+            and parallel_config.data_parallel_size > 1
             and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             # TODO: Piecewise Cuda graph might be enabled
