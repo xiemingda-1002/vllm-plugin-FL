@@ -3,13 +3,120 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_fl.platform import PlatformFL
+from vllm_fl.platform import PlatformFL, _ascend_npugraph_ex_enabled
 
 
 def test_npu_simple_compile_backend_is_eager():
     expected_backend = "eager" if PlatformFL.device_type == "npu" else "inductor"
 
     assert PlatformFL.simple_compile_backend == expected_backend
+
+
+def test_npu_custom_compile_backend_stays_inside_fl():
+    if PlatformFL.device_type != "npu":
+        pytest.skip("Ascend-only compiler backend")
+
+    assert PlatformFL.get_compile_backend() == (
+        "vllm_fl.compilation.compiler_interface.AscendCompiler"
+    )
+
+
+def _make_cudagraph_config(
+    *,
+    max_num_seqs=32,
+    num_speculative_tokens=None,
+    max_capture_size=None,
+    capture_sizes=None,
+):
+    speculative_config = None
+    if num_speculative_tokens is not None:
+        speculative_config = SimpleNamespace(
+            num_speculative_tokens=num_speculative_tokens
+        )
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=speculative_config,
+        compilation_config=SimpleNamespace(
+            max_cudagraph_capture_size=max_capture_size,
+            cudagraph_capture_sizes=capture_sizes,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "num_speculative_tokens", "expected"),
+    [
+        (32, None, 32),
+        (40, 3, 160),
+        (200, 3, 512),
+    ],
+)
+def test_ascend_default_max_cudagraph_capture_size(
+    monkeypatch, max_num_seqs, num_speculative_tokens, expected
+):
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _make_cudagraph_config(
+        max_num_seqs=max_num_seqs,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+
+    PlatformFL.apply_config_platform_defaults(config)
+
+    assert config.compilation_config.max_cudagraph_capture_size == expected
+
+
+@pytest.mark.parametrize(
+    ("max_capture_size", "capture_sizes"),
+    [
+        (456, None),
+        (None, [1, 2, 4]),
+    ],
+)
+def test_ascend_cudagraph_defaults_preserve_explicit_values(
+    monkeypatch, max_capture_size, capture_sizes
+):
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _make_cudagraph_config(
+        max_capture_size=max_capture_size,
+        capture_sizes=capture_sizes,
+    )
+
+    PlatformFL.apply_config_platform_defaults(config)
+
+    assert config.compilation_config.max_cudagraph_capture_size == max_capture_size
+    assert config.compilation_config.cudagraph_capture_sizes == capture_sizes
+
+
+def test_cudagraph_default_is_ascend_only(monkeypatch):
+    monkeypatch.setattr(PlatformFL, "device_type", "cuda")
+    config = _make_cudagraph_config()
+
+    PlatformFL.apply_config_platform_defaults(config)
+
+    assert config.compilation_config.max_cudagraph_capture_size is None
+
+
+@pytest.mark.parametrize(
+    ("additional_config", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"ascend_compilation_config": {}}, False),
+        (
+            {
+                "ascend_compilation_config": {
+                    "enable_npugraph_ex": True,
+                }
+            },
+            True,
+        ),
+        ({"ascend_compilation_config": "invalid"}, False),
+    ],
+)
+def test_ascend_npugraph_ex_is_explicit_opt_in(additional_config, expected):
+    config = SimpleNamespace(additional_config=additional_config)
+
+    assert _ascend_npugraph_ex_enabled(config) is expected
 
 
 def test_ascend_entrypoint_stays_inside_fl(monkeypatch):
