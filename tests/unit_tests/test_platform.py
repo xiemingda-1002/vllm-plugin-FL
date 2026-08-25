@@ -2,8 +2,60 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import CUDAGraphMode
 
 from vllm_fl.platform import PlatformFL, _ascend_npugraph_ex_enabled
+
+
+def _make_dp_graph_config(all2all_backend):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            all2all_backend=all2all_backend,
+            worker_cls=None,
+            disable_custom_all_reduce=False,
+        ),
+        model_config=None,
+        cache_config=None,
+        scheduler_config=None,
+        compilation_config=SimpleNamespace(
+            compile_sizes=None,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            mode=None,
+            backend=None,
+            use_inductor=True,
+            splitting_ops=None,
+            pass_config=SimpleNamespace(
+                fuse_norm_quant=True,
+                fuse_act_quant=True,
+                fuse_attn_quant=True,
+            ),
+            cudagraph_num_of_warmups=0,
+        ),
+        additional_config=None,
+        attention_config=None,
+    )
+
+
+def test_allgather_dp2_preserves_full_decode_only_graph(monkeypatch):
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _make_dp_graph_config("allgather_reducescatter")
+
+    PlatformFL.check_and_update_config(config)
+
+    assert (
+        config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_DECODE_ONLY
+    )
+
+
+def test_deepep_high_throughput_dp2_disables_graph(monkeypatch):
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _make_dp_graph_config("deepep_high_throughput")
+
+    PlatformFL.check_and_update_config(config)
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
 def test_npu_simple_compile_backend_is_eager():
