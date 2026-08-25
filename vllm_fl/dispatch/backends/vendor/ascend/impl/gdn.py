@@ -64,8 +64,15 @@ def _runtime_num_actual_tokens(
     attn_metadata: GDNAttentionMetadata,
     mixed_qkv: torch.Tensor,
 ) -> int:
-    """Return the authoritative runtime token count for GDN core output."""
-    if attn_metadata.num_prefills > 0:
+    """Return the authoritative runtime token count for GDN core output.
+
+    During FX tracing the metadata object can still contain the one-token
+    decode value used to capture FULL_DECODE_ONLY, so the tensor dimension is
+    authoritative there.  Outside tracing, including eager chunked-prefill
+    and prefix-cache resume, ``num_actual_tokens`` must be used to discard the
+    runner's padding exactly as the native vLLM-Ascend implementation does.
+    """
+    if attn_metadata.num_prefills > 0 and torch.compiler.is_compiling():
         return mixed_qkv.shape[0]
     return attn_metadata.num_actual_tokens
 

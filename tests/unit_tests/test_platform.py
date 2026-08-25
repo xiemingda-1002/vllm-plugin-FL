@@ -19,9 +19,23 @@ def test_ascend_entrypoint_stays_inside_fl(monkeypatch):
     import vllm_fl
 
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
 
     assert vllm_fl.register() == "vllm_fl.platform.PlatformFL"
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert os.environ["TRITON_CACHE_DIR"].endswith(
+        "/.triton/vllm-fl-ascend-v1"
+    )
+
+
+def test_ascend_triton_cache_preserves_explicit_override(monkeypatch):
+    import vllm_fl
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/tmp/user-triton-cache")
+
+    vllm_fl._configure_ascend_triton_cache()
+
+    assert os.environ["TRITON_CACHE_DIR"] == "/tmp/user-triton-cache"
 
 
 def test_ascend_platform_hook_installs_hybrid_cache_patch_early(monkeypatch):
