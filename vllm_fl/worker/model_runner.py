@@ -390,6 +390,8 @@ def _maybe_dump_ascend_precision_state(
     input_ids: torch.Tensor | None,
     positions: torch.Tensor | None,
     inputs_embeds: torch.Tensor | None,
+    *,
+    stage: str,
 ) -> None:
     """Dump output and selected GDN states for opt-in precision diagnosis.
 
@@ -409,8 +411,11 @@ def _maybe_dump_ascend_precision_state(
     if max_steps < 0:
         raise ValueError("VLLM_FL_PRECISION_DUMP_MAX_STEPS must be non-negative")
 
+    if stage not in ("pre", "post"):
+        raise ValueError(f"Unsupported precision dump stage: {stage}")
     step = getattr(model_runner, "_precision_dump_step", 0)
-    model_runner._precision_dump_step = step + 1
+    if stage == "post":
+        model_runner._precision_dump_step = step + 1
     if step >= max_steps:
         return
 
@@ -474,6 +479,7 @@ def _maybe_dump_ascend_precision_state(
     batch_descriptor = getattr(forward_context, "batch_descriptor", None)
     payload: dict[str, Any] = {
         "step": step,
+        "stage": stage,
         "phase": phase,
         "cudagraph_runtime_mode": runtime_mode_name,
         "batch_num_tokens": getattr(batch_descriptor, "num_tokens", None),
@@ -542,6 +548,22 @@ def _maybe_dump_ascend_precision_state(
             layer_payload["metadata"][field_name] = _precision_dump_cpu(
                 getattr(metadata, field_name)
             )
+        prefill_fallback = getattr(
+            metadata, "non_spec_prefill_fallback_meta", None
+        )
+        if prefill_fallback is not None:
+            conv_meta = prefill_fallback.causal_conv1d
+            layer_payload["prefill_host_args"] = {
+                "query_start_loc_cpu": _precision_dump_cpu(
+                    conv_meta.query_start_loc_cpu
+                ),
+                "cache_indices_cpu": _precision_dump_cpu(
+                    conv_meta.cache_indices_cpu
+                ),
+                "has_initial_state_cpu": _precision_dump_cpu(
+                    conv_meta.has_initial_state_cpu
+                ),
+            }
         payload["layers"][layer_name] = layer_payload
 
     if torch.distributed.is_initialized():
@@ -550,11 +572,12 @@ def _maybe_dump_ascend_precision_state(
         global_rank = get_tp_group().rank_in_group
     rank_dir = Path(dump_dir_value) / f"rank_{global_rank:04d}"
     rank_dir.mkdir(parents=True, exist_ok=True)
-    dump_path = rank_dir / f"step_{step:04d}.pt"
+    dump_path = rank_dir / f"step_{step:04d}_{stage}.pt"
     torch.save(payload, dump_path)
     logger.warning(
-        "Saved Ascend precision dump step=%d phase=%s mode=%s to %s",
+        "Saved Ascend precision dump step=%d stage=%s phase=%s mode=%s to %s",
         step,
+        stage,
         phase,
         runtime_mode_name,
         dump_path,
@@ -4052,6 +4075,16 @@ class ModelRunnerFL(
         )
         if debug_forward:
             logger.warning("FORWARD_DEBUG model enter tokens=%d", debug_num_tokens)
+        if os.environ.get("VLLM_FL_PRECISION_DUMP_DIR", "").strip():
+            _maybe_dump_ascend_precision_state(
+                self,
+                get_forward_context(),
+                None,
+                input_ids,
+                positions,
+                inputs_embeds,
+                stage="pre",
+            )
         model_output = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -4101,6 +4134,7 @@ class ModelRunnerFL(
                 input_ids,
                 positions,
                 inputs_embeds,
+                stage="post",
             )
         return model_output
 

@@ -67,12 +67,26 @@ def test_single_sequence_chunk_metadata_boundaries(seq_len, expected_chunks):
     assert metadata.final_chunk_indices_chunk64.tolist() == [expected_chunks]
 
 
-def test_prefill_runtime_token_count_uses_tensor_shape():
+def test_eager_prefill_runtime_token_count_discards_padding():
+    _, _, runtime_num_tokens = _import_gdn_helpers()
+    eager_metadata = SimpleNamespace(
+        num_prefills=1,
+        num_actual_tokens=274,
+    )
+
+    assert runtime_num_tokens(
+        eager_metadata,
+        torch.empty(512, 3),
+    ) == 274
+
+
+def test_traced_prefill_runtime_token_count_uses_tensor_shape(monkeypatch):
     _, _, runtime_num_tokens = _import_gdn_helpers()
     stale_capture_metadata = SimpleNamespace(
         num_prefills=1,
         num_actual_tokens=1,
     )
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
 
     assert runtime_num_tokens(
         stale_capture_metadata,
