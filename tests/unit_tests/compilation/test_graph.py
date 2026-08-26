@@ -49,17 +49,43 @@ class TestGraphEntry:
         assert entry.input_addresses is None
 
 
-def test_ascend_graph_params_are_initialized_per_capture_size():
-    from vllm_fl.compilation.graph import (
-        get_ascend_graph_params,
-        set_ascend_graph_params,
-    )
+class TestAscendGraphParams:
+    """Tests for Ascend capture/update state initialization."""
 
-    set_ascend_graph_params([4, 1, 4])
-    params = get_ascend_graph_params()
+    def test_params_are_initialized_for_unique_capture_sizes(self):
+        from vllm_fl.compilation.graph import (
+            get_ascend_graph_params,
+            set_ascend_graph_params,
+        )
 
-    assert params is not None
-    assert set(params.events) == {1, 4}
-    assert set(params.workspaces) == {1, 4}
-    assert set(params.handles) == {1, 4}
-    assert set(params.attention_params) == {1, 4}
+        set_ascend_graph_params([8, 1, 4, 8])
+        params = get_ascend_graph_params()
+
+        assert params is not None
+        assert set(params.events) == {1, 4, 8}
+        assert set(params.workspaces) == {1, 4, 8}
+        assert set(params.handles) == {1, 4, 8}
+        assert set(params.attention_params) == {1, 4, 8}
+        assert set(params.conv1d_events) == {1, 4, 8}
+        assert set(params.conv1d_handles) == {1, 4, 8}
+        assert set(params.conv1d_params) == {1, 4, 8}
+        assert all(workspace is None for workspace in params.workspaces.values())
+
+    def test_reinitialization_drops_profile_capture_state(self):
+        from vllm_fl.compilation.graph import (
+            get_ascend_graph_params,
+            set_ascend_graph_params,
+        )
+
+        set_ascend_graph_params([1, 2])
+        params = get_ascend_graph_params()
+        assert params is not None
+        params.handles[1].append(object())
+
+        # Memory profiling captures temporary graphs. Runtime capture must
+        # receive fresh task handles instead of retaining those temporary
+        # handles after GraphWrapper.clear_all_graphs().
+        set_ascend_graph_params([1, 2])
+        refreshed = get_ascend_graph_params()
+        assert refreshed is not None
+        assert refreshed.handles[1] == []
