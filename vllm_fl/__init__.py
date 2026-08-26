@@ -3,6 +3,7 @@
 import os
 import logging
 import sys
+from pathlib import Path
 
 # torch.float4_e2m1fn_x2 exists only in CUDA builds of PyTorch 2.7+.
 # vllm.ir.tolerances references it at module level, so we inject a sentinel
@@ -21,6 +22,35 @@ from . import version as version  # PyTorch-style: vllm_fl.version.git_version
 
 
 logger = logging.getLogger(__name__)
+
+_ASCEND_TRITON_CACHE_EPOCH = "vllm-fl-ascend-v1"
+
+
+def _configure_ascend_hccl() -> None:
+    """Use HCCL's AIV communication expansion mode by default on Ascend.
+
+    AIV is provided by HCCL rather than by Python or C++ operator
+    registrations. Selecting it before worker processes are spawned is
+    sufficient for FL's HCCL process groups. Keep an explicitly supplied value
+    untouched so deployments can opt out for compatibility/debugging.
+    """
+    os.environ.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
+
+
+def _configure_ascend_triton_cache() -> None:
+    """Keep FL Ascend kernels out of incompatible shared Triton caches.
+
+    torch_npu's Triton cache key can collide for kernels copied from another
+    plugin even when their source locations and launchers differ.  Reusing
+    such an entry corrupted Qwen3.6 aligned-Mamba prefix-cache inference while
+    a clean cache produced correct output.  A versioned FL-owned default keeps
+    normal launches deterministic; an explicit user setting is preserved.
+    """
+    if os.environ.get("TRITON_CACHE_DIR", "").strip():
+        return
+    os.environ["TRITON_CACHE_DIR"] = str(
+        Path.home() / ".triton" / _ASCEND_TRITON_CACHE_EPOCH
+    )
 
 
 def __getattr__(name):
@@ -107,6 +137,14 @@ def register():
     multiproc_method = os.environ.get("VLLM_WORKER_MULTIPROC_METHOD")
     if multiproc_method is None:
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+    # Apply Ascend runtime defaults while preserving explicit environment
+    # overrides supplied by the launcher.
+    from vllm_fl.utils import DeviceInfo
+
+    if DeviceInfo().device_type == "npu":
+        _configure_ascend_hccl()
+        _configure_ascend_triton_cache()
 
     _init_vendor_device()
 
