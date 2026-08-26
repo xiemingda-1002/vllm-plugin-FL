@@ -81,8 +81,9 @@ class PlatformFL(Platform):
     device_type = device_info.device_type
     dispatch_key = device_info.dispatch_key
     torch_device_fn = device_info.torch_device_fn
-    # NPU Inductor is not part of FL's Ascend graph path. Keep independently
-    # decorated helper functions on the eager backend.
+    # Upstream uses this backend for small, independently decorated helpers
+    # such as sampler logprob ranking.  NPU Inductor is not part of FL's
+    # Ascend graph path; keep these helpers eager just like vLLM-Ascend does.
     simple_compile_backend: str = "eager" if device_type == "npu" else "inductor"
     ray_device_key: str = "GPU"
     dist_backend: str = (
@@ -165,6 +166,14 @@ class PlatformFL(Platform):
         """Import device-specific kernels."""
         logger.info(f"current vendor_name is: {cls.vendor_name}")
 
+        if cls.device_type == "npu":
+            try:
+                from vllm_fl.ascend_custom_ops import bootstrap_custom_op_env
+
+                bootstrap_custom_op_env()
+            except (ImportError, OSError) as exc:
+                logger.warning("Ascend custom OPP is unavailable: %s", exc)
+
         if cls.vendor_name == "metax":
             try:
                 import mcoplib._C  # noqa: F401
@@ -196,6 +205,16 @@ class PlatformFL(Platform):
         import vllm.kernels  # noqa: F401
 
     @classmethod
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        # vLLM-Ascend chooses the NPU block size during config validation and
+        # intentionally skips upstream's post-load backend realignment.  The
+        # latter treats the combined Mamba state as one page and changes this
+        # model's correctly aligned 2048-token page back to 1152 tokens.
+        if cls.device_type == "npu":
+            return
+        super().update_block_size_for_backend(vllm_config)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         if cls.device_type == "ptpu":
             import vllm_fl.dispatch.backends.vendor.sunrise  # noqa: F401
@@ -224,6 +243,9 @@ class PlatformFL(Platform):
             from vllm_fl.dispatch.backends.vendor.ascend.patch import refresh_block_size
 
             refresh_block_size(vllm_config)
+            # vLLM-Ascend's NPU communicator uses the HCCL process group and
+            # does not provide CUDA's custom all-reduce implementation.
+            parallel_config.disable_custom_all_reduce = True
 
         # TODO(lucas): handle this more gracefully
         # Note: model_config may be None during testing
@@ -247,6 +269,8 @@ class PlatformFL(Platform):
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
 
+        # Ascend full graph uses vLLM's eager FX backend plus an outer NPUGraph.
+        # Inductor and piecewise graph modes are intentionally out of scope.
         if cls.device_type == "npu":
             from vllm.config import CompilationMode
 
@@ -259,11 +283,18 @@ class PlatformFL(Platform):
                 compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             elif compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
                 compilation_config.mode = CompilationMode.VLLM_COMPILE
+                # Keep the FX graph eager and let the FL-owned outer NPUGraph
+                # wrapper perform decode capture/replay.  The current
+                # vLLM-Ascend npugraph_ex compiler was evaluated here, but it
+                # did not improve latency and regressed mixed-batch GDN state
+                # reuse, so it is intentionally not selected.
                 compilation_config.backend = "eager"
                 compilation_config.use_inductor = False
                 compilation_config.splitting_ops = []
-                # These post-passes are CUDA/Inductor-specific. The eager FX
-                # graph is used only to drive the existing NPUGraph wrapper.
+                # These post-grad quantization fusions are CUDA-only in
+                # upstream vLLM.  The NPU path imports neither pass class and
+                # this BF16 graph does not need them, so keep the eager FX
+                # backend free of CUDA-specific post passes.
                 compilation_config.pass_config.fuse_norm_quant = False
                 compilation_config.pass_config.fuse_act_quant = False
                 compilation_config.pass_config.fuse_attn_quant = False
@@ -279,21 +310,6 @@ class PlatformFL(Platform):
                 )
                 compilation_config.mode = CompilationMode.NONE
                 compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-
-        # Ascend NPU: force float32 SSM state cache for GDN linear attention.
-        # The pure-PyTorch recurrence accumulates state in float32 but writes
-        # back to initial_state.dtype each step. If the cache is bf16, the
-        # round-trip truncation compounds across hundreds of tokens, degrading
-        # output quality (especially at temperature > 0). Forcing float32 cache
-        # eliminates this precision loss with negligible memory impact (the SSM
-        # state is small relative to the KV cache).
-        if cls.device_type == "npu":
-            if cache_config and cache_config.mamba_ssm_cache_dtype is None:
-                cache_config.mamba_ssm_cache_dtype = "float32"
-                logger.info(
-                    "Forcing mamba_ssm_cache_dtype to float32 for Ascend NPU "
-                    "to avoid recurrence precision loss in GDN decode."
-                )
 
         if (
             cls.device_type == "musa"
@@ -347,6 +363,13 @@ class PlatformFL(Platform):
         num_heads: int | None = None,
     ) -> str:
         """Get the attention backend class path using the dispatch mechanism."""
+        if cls.device_type == "npu":
+            # Keep attention and its metadata builder from the same current
+            # vLLM-Ascend release as the reused model operators.
+            return (
+                "vllm_fl.dispatch.backends.vendor.ascend.impl."
+                "native_attention.AscendAttentionBackendFL"
+            )
         use_mla = attn_selector_config.use_mla
         use_sparse = attn_selector_config.use_sparse
 
@@ -410,6 +433,12 @@ class PlatformFL(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
+        if cls.device_type == "npu":
+            logger.info("Using vLLM-Ascend-compatible NPU communicator.")
+            return (
+                "vllm_fl.distributed.device_communicators."
+                "npu_communicator.NPUCommunicator"
+            )
         if cls.dist_backend == "flagcx":
             logger.info("Using CommunicatorFL for communication.")
             return "vllm_fl.distributed.communicator.CommunicatorFL"  # noqa
@@ -470,6 +499,11 @@ class PlatformFL(Platform):
     def support_hybrid_kv_cache(cls) -> bool:
         return True
 
+    @classmethod
+    def set_additional_forward_context(cls, *args, **kwargs):
+        """Keep the base context portable; FL populates NPU extras locally."""
+        return super().set_additional_forward_context(*args, **kwargs)
+
     ### NOTE(lms): will effect compile result
     @classmethod
     def opaque_attention_op(cls) -> bool:
@@ -487,6 +521,15 @@ class PlatformFL(Platform):
     def pre_register_and_update(cls, parser=None) -> None:
         if cls.device_name == "npu":
             import vllm_fl.dispatch.backends.vendor.ascend
+
+            # Install hybrid Mamba/attention cache patches before VllmConfig
+            # construction without recursively importing vLLM while the
+            # plugin itself is still being resolved.
+            from vllm_fl.dispatch.backends.vendor.ascend.patch import (
+                patch_mamba_config,
+            )
+
+            patch_mamba_config()
         elif cls.device_name == "gcu":
             import vllm_fl.dispatch.backends.vendor.gcu  # noqa: F401
         elif cls.device_type == "ptpu":
@@ -556,7 +599,7 @@ class PlatformFL(Platform):
             return DeviceCapability(major=major, minor=minor)
         # TODO: For PTPU/Sunrise devices, return None
         if cls.device_type == "ptpu":
-            return None        
+            return None
         if cls.device_type == "gcu":
             gcu = getattr(torch, "gcu", None)
             if gcu is None:

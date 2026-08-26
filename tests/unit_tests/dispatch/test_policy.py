@@ -115,8 +115,9 @@ class TestSelectionPolicy:
 
 class TestPolicyManager:
     @pytest.fixture(autouse=True)
-    def reset_policy(self):
-        """Reset global policy before and after each test."""
+    def reset_policy(self, monkeypatch):
+        """Test the built-in default independently of platform config."""
+        monkeypatch.setenv("VLLM_FL_PREFER", PREFER_DEFAULT)
         reset_global_policy()
         yield
         reset_global_policy()
@@ -158,7 +159,8 @@ class TestPolicyManager:
 
 class TestPolicyContext:
     @pytest.fixture(autouse=True)
-    def reset_policy(self):
+    def reset_policy(self, monkeypatch):
+        monkeypatch.setenv("VLLM_FL_PREFER", PREFER_DEFAULT)
         reset_global_policy()
         yield
         reset_global_policy()

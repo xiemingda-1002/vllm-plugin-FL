@@ -173,6 +173,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     actual_seq_lengths_q: list[int] = field(default_factory=list)
 
     positions: torch.Tensor = None
+    positions_cpu: torch.Tensor = None
 
     attn_state: Any = None
 
@@ -183,18 +184,22 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     num_input_tokens: int = 0
 
     prefill_context_parallel_metadata: Optional[AscendPrefillContextParallelMetadata] = None
+    kvcomp_metadata: Any = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(
         self, num_actual_tokens: int, num_actual_reqs: int
     ) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
+        def _slice_reqs(value):
+            return value[:num_actual_reqs] if value is not None else None
+
         return AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
-            seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
-            num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
+            seq_lens_cpu=_slice_reqs(self.seq_lens_cpu),
+            num_computed_tokens_cpu=_slice_reqs(self.num_computed_tokens_cpu),
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,
@@ -207,11 +212,26 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
+            positions_cpu=self.positions_cpu,
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
+            seq_lens_cpu_upper_bound=_slice_reqs(self.seq_lens_cpu_upper_bound),
             max_seq_len=self.max_seq_len,
+            _seq_lens_cpu=_slice_reqs(self._seq_lens_cpu),
+            _num_computed_tokens_cpu=_slice_reqs(
+                self._num_computed_tokens_cpu
+            ),
+            dcp_local_seq_lens=_slice_reqs(self.dcp_local_seq_lens),
+            dcp_local_seq_lens_cpu=_slice_reqs(
+                self.dcp_local_seq_lens_cpu
+            ),
+            is_prefilling=_slice_reqs(self.is_prefilling),
+            encoder_seq_lens=_slice_reqs(self.encoder_seq_lens),
+            encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
+            logits_indices_padded=self.logits_indices_padded,
+            num_logits_indices=self.num_logits_indices,
         )
 
 
@@ -317,8 +337,14 @@ class AscendAttentionMetadataBuilder:
         seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
 
-        # Determine attention state
-        attn_state = self._determine_attn_state(
+        # The model runner has the request-history information needed to
+        # distinguish an initial prefill from a later chunked prefill or a
+        # prefix-cache resume.  Preserve that state so subsequent chunks read
+        # the accumulated KV cache instead of attending only to the current
+        # chunk.  The local inference remains a compatibility fallback for
+        # callers that do not provide an Ascend state.
+        attn_state = self._resolve_attn_state(
+            common_attn_metadata.attn_state,
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens
         )
 
@@ -363,6 +389,24 @@ class AscendAttentionMetadataBuilder:
         else:
             # Mixed decode and prefill
             return AscendAttentionState.ChunkedPrefill
+
+    def _resolve_attn_state(
+        self,
+        runner_attn_state: AscendAttentionState | None,
+        num_decodes: int,
+        num_prefills: int,
+        num_decode_tokens: int,
+        num_prefill_tokens: int,
+    ) -> AscendAttentionState:
+        """Use the runner state when available, with a legacy fallback."""
+        if runner_attn_state is not None:
+            return runner_attn_state
+        return self._determine_attn_state(
+            num_decodes,
+            num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        )
 
     def _split_decodes_and_prefills(self, common_attn_metadata):
         """Split batch into decode and prefill requests."""
