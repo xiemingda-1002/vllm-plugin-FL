@@ -9,6 +9,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config import CUDAGraphMode
+
 
 @pytest.fixture
 def runtime(monkeypatch, ascend_attention_module):
@@ -78,6 +80,13 @@ def _metadata(rt, length=6):
 
 def _impl(rt, window, heads=4):
     impl = object.__new__(rt.ns["AscendAttentionBackendImpl"])
+    impl.vllm_config = SimpleNamespace(
+        speculative_config=None,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        ),
+        additional_config={"pa_shape_list": [2]},
+    )
     impl.sliding_window = window
     impl.num_heads, impl.num_kv_heads, impl.head_size = heads, 2, 8
     impl.scale = 0.125
@@ -102,7 +111,10 @@ def test_fia_capture_update_live_metadata_and_fixed_buffers(runtime, window):
     live.block_tables = torch.tensor([[2, 3], [1, 0]], dtype=torch.int32)
     update_stream = object()
     impl.update_graph_params(
-        update_stream, SimpleNamespace(attn_metadata={"fia": live}), 2
+        update_stream,
+        SimpleNamespace(attn_metadata={"fia": live}),
+        2,
+        impl.vllm_config,
     )
     update = rt.calls[-1][1]
     assert update["actual_seq_lengths"] is live.actual_seq_lengths_q

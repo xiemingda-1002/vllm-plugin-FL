@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import CUDAGraphMode
+
 pytestmark = [pytest.mark.gpu, pytest.mark.functional]
 
 
@@ -51,6 +53,13 @@ def test_ascend_attention_graph_replay(ascend_runtime, batch, windows):
     layers = []
     for index, window in enumerate(windows):
         impl = object.__new__(impl_cls)
+        impl.vllm_config = SimpleNamespace(
+            speculative_config=None,
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+            ),
+            additional_config={"pa_shape_list": [batch]},
+        )
         impl.num_heads, impl.num_kv_heads, impl.head_size = 4, 2, 128
         impl.scale = 128**-0.5
         impl.sliding_window = window
