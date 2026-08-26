@@ -9,119 +9,12 @@
 # ruff: noqa: E501
 # mypy: ignore-errors
 
-import os
-
 import torch
 from vllm.triton_utils import tl, triton
 
 from vllm_fl.dispatch.backends.vendor.ascend.impl.triton.triton_utils import extract_slice, insert_slice
 
 from .utils import prepare_chunk_indices
-
-
-def _solve_tril_torch(
-    A: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Stable eager fallback using batched per-chunk triangular inverses.
-
-    Packing multiple 64-token chunks into one solve avoids one AICPU launch per
-    chunk.  The bounded batch keeps the temporary FP32 matrices small enough
-    for long-context inference while retaining the same independent block
-    semantics as the original per-chunk loop.
-    """
-    B, T, H, BT = A.shape
-    output = torch.zeros(
-        (B, T, H, BT), device=A.device, dtype=output_dtype
-    )
-    if cu_seqlens is None:
-        sequence_ranges = [
-            (batch_idx, 0, T) for batch_idx in range(B)
-        ]
-    else:
-        offsets = [
-            int(value)
-            for value in cu_seqlens.detach().to("cpu").tolist()
-        ]
-        sequence_ranges = [
-            (0, start, end)
-            for start, end in zip(offsets, offsets[1:])
-        ]
-
-    max_chunks_per_solve = 128
-    identity = torch.eye(BT, device=A.device, dtype=torch.float32).view(
-        1, 1, BT, BT
-    )
-    for batch_idx, sequence_start, sequence_end in sequence_ranges:
-        sequence_len = sequence_end - sequence_start
-        num_chunks = (sequence_len + BT - 1) // BT
-        for first_chunk in range(0, num_chunks, max_chunks_per_solve):
-            chunk_count = min(
-                max_chunks_per_solve, num_chunks - first_chunk
-            )
-            token_start = sequence_start + first_chunk * BT
-            token_end = min(token_start + chunk_count * BT, sequence_end)
-            valid_tokens = token_end - token_start
-            packed = torch.zeros(
-                (chunk_count * BT, H, BT),
-                device=A.device,
-                dtype=torch.float32,
-            )
-            packed[:valid_tokens].copy_(
-                A[batch_idx, token_start:token_end].to(torch.float32)
-            )
-            blocks = packed.view(chunk_count, BT, H, BT).permute(
-                0, 2, 1, 3
-            )
-            system = torch.tril(blocks, diagonal=-1) + identity
-            inverse = torch.linalg.solve_triangular(
-                system,
-                identity.expand(chunk_count, H, -1, -1),
-                upper=False,
-                unitriangular=True,
-            )
-            solved = inverse.permute(0, 2, 1, 3).reshape(
-                chunk_count * BT, H, BT
-            )
-            final_chunk_len = sequence_len % BT
-            has_partial_final_chunk = (
-                token_end == sequence_end and final_chunk_len != 0
-            )
-            if has_partial_final_chunk:
-                full_tokens = valid_tokens - final_chunk_len
-                if full_tokens:
-                    output[
-                        batch_idx,
-                        token_start : token_start + full_tokens,
-                    ].copy_(solved[:full_tokens].to(output_dtype))
-                output[
-                    batch_idx,
-                    token_start + full_tokens : token_end,
-                    :,
-                    :final_chunk_len,
-                ].copy_(
-                    solved[
-                        full_tokens:valid_tokens,
-                        :,
-                        :final_chunk_len,
-                    ].to(output_dtype)
-                )
-            else:
-                output[batch_idx, token_start:token_end].copy_(
-                    solved[:valid_tokens].to(output_dtype)
-                )
-    return output
-
-
-def _use_stable_torch_solve() -> bool:
-    """Select the explicit torch fallback only when requested.
-
-    The copied vLLM-Ascend Triton implementation is the production default for
-    both eager and graph modes. Set ``VLLM_FL_GDN_TORCH_SOLVE=1`` only for
-    precision diagnostics or recovery on an unsupported runtime.
-    """
-    return os.environ.get("VLLM_FL_GDN_TORCH_SOLVE", "0") == "1"
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -458,9 +351,6 @@ def solve_tril(
         (I + A)^-1 with the same shape as A
     """
     assert A.shape[-1] in [16, 32, 64]
-
-    if _use_stable_torch_solve():
-        return _solve_tril_torch(A, cu_seqlens, output_dtype)
 
     B, T, H, BT = A.shape
     Ad = torch.empty(B, T, H, 16, device=A.device, dtype=torch.float if BT != 16 else output_dtype)

@@ -1401,52 +1401,6 @@ class TestAscendFIAQueryStartLoc:
 
 
 # =============================================================================
-# Layer 1: Precision dump helper tests
-# =============================================================================
-
-
-class TestPrecisionDumpHelpers:
-    def test_layer_selectors_preserve_selector_order_and_deduplicate(self):
-        from vllm_fl.worker.model_runner import _select_precision_dump_layers
-
-        layer_names = [
-            "model.layers.0.linear_attn",
-            "model.layers.1.linear_attn",
-            "model.layers.2.linear_attn",
-        ]
-
-        assert _select_precision_dump_layers(
-            layer_names, ["last", "first", "layers.1", "last"]
-        ) == [layer_names[2], layer_names[0], layer_names[1]]
-
-    def test_layer_selectors_support_substring_matches(self):
-        from vllm_fl.worker.model_runner import _select_precision_dump_layers
-
-        layer_names = ["model.layers.0.gdn", "model.layers.2.gdn", "other"]
-
-        assert _select_precision_dump_layers(layer_names, ["layers"]) == layer_names[:2]
-
-    def test_layer_selectors_support_exact_match(self):
-        from vllm_fl.worker.model_runner import _select_precision_dump_layers
-
-        layer_names = ["model.layers.1.gdn", "model.layers.10.gdn"]
-
-        assert _select_precision_dump_layers(layer_names, ["=model.layers.1.gdn"]) == [
-            layer_names[0]
-        ]
-
-    def test_precision_dump_cpu_recurses_and_detaches(self):
-        from vllm_fl.worker.model_runner import _precision_dump_cpu
-
-        source = torch.arange(3.0, requires_grad=True)
-        dumped = _precision_dump_cpu({"nested": (source,)})
-
-        assert dumped["nested"][0].device.type == "cpu"
-        assert not dumped["nested"][0].requires_grad
-        torch.testing.assert_close(dumped["nested"][0], source.detach())
-
-
-# =============================================================================
 # Layer 1: ExecuteModelState Data Structure Tests
 # =============================================================================
 
