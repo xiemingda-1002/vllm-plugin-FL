@@ -114,7 +114,10 @@ def _accelerator_synchronize() -> None:
         torch.accelerator.synchronize()
 
 
-if current_platform.dist_backend == "flagcx" or current_platform.device_type == "musa":
+if (
+    current_platform.dist_backend == "flagcx"
+    or current_platform.device_type in ("musa", "npu")
+):
     @contextmanager
     def graph_capture(device: torch.device):
         """
