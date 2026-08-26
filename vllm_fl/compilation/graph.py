@@ -85,6 +85,9 @@ class AscendGraphParams:
     workspaces: dict[int, list[torch.Tensor]]
     handles: dict[int, list[Any]]
     attention_params: dict[int, list[Any]]
+    conv1d_events: dict[int, list[Any]]
+    conv1d_handles: dict[int, list[Any]]
+    conv1d_params: dict[int, list[tuple[Any, ...]]]
 
 
 _ascend_graph_params: AscendGraphParams | None = None
@@ -92,7 +95,7 @@ _ascend_graph_capturing = False
 
 
 def set_ascend_graph_params(capture_sizes: list[int]) -> None:
-    """Initialize per-shape attention task state before graph capture."""
+    """Initialize per-shape task update storage before graph capture."""
     global _ascend_graph_params
     sizes = sorted(set(capture_sizes))
     _ascend_graph_params = AscendGraphParams(
@@ -100,6 +103,9 @@ def set_ascend_graph_params(capture_sizes: list[int]) -> None:
         workspaces={size: [] for size in sizes},
         handles={size: [] for size in sizes},
         attention_params={size: [] for size in sizes},
+        conv1d_events={size: [] for size in sizes},
+        conv1d_handles={size: [] for size in sizes},
+        conv1d_params={size: [] for size in sizes},
     )
 
 
@@ -130,14 +136,21 @@ def update_ascend_full_graph_params(
     update_stream: Any,
     forward_context: Any,
     num_tokens: int,
+    vllm_config: VllmConfig,
 ) -> None:
-    """Refresh Ascend attention parameters consumed by the next replay."""
+    """Refresh host parameters consumed by task groups on the next replay."""
     from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import (
         AscendAttentionBackendImpl,
+    )
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.gdn import (
+        update_conv1d_graph_params,
     )
 
     AscendAttentionBackendImpl.update_graph_params(
         update_stream, forward_context, num_tokens
+    )
+    update_conv1d_graph_params(
+        update_stream, forward_context, num_tokens, vllm_config
     )
 
 

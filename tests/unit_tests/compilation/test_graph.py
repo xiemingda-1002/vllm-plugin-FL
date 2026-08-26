@@ -68,6 +68,10 @@ def test_ascend_graph_params_are_initialized_per_capture_size(monkeypatch):
     assert set(params.workspaces) == {1, 4}
     assert set(params.handles) == {1, 4}
     assert set(params.attention_params) == {1, 4}
+    assert set(params.conv1d_events) == {1, 4}
+    assert set(params.conv1d_handles) == {1, 4}
+    assert set(params.conv1d_params) == {1, 4}
+    assert all(workspace == [] for workspace in params.workspaces.values())
 
 
 def test_weak_workspace_lifecycle_retains_each_task(monkeypatch):
@@ -90,3 +94,19 @@ def test_weak_workspace_lifecycle_retains_each_task(monkeypatch):
     assert graph.get_ascend_graph_params().workspaces[2] == [
         ("weak", id(value)) for value in owned
     ]
+
+
+def test_reinitialization_drops_profile_capture_state(monkeypatch):
+    import vllm_fl.compilation.graph as graph
+
+    monkeypatch.setattr(graph, "_ascend_graph_params", None)
+    graph.set_ascend_graph_params([1, 2])
+    params = graph.get_ascend_graph_params()
+    assert params is not None
+    params.handles[1].append(object())
+
+    # Runtime capture must not retain task handles from temporary profile graphs.
+    graph.set_ascend_graph_params([1, 2])
+    refreshed = graph.get_ascend_graph_params()
+    assert refreshed is not None
+    assert refreshed.handles[1] == []
