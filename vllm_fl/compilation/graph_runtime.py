@@ -1,7 +1,12 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Device-specific lifecycle hooks for static graph execution."""
+"""Device-specific lifecycle hooks for static graph execution.
+
+The model runner owns *when* a graph is prepared, captured, and replayed.
+This module owns the small device-specific actions performed at those
+lifecycle points so worker code does not need hardware checks.
+"""
 
 from contextlib import contextmanager, nullcontext
 from typing import Any

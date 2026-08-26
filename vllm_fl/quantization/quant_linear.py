@@ -1,11 +1,22 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 
+from importlib.util import find_spec
+
 from vllm.platforms import PlatformEnum, current_platform
 
-from .fp8 import FlagGemsFp8BlockScaledMMLinearKernel
 from vllm_fl.utils import use_flaggems_op
 
 FLAGGEMS_FP8_BLOCK_GEMM_OP = "flaggems_fp8_block_gemm"
+
+FlagGemsFp8BlockScaledMMLinearKernel = None
+if (
+    current_platform.device_type != "npu"
+    or (
+        use_flaggems_op(FLAGGEMS_FP8_BLOCK_GEMM_OP)
+        and find_spec("flag_gems") is not None
+    )
+):
+    from .fp8 import FlagGemsFp8BlockScaledMMLinearKernel
 
 
 def _resolve_source_platform() -> PlatformEnum:
