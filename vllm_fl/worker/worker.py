@@ -390,7 +390,7 @@ class WorkerFL(WorkerBase):
 
         if current_platform.device_type == "npu":
             from vllm_fl.dispatch.backends.vendor.ascend.impl.triton_utils import (
-                    init_device_properties_triton,
+                init_device_properties_triton,
             )
             init_device_properties_triton()
             import torch_npu._inductor  # noqa: F401
@@ -628,6 +628,38 @@ class WorkerFL(WorkerBase):
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes = []
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+            # M-RoPE position buffers intentionally allocate one extra column
+            # so slices passed to torch.compile stay non-contiguous.  Dynamo
+            # therefore guards their row stride as max_num_batched_tokens + 1,
+            # while upstream builds compile ranges only through
+            # max_num_batched_tokens.  At the boundary (for example 16384
+            # tokens) the full-decode graph would otherwise fail during
+            # capture with ``Shape: 16385 out of considered ranges``.
+            #
+            # Extend only the terminal symbolic range.  This does not enlarge
+            # scheduler batches or graph capture sizes; those remain entirely
+            # automatic and bounded by the original scheduler configuration.
+            compilation_config = self.vllm_config.compilation_config
+            if (
+                current_platform.device_type == "npu"
+                and self.model_runner.uses_mrope
+                and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and compilation_config.compile_ranges_endpoints
+            ):
+                max_num_tokens = self.scheduler_config.max_num_batched_tokens
+                endpoints = compilation_config.compile_ranges_endpoints
+                if endpoints[-1] == max_num_tokens:
+                    compilation_config.compile_ranges_endpoints = [
+                        *endpoints[:-1],
+                        max_num_tokens + 1,
+                    ]
+                    logger.info(
+                        "Extending the terminal M-RoPE compile range from %d "
+                        "to %d for the non-contiguous position-buffer stride.",
+                        max_num_tokens,
+                        max_num_tokens + 1,
+                    )
+
             # warm up sizes that are not in cudagraph capture sizes,
             # but users still want to compile for better performance,
             # e.g. for the max-num-batched token size in chunked prefill.
@@ -648,7 +680,14 @@ class WorkerFL(WorkerBase):
             all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
             for compile_range in compile_ranges:
                 if not any(x in compile_range for x in all_sizes):
-                    warmup_sizes.append(compile_range.end)
+                    # The M-RoPE-only terminal extension above describes a
+                    # symbolic stride, not a schedulable token count.
+                    warmup_sizes.append(
+                        min(
+                            compile_range.end,
+                            self.scheduler_config.max_num_batched_tokens,
+                        )
+                    )
 
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
@@ -887,12 +926,22 @@ class WorkerFL(WorkerBase):
             if self.profiler is None:
                 profiler_type = self.profiler_config.profiler
                 if profiler_type == "torch":
-                    self.profiler = TorchProfilerWrapper(
-                        self.profiler_config,
-                        worker_name=trace_name,
-                        local_rank=self.local_rank,
-                        activities=["CPU", "CUDA"],
-                    )
+                    if current_platform.device_type == "npu":
+                        from vllm_fl.profiler.torch_npu_profiler import (
+                            TorchNPUProfilerWrapper,
+                        )
+
+                        self.profiler = TorchNPUProfilerWrapper(
+                            self.profiler_config,
+                            trace_name,
+                        )
+                    else:
+                        self.profiler = TorchProfilerWrapper(
+                            self.profiler_config,
+                            worker_name=trace_name,
+                            local_rank=self.local_rank,
+                            activities=["CPU", "CUDA"],
+                        )
                     logger.debug(
                         "Starting torch profiler with trace name: %s", trace_name
                     )

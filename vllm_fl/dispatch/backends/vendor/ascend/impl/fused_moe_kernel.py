@@ -8,9 +8,15 @@ Uses a CPU side-channel to pass moe_align data to the GEMM kernel,
 avoiding any NPU→CPU transfers during the hot path.
 """
 
+import logging
+import os
+
 import torch
 import numpy as np
 from vllm.utils.math_utils import round_up
+
+
+logger = logging.getLogger(__name__)
 
 
 def moe_align_block_size_torch(
@@ -22,6 +28,12 @@ def moe_align_block_size_torch(
     ignore_invalid_experts: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pure-torch moe_align_block_size for Ascend NPU (CPU-based)."""
+    debug = os.environ.get("VLLM_FL_DEBUG_MOE", "0") == "1"
+    if debug:
+        logger.warning(
+            "MOE_DEBUG align enter shape=%s device=%s block_size=%d experts=%d",
+            tuple(topk_ids.shape), topk_ids.device, block_size, num_experts,
+        )
     device = topk_ids.device
     num_tokens = topk_ids.numel()
 
@@ -32,6 +44,8 @@ def moe_align_block_size_torch(
         max_num_tokens_padded = min(num_tokens * block_size, max_num_tokens_padded)
 
     topk_ids_flat = topk_ids.view(-1).cpu()
+    if debug:
+        logger.warning("MOE_DEBUG align topk_ids.cpu complete")
     padding_value = num_tokens
 
     expert_counts = torch.bincount(topk_ids_flat.long(), minlength=num_experts)[:num_experts]
@@ -79,6 +93,9 @@ def moe_align_block_size_torch(
         expert_map_cpu = expert_map.cpu()
         valid = expert_ids_tensor >= 0
         expert_ids_tensor[valid] = expert_map_cpu[expert_ids_tensor[valid].long()]
+
+    if debug:
+        logger.warning("MOE_DEBUG align host routing complete actual_len=%d", actual_len)
 
     return sorted_ids.to(device), expert_ids_tensor.to(device), num_tokens_post_pad.to(device)
 
@@ -298,6 +315,13 @@ def _invoke_fused_moe_loop(
     use_fp8_w8a8=False, use_int8_w8a8=False, B_bias=None,
 ):
     """Fallback per-expert torch.mm loop."""
+    debug = os.environ.get("VLLM_FL_DEBUG_MOE", "0") == "1"
+    if debug:
+        logger.warning(
+            "MOE_DEBUG loop enter A=%s B=%s C=%s aligned=%s",
+            tuple(A.shape), tuple(B.shape), tuple(C.shape),
+            sorted_token_ids is not None,
+        )
     N = B.shape[1]
     block_size = config["BLOCK_SIZE_M"]
     c_flat = C.view(-1, N)
@@ -312,7 +336,11 @@ def _invoke_fused_moe_loop(
     expert_indices = {}
 
     if sorted_token_ids is None:
+        if debug:
+            logger.warning("MOE_DEBUG loop expert_ids.cpu begin")
         expert_ids_cpu = expert_ids.cpu().numpy()
+        if debug:
+            logger.warning("MOE_DEBUG loop expert_ids.cpu complete")
         expert_batches = {}
         for pair_idx in range(len(expert_ids_cpu)):
             if pair_idx >= num_valid_tokens:
@@ -352,9 +380,15 @@ def _invoke_fused_moe_loop(
             a_idx = valid_ids // max(top_k, 1)
             expert_indices[expert_id] = (valid_ids, a_idx)
 
-    for expert_id, (valid_ids, a_idx) in expert_indices.items():
+    for loop_idx, (expert_id, (valid_ids, a_idx)) in enumerate(
+        expert_indices.items()
+    ):
+        if debug and loop_idx == 0:
+            logger.warning("MOE_DEBUG loop first expert mm begin expert=%d", expert_id)
         a_block = A[a_idx]
         out = torch.mm(a_block, B[expert_id].t())
+        if debug and loop_idx == 0:
+            logger.warning("MOE_DEBUG loop first expert mm submitted")
 
         if B_bias is not None:
             out = out + B_bias[expert_id]
@@ -366,3 +400,5 @@ def _invoke_fused_moe_loop(
         c_flat[valid_ids] = out.to(c_flat.dtype)
 
     del expert_indices
+    if debug:
+        logger.warning("MOE_DEBUG loop exit")

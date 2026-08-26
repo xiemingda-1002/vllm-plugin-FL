@@ -79,6 +79,73 @@ class GraphOptions:
     weak_ref_output: bool = True
 
 
+@dataclasses.dataclass
+class AscendGraphParams:
+    """Host-side task update state for a captured Ascend full graph."""
+
+    events: dict[int, list[Any]]
+    workspaces: dict[int, torch.Tensor | None]
+    handles: dict[int, list[Any]]
+    attention_params: dict[int, list[tuple[Any, ...]]]
+    conv1d_events: dict[int, list[Any]]
+    conv1d_handles: dict[int, list[Any]]
+    conv1d_params: dict[int, list[tuple[Any, ...]]]
+
+
+_ascend_graph_params: AscendGraphParams | None = None
+_ascend_graph_capturing = False
+
+
+def set_ascend_graph_params(capture_sizes: list[int]) -> None:
+    """Initialize per-shape task update storage before graph capture."""
+    global _ascend_graph_params
+    sizes = sorted(set(capture_sizes))
+    _ascend_graph_params = AscendGraphParams(
+        events={size: [] for size in sizes},
+        workspaces={size: None for size in sizes},
+        handles={size: [] for size in sizes},
+        attention_params={size: [] for size in sizes},
+        conv1d_events={size: [] for size in sizes},
+        conv1d_handles={size: [] for size in sizes},
+        conv1d_params={size: [] for size in sizes},
+    )
+
+
+def get_ascend_graph_params() -> AscendGraphParams | None:
+    return _ascend_graph_params
+
+
+def set_ascend_graph_capturing(capturing: bool) -> None:
+    global _ascend_graph_capturing
+    _ascend_graph_capturing = capturing
+
+
+def is_ascend_graph_capturing() -> bool:
+    return _ascend_graph_capturing
+
+
+def update_ascend_full_graph_params(
+    update_stream: Any,
+    forward_context: Any,
+    num_tokens: int,
+    vllm_config: VllmConfig,
+) -> None:
+    """Refresh host parameters consumed by task groups on the next replay."""
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import (
+        AscendAttentionBackendImpl,
+    )
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.gdn import (
+        update_conv1d_graph_params,
+    )
+
+    AscendAttentionBackendImpl.update_graph_params(
+        update_stream, forward_context, num_tokens
+    )
+    update_conv1d_graph_params(
+        update_stream, forward_context, num_tokens, vllm_config
+    )
+
+
 class GraphWrapper:
     """FL-specific graph wrapper that supports multiple device types (CUDA, NPU).
     Adapted from upstream CUDAGraphWrapper with platform-agnostic graph capture."""
@@ -151,6 +218,13 @@ class GraphWrapper:
             return self.runnable(*args, **kwargs)
 
         forward_context = get_forward_context()
+        if current_platform.device_type == "npu":
+            # This context is created for one model invocation.  Keep a
+            # per-invocation marker in addition to the module-level marker
+            # used by Ascend operators while capture is active.  The runner
+            # inspects this after the wrapped model returns so it can avoid
+            # scheduling a task update for the capture invocation itself.
+            setattr(forward_context, "capturing", False)
         batch_descriptor = forward_context.batch_descriptor
         graph_runtime_mode = forward_context.cudagraph_runtime_mode
 
@@ -206,20 +280,29 @@ class GraphWrapper:
             except (ImportError, RuntimeError):
                 pass
 
-            # FL-specific: use platform-agnostic graph capture
-            with current_platform.torch_device_fn.graph(
-                graph, pool=self.graph_pool
-            ):
-                # `output` is managed by pytorch's cudagraph pool
-                output = self.runnable(*args, **kwargs)
-                # Join offloader's copy stream after forward if available
-                try:
-                    from vllm.model_executor.offloader.base import get_offloader
-                    get_offloader().join_after_forward()
-                except (ImportError, RuntimeError):
-                    pass
-                if self.cudagraph_options.weak_ref_output:
-                    output = weak_ref_tensors(output)
+            # Ascend custom operators record task-group handles only while the
+            # outer NPUGraph is being captured.
+            if current_platform.device_type == "npu":
+                setattr(forward_context, "capturing", True)
+                set_ascend_graph_capturing(True)
+            try:
+                # FL-specific: use platform-agnostic graph capture
+                with current_platform.torch_device_fn.graph(
+                    graph, pool=self.graph_pool
+                ):
+                    # `output` is managed by pytorch's graph pool
+                    output = self.runnable(*args, **kwargs)
+                    # Join offloader's copy stream after forward if available
+                    try:
+                        from vllm.model_executor.offloader.base import get_offloader
+                        get_offloader().join_after_forward()
+                    except (ImportError, RuntimeError):
+                        pass
+                    if self.cudagraph_options.weak_ref_output:
+                        output = weak_ref_tensors(output)
+            finally:
+                if current_platform.device_type == "npu":
+                    set_ascend_graph_capturing(False)
 
             entry.output = weak_ref_tensors(output)
             entry.graph = graph
