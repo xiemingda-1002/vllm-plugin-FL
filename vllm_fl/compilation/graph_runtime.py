@@ -10,7 +10,10 @@ import torch
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import GraphCaptureContext
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 _GRAPH_CLASS_NAMES = {
     "cuda": "CUDAGraph",
@@ -97,14 +100,28 @@ class GraphRuntimeBackend:
     def after_model_forward(self, vllm_config: VllmConfig) -> None:
         pass
 
+    def adjust_compile_ranges(
+        self,
+        compilation_config: Any,
+        *,
+        uses_mrope: bool,
+        max_num_tokens: int,
+    ) -> None:
+        pass
+
+    def should_reserve_moe_workspace(self, compilation_config: Any) -> bool:
+        return False
+
 
 class AscendGraphRuntimeBackend(GraphRuntimeBackend):
-    """Ascend attention task state and synchronization around NPUGraph."""
+    """Ascend task-group state and synchronization around NPUGraph."""
 
     def __init__(self) -> None:
         self._update_stream: Any | None = None
 
     def prepare_forward_context(self, forward_context: Any) -> None:
+        # The marker is scoped to one model invocation. The runner uses it to
+        # distinguish capture from replay after the wrapped model returns.
         forward_context.capturing = False
 
     def begin_capture(self, forward_context: Any) -> None:
@@ -166,8 +183,40 @@ class AscendGraphRuntimeBackend(GraphRuntimeBackend):
             self._update_stream,
             forward_context,
             batch_descriptor.num_tokens,
+            vllm_config,
         )
 
+    def adjust_compile_ranges(
+        self,
+        compilation_config: Any,
+        *,
+        uses_mrope: bool,
+        max_num_tokens: int,
+    ) -> None:
+        """Include the non-contiguous M-RoPE row stride in Dynamo ranges."""
+        if (
+            not uses_mrope
+            or compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            or not compilation_config.compile_ranges_endpoints
+        ):
+            return
+
+        endpoints = compilation_config.compile_ranges_endpoints
+        if endpoints[-1] != max_num_tokens:
+            return
+        compilation_config.compile_ranges_endpoints = [
+            *endpoints[:-1],
+            max_num_tokens + 1,
+        ]
+        logger.info(
+            "Extending the terminal M-RoPE compile range from %d to %d "
+            "for the non-contiguous position-buffer stride.",
+            max_num_tokens,
+            max_num_tokens + 1,
+        )
+
+    def should_reserve_moe_workspace(self, compilation_config: Any) -> bool:
+        return compilation_config.cudagraph_mode != CUDAGraphMode.NONE
 
 _GRAPH_RUNTIME_BACKENDS: dict[str, type[GraphRuntimeBackend]] = {
     "npu": AscendGraphRuntimeBackend,
