@@ -9,7 +9,10 @@
 The implementation follows the Ascend non-quantized AllGather execution order
 and weight layout. The surrounding vLLM modular MoE runner retains ownership
 of shared-expert execution and the final tensor-parallel reduction, while FL
-provides the Ascend routing and GMM compute path.
+provides the Ascend routing and GMM compute path. With expert parallelism
+enabled, vLLM supplies the local expert map and performs the final cross-rank
+reduction; this method routes and computes only the experts owned by the
+current EP rank.
 """
 
 from __future__ import annotations
