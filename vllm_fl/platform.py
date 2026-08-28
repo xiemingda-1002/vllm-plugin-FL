@@ -610,6 +610,21 @@ class PlatformFL(Platform):
             )
 
             patch_mamba_config()
+
+            # Register the ModelSlim config before VllmConfig validates the
+            # command-line quantization method.
+            from vllm_fl.quantization.modelslim import (
+                ASCEND_QUANTIZATION_METHOD,
+                AscendModelSlimConfig,  # noqa: F401
+            )
+
+            if parser is not None:
+                quant_action = parser._option_string_actions.get(
+                    "--quantization"
+                )
+                choices = getattr(quant_action, "choices", None)
+                if choices and ASCEND_QUANTIZATION_METHOD not in choices:
+                    choices.append(ASCEND_QUANTIZATION_METHOD)
         elif cls.device_name == "gcu":
             import vllm_fl.dispatch.backends.vendor.gcu  # noqa: F401
         elif cls.device_type == "ptpu":
