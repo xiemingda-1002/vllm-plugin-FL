@@ -27,6 +27,10 @@ _ACL_FORMAT_FRACTAL_NZ = 29
 def _npu_format_nz(weight: torch.Tensor) -> torch.Tensor:
     import torch_npu
 
+    # Quantized matmul kernels consume FRACTAL_NZ weights. The runtime rejects
+    # format casts while internal formats are disabled and silently leaves the
+    # tensor in its base layout, so enable the format before converting weights.
+    torch.npu.config.allow_internal_format = True
     return torch_npu.npu_format_cast(weight, _ACL_FORMAT_FRACTAL_NZ)
 
 

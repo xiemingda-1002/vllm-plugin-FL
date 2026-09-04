@@ -190,6 +190,18 @@ def register_router():
 def register_model():
     """Register FL-specific models not yet upstream."""
     from vllm import ModelRegistry
+    from vllm.platforms import current_platform
+
+    if current_platform.device_type == "npu":
+        # Model registration runs after platform selection in API, scheduler,
+        # and worker processes. Install DSA cache scheduling here so each
+        # spawned role sees the same compressed cache-spec mapping without
+        # initializing the device runtime during platform discovery.
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.dsa_cache_manager import (
+            install_dsa_cache_manager,
+        )
+
+        install_dsa_cache_manager()
 
     _register_flagcx_connector()
 
@@ -210,9 +222,14 @@ def register_model():
 
     # Register DeepseekV4 model
     try:
+        deepseek_v4_model = (
+            "vllm_fl.models.deepseek_v4_ascend:AscendDeepseekV4ForCausalLM"
+            if current_platform.device_type == "npu"
+            else "vllm_fl.models.deepseek_v4:DeepseekV4ForCausalLM"
+        )
         ModelRegistry.register_model(
             "DeepseekV4ForCausalLM",
-            "vllm_fl.models.deepseek_v4:DeepseekV4ForCausalLM"
+            deepseek_v4_model,
         )
     except Exception as e:
         logger.error(f"Register DeepseekV4 model error: {str(e)}")

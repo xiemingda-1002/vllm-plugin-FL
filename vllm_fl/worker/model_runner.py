@@ -556,6 +556,67 @@ def _should_pad_fia_query_start_loc(
     )
 
 
+class AttentionMetadataPadding(NamedTuple):
+    """Padded descriptor fields consumed by attention metadata builders.
+
+    ``num_tokens`` and ``num_reqs`` are populated only when attention must
+    follow the padded model-forward descriptor.  The real scheduled token and
+    request counts remain separate inputs to the metadata builder.
+    """
+
+    num_tokens: int | None
+    num_reqs: int | None
+
+    @property
+    def enabled(self) -> bool:
+        return self.num_tokens is not None
+
+
+def _resolve_attention_metadata_padding(
+    device_type: str,
+    cudagraph_runtime_mode: CUDAGraphMode,
+    batch_descriptor: BatchDescriptor,
+    *,
+    num_tokens_unpadded: int,
+    num_reqs_unpadded: int,
+) -> AttentionMetadataPadding:
+    """Align attention inputs with the final model-forward descriptor.
+
+    Full graphs require padded attention metadata on every accelerator.  On
+    Ascend, a DP collective can downgrade a locally padded decode graph to
+    eager execution while retaining the padded token descriptor.  The model
+    still forwards that padded shape, so Ascend attention metadata must retain
+    it as well.  Other platforms keep the upstream eager behavior.
+    """
+    num_tokens_padded = batch_descriptor.num_tokens
+    if num_tokens_padded < num_tokens_unpadded:
+        raise ValueError(
+            "Attention batch descriptor cannot contain fewer tokens than "
+            f"the scheduled batch: {num_tokens_padded} < "
+            f"{num_tokens_unpadded}"
+        )
+
+    pad_for_full_graph = cudagraph_runtime_mode == CUDAGraphMode.FULL
+    pad_for_ascend_execution = (
+        device_type == "npu"
+        and num_tokens_padded > num_tokens_unpadded
+    )
+    if not (pad_for_full_graph or pad_for_ascend_execution):
+        return AttentionMetadataPadding(None, None)
+
+    num_reqs_padded = (
+        batch_descriptor.num_reqs
+        if batch_descriptor.num_reqs is not None
+        else num_reqs_unpadded
+    )
+    if num_reqs_padded < num_reqs_unpadded:
+        raise ValueError(
+            "Attention batch descriptor cannot contain fewer requests than "
+            f"the scheduled batch: {num_reqs_padded} < {num_reqs_unpadded}"
+        )
+    return AttentionMetadataPadding(num_tokens_padded, num_reqs_padded)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -787,10 +848,25 @@ def _reserve_modular_moe_workspace(
 
         impl = getattr(moe_kernel, "impl", None)
         fused_experts = getattr(impl, "fused_experts", None)
+        prepare_finalize = getattr(impl, "prepare_finalize", None)
         moe_config = getattr(module, "moe_config", None)
         w13_weight = getattr(module, "w13_weight", None)
         if fused_experts is None or moe_config is None or w13_weight is None:
             continue
+
+        workspace_tokens = max_num_tokens
+        reservation_method = getattr(
+            type(prepare_finalize), "max_workspace_tokens", None
+        )
+        if callable(reservation_method):
+            workspace_tokens = int(
+                reservation_method(prepare_finalize, max_num_tokens)
+            )
+            if workspace_tokens < max_num_tokens:
+                raise ValueError(
+                    "modular MoE workspace token bound cannot be smaller "
+                    "than max_num_tokens"
+                )
 
         # These are the same problem dimensions passed by
         # FusedMoEKernelModularImpl._fused_experts at runtime.
@@ -802,7 +878,7 @@ def _reserve_modular_moe_workspace(
         )
         workspace13_shape, workspace2_shape, output_shape = (
             fused_experts.workspace_shapes(
-                max_num_tokens,
+                workspace_tokens,
                 intermediate_dim,
                 hidden_dim,
                 top_k,
@@ -874,6 +950,14 @@ class ModelRunnerFL(
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
         self.max_model_len = model_config.max_model_len
+        hf_text_config = self.model_config.hf_text_config
+        self.use_compress = (
+            current_platform.device_type == "npu"
+            and hasattr(hf_text_config, "compress_ratios")
+        )
+        self._dsa_num_scheduled_tokens_compressed_list: (
+            list[np.ndarray] | None
+        ) = None
 
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
@@ -1166,6 +1250,22 @@ class ModelRunnerFL(
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
+        )
+        # DSA metadata is prepared on the host. Keep a persistent pinned
+        # mirror so graph capture never records a temporary D2H result.
+        self._dsa_positions_cpu_buf = (
+            torch.zeros(
+                self.max_num_tokens,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            )
+            if self.use_compress
+            else None
+        )
+        self._dsa_positions_np_buf = (
+            self._dsa_positions_cpu_buf.numpy()
+            if self._dsa_positions_cpu_buf is not None
+            else None
         )
         # FIA TND graph capture may append one virtual request so that the
         # final query boundary equals the padded hidden-state shape.
@@ -2625,11 +2725,44 @@ class ModelRunnerFL(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        if self.use_compress:
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.dsa_utils import (
+                compute_dsa_slot_mappings,
+                get_compressed_pos_and_indices,
+            )
+
+            assert self._dsa_positions_np_buf is not None
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                self.query_pos.np[:total_num_scheduled_tokens],
+                out=self._dsa_positions_np_buf[:total_num_scheduled_tokens],
+            )
+
+            (
+                positions_compressed_list,
+                req_indices_compressed_list,
+                self._dsa_num_scheduled_tokens_compressed_list,
+            ) = get_compressed_pos_and_indices(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                num_scheduled_tokens[:num_reqs],
+                self.arange_np[:num_reqs],
+                self.kv_cache_config.kv_cache_groups,
+            )
+            compute_dsa_slot_mappings(
+                self.input_batch.block_table,
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+                positions_compressed_list,
+                req_indices_compressed_list,
+            )
+        else:
+            self._dsa_num_scheduled_tokens_compressed_list = None
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2765,6 +2898,14 @@ class ModelRunnerFL(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
 
+            if (
+                self.use_compress
+                and self._dsa_num_scheduled_tokens_compressed_list is None
+            ):
+                # DSA warmup/capture uses synthetic requests. Point every
+                # active row at the null block instead of retaining stale state.
+                blk_table_tensor[:num_reqs_padded].fill_(NULL_BLOCK_ID)
+
             # Fill unused block table entries with NULL_BLOCK_ID (null block)
             # for CUDAGraph padding. Block 0 is reserved for padding.
             blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
@@ -2849,6 +2990,7 @@ class ModelRunnerFL(
                 is_prefilling=is_prefilling,
                 num_input_tokens=num_tokens_padded,
                 positions=self.positions[:num_tokens_padded],
+                positions_cpu=self._dsa_positions_cpu_buf,
                 attn_state=ascend_attn_state,
                 prefill_context_parallel_metadata=None,
                 kvcomp_metadata=None,
@@ -2905,6 +3047,9 @@ class ModelRunnerFL(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
+        dsa_prefill_metadata: dict[Any, Any] = {}
+        dsa_decode_metadata: dict[Any, Any] = {}
+        dsa_common_metadata: dict[Any, Any] = {}
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -2912,6 +3057,9 @@ class ModelRunnerFL(
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
         ) -> None:
+            nonlocal dsa_prefill_metadata
+            nonlocal dsa_decode_metadata
+            nonlocal dsa_common_metadata
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             builder_common_attn_metadata = (
@@ -2943,7 +3091,37 @@ class ModelRunnerFL(
                     ],
                 )
 
-            if for_cudagraph_capture:
+            is_dsa_builder = False
+            if self.use_compress:
+                from vllm_fl.dispatch.backends.vendor.ascend.impl.dsa import (
+                    AscendDSAMetadataBuilder,
+                )
+
+                is_dsa_builder = isinstance(
+                    builder,
+                    AscendDSAMetadataBuilder,
+                )
+                if is_dsa_builder:
+                    extra_attn_metadata_args = dict(
+                        compress_ratio=getattr(
+                            kv_cache_spec,
+                            "compress_ratio",
+                            1,
+                        ),
+                        num_reqs_actual=num_reqs,
+                        prefill_ratio_to_sas_metadata=(
+                            {} if for_cudagraph_capture else dsa_prefill_metadata
+                        ),
+                        decode_ratio_to_sas_metadata=(
+                            {} if for_cudagraph_capture else dsa_decode_metadata
+                        ),
+                        common_ratio_to_sas_metadata=(
+                            {} if for_cudagraph_capture else dsa_common_metadata
+                        ),
+                        block_size=kv_cache_spec.block_size,
+                    )
+
+            if for_cudagraph_capture and not is_dsa_builder:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     builder_common_attn_metadata
                 )
@@ -2964,6 +3142,11 @@ class ModelRunnerFL(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+
+            if is_dsa_builder:
+                dsa_prefill_metadata = builder.prefill_ratio_to_sas_metadata
+                dsa_decode_metadata = builder.decode_ratio_to_sas_metadata
+                dsa_common_metadata = builder.common_ratio_to_sas_metadata
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -4606,6 +4789,12 @@ class ModelRunnerFL(
         ):
             return None, None
 
+        # Some compatibility and unit-test callers construct a lightweight
+        # runner without invoking the full initializer. Compression is an
+        # opt-in DeepSeek DSA capability, so a missing flag must retain the
+        # ordinary slot-mapping contract.
+        use_compress = getattr(self, "use_compress", False)
+
         def _get_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = self.kv_cache_config.kv_cache_groups[
@@ -4650,9 +4839,30 @@ class ModelRunnerFL(
                     buffer[:num_tokens_padded].copy_(slot_mapping)
                     slot_mapping = buffer[:num_tokens_padded]
 
-            # Fill unused with -1. Needed for reshape_and_cache in full cuda
-            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
+            # Compressed DSA groups produce fewer fresh cache positions than
+            # model input tokens. Keep their valid prefix and mask the rest;
+            # ordinary groups retain the usual unpadded-token boundary.
+            if (
+                use_compress
+                and self._dsa_num_scheduled_tokens_compressed_list is not None
+            ):
+                valid_tokens = int(
+                    np.sum(
+                        self._dsa_num_scheduled_tokens_compressed_list[
+                            kv_cache_gid
+                        ]
+                    )
+                )
+                slot_mapping[valid_tokens:num_tokens_padded].fill_(-1)
+            elif use_compress:
+                # Dummy/graph-capture runs have no fresh compressed position
+                # metadata. Clear persistent buffers so stale request state
+                # cannot be captured.
+                slot_mapping[:num_tokens_padded].fill_(0)
+            else:
+                # Fill unused with -1. Needed for reshape-and-cache in full
+                # graph mode.
+                slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
 
             return slot_mapping
 
@@ -4844,7 +5054,13 @@ class ModelRunnerFL(
                 for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
                 if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
             )
-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+            attention_padding = _resolve_attention_metadata_padding(
+                current_platform.device_type,
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_unpadded=num_tokens_unpadded,
+                num_reqs_unpadded=num_reqs,
+            )
 
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
@@ -4874,7 +5090,11 @@ class ModelRunnerFL(
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-            ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+            ubatch_slices_attn = (
+                ubatch_slices_padded
+                if attention_padding.enabled
+                else ubatch_slices
+            )
 
             if _should_pad_fia_query_start_loc(
                 current_platform.device_type,
@@ -4887,13 +5107,19 @@ class ModelRunnerFL(
                     cudagraph_mode,
                     batch_desc.num_reqs,
                 )
+                attention_padding = AttentionMetadataPadding(
+                    attention_padding.num_tokens,
+                    num_reqs_padded,
+                )
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
+                if attention_padding.enabled or has_separate_kv_update
                 else num_tokens_unpadded,
                 num_reqs_padded=(
-                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+                    num_reqs_padded
+                    if attention_padding.enabled or has_separate_kv_update
+                    else num_reqs
                 ),
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
@@ -4902,9 +5128,9 @@ class ModelRunnerFL(
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_tokens_padded=attention_padding.num_tokens,
                     num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    num_reqs_padded=attention_padding.num_reqs,
                     max_query_len=max_num_scheduled_tokens,
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
@@ -6266,6 +6492,10 @@ class ModelRunnerFL(
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
 
+        # Compression is enabled only by the fully initialized DeepSeek DSA
+        # runner. Lightweight compatibility callers keep the standard path.
+        use_compress = getattr(self, "use_compress", False)
+
         assert (
             cudagraph_runtime_mode is None
             or cudagraph_runtime_mode.is_valid_runtime_mode()
@@ -6384,6 +6614,12 @@ class ModelRunnerFL(
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
+        if use_compress:
+            # Synthetic runs never carry request-derived compression counts.
+            # Clear the previous real batch before building persistent dummy
+            # slot mappings and block tables.
+            self._dsa_num_scheduled_tokens_compressed_list = None
+
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
             num_reqs_padded=num_reqs_padded,
@@ -6391,11 +6627,12 @@ class ModelRunnerFL(
             ubatch_slices=ubatch_slices_padded,
         )
 
-        # Dummy runs have no real slot assignments — fill with -1 so
-        # concat_and_cache kernels skip the KV write.
+        # Ordinary attention uses -1 to skip dummy KV writes. DSA converts
+        # flat slots to [block, offset], so it needs the reserved null slot.
         if slot_mappings_by_group is not None:
+            dummy_slot = 0 if use_compress else -1
             for sm in slot_mappings_by_group.values():
-                sm.fill_(-1)
+                sm.fill_(dummy_slot)
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
         # etc.) with execute_model.  It must participate in the same event
@@ -6405,6 +6642,13 @@ class ModelRunnerFL(
             # If force_attention is True, we always capture attention.
             # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                attention_padding = _resolve_attention_metadata_padding(
+                    current_platform.device_type,
+                    cudagraph_runtime_mode,
+                    batch_desc,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_reqs_unpadded=num_reqs,
+                )
                 if profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
@@ -6453,6 +6697,10 @@ class ModelRunnerFL(
                         cudagraph_runtime_mode,
                         batch_desc.num_reqs,
                     )
+                    attention_padding = AttentionMetadataPadding(
+                        attention_padding.num_tokens,
+                        num_reqs_padded,
+                    )
 
                 # Sync block table CPU->GPU so cleared rows from
                 # remove_request() are visible to the attention metadata
@@ -6460,14 +6708,22 @@ class ModelRunnerFL(
                 # requests can corrupt Mamba state.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
-                pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                if use_compress:
+                    assert self._dsa_positions_cpu_buf is not None
+                    self.positions[:num_tokens_padded].fill_(127)
+                    self._dsa_positions_cpu_buf[:num_tokens_padded].fill_(127)
+
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_tokens_padded=attention_padding.num_tokens,
                     num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    num_reqs_padded=attention_padding.num_reqs,
                     max_query_len=max_query_len,
-                    ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
+                    ubatch_slices=(
+                        ubatch_slices_padded
+                        if attention_padding.enabled
+                        else ubatch_slices
+                    ),
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
@@ -6626,6 +6882,11 @@ class ModelRunnerFL(
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+
+        if use_compress and force_attention:
+            assert self._dsa_positions_cpu_buf is not None
+            self.positions.zero_()
+            self._dsa_positions_cpu_buf.zero_()
 
         return hidden_states, hidden_states
 
@@ -7601,6 +7862,16 @@ class ModelRunnerFL(
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+                    reshape_kv_cache = getattr(
+                        attn_backend, "reshape_kv_cache", None
+                    )
+                    if reshape_kv_cache is not None:
+                        specialized_kv_cache = reshape_kv_cache(
+                            raw_tensor, kv_cache_spec, num_blocks
+                        )
+                        if specialized_kv_cache is not None:
+                            kv_caches[layer_name] = specialized_kv_cache
+                            continue
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -7834,15 +8105,40 @@ class ModelRunnerFL(
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
-        bind_kv_cache(
-            kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_caches,
-            num_attn_module,
-        )
+        hf_text_config = self.model_config.hf_text_config
+        if self.use_compress and hf_text_config.model_type == "deepseek_v4":
+            # A DeepSeek V4 layer owns several cache entries (compressed
+            # attention, indexer state/scale and sliding state).  Sorting by
+            # the model's logical layer order preserves the runner cache
+            # contract, while binding every named entry directly avoids the
+            # one-attention-cache-per-layer assumption in the generic helper.
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.dsa_utils import (
+                extract_dsv4_layer_index,
+            )
+
+            assert len(self.kv_caches) == 0
+            for layer_name in sorted(
+                kv_caches,
+                key=lambda name: (
+                    extract_dsv4_layer_index(hf_text_config, name),
+                    name,
+                ),
+            ):
+                self.kv_caches.append(kv_caches[layer_name])
+            for layer_name, kv_cache in kv_caches.items():
+                self.compilation_config.static_forward_context[
+                    layer_name
+                ].kv_cache = [kv_cache]
+        else:
+            num_attn_module = (
+                2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
+            )
+            bind_kv_cache(
+                kv_caches,
+                self.compilation_config.static_forward_context,
+                self.kv_caches,
+                num_attn_module,
+            )
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

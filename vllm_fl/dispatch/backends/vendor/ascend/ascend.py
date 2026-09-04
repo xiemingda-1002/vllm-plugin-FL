@@ -310,3 +310,38 @@ class AscendBackend(Backend):
             s = topk_weights.sum(dim=-1, keepdim=True)
             topk_weights.div_(s.clamp(min=1e-8))
         return topk_weights, topk_indices
+
+    def mhc_pre(
+        self,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits=1,
+    ):
+        """Run the Ascend mHC pre-mixing kernel."""
+        from .impl.mhc import mhc_pre_ascend
+
+        return mhc_pre_ascend(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+        )
+
+    def mhc_post(self, x, residual, post, comb):
+        """Run the Ascend mHC post-mixing kernel."""
+        from .impl.mhc import mhc_post_ascend
+
+        return mhc_post_ascend(x, residual, post, comb)

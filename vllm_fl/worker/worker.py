@@ -1253,6 +1253,12 @@ class WorkerFL(WorkerBase):
         if new_ep_size < old_ep_size:
             self._eplb_before_scale_down(old_ep_size, new_ep_size)
 
+        if current_platform.device_type == "npu":
+            from vllm_fl.distributed.ascend_parallel_state import (
+                destroy_ascend_mc2_group,
+            )
+
+            destroy_ascend_mc2_group()
         cleanup_dist_env_and_memory()
 
         if (
@@ -1336,6 +1342,13 @@ def init_worker_distributed_environment(
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+
+    if current_platform.device_type == "npu":
+        from vllm_fl.distributed.ascend_parallel_state import (
+            init_ascend_mc2_group,
+        )
+
+        init_ascend_mc2_group(vllm_config)
 
     # Init ec connector here before KV caches caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
