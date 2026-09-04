@@ -1410,6 +1410,81 @@ class TestAscendFIAQueryStartLoc:
         assert int(fia_common.query_start_loc_cpu[-1]) == 32
 
 
+class TestAttentionMetadataPadding:
+    @pytest.mark.parametrize(
+        (
+            "device_type",
+            "runtime_mode",
+            "num_tokens_unpadded",
+            "descriptor_tokens",
+            "descriptor_reqs",
+            "expected",
+        ),
+        [
+            # A local C15 decode selects the C16 graph bucket, then another DP
+            # rank's prefill downgrades the final mode to NONE.  Forward still
+            # consumes C16, while query_start_loc keeps the 15 real requests.
+            (
+                "npu",
+                CUDAGraphMode.NONE,
+                15,
+                16,
+                None,
+                (16, 15),
+            ),
+            ("npu", CUDAGraphMode.NONE, 16, 16, None, (None, None)),
+            ("npu", CUDAGraphMode.FULL, 15, 16, 16, (16, 16)),
+            ("cuda", CUDAGraphMode.NONE, 15, 16, None, (None, None)),
+            ("cuda", CUDAGraphMode.FULL, 15, 16, 16, (16, 16)),
+        ],
+    )
+    def test_resolves_final_execution_descriptor_contract(
+        self,
+        device_type,
+        runtime_mode,
+        num_tokens_unpadded,
+        descriptor_tokens,
+        descriptor_reqs,
+        expected,
+    ):
+        from vllm.forward_context import BatchDescriptor
+
+        from vllm_fl.worker.model_runner import (
+            _resolve_attention_metadata_padding,
+        )
+
+        descriptor = BatchDescriptor(
+            num_tokens=descriptor_tokens,
+            num_reqs=descriptor_reqs,
+        )
+        padding = _resolve_attention_metadata_padding(
+            device_type,
+            runtime_mode,
+            descriptor,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_reqs_unpadded=15,
+        )
+
+        assert tuple(padding) == expected
+        assert padding.enabled is (expected[0] is not None)
+
+    def test_rejects_descriptor_smaller_than_scheduled_batch(self):
+        from vllm.forward_context import BatchDescriptor
+
+        from vllm_fl.worker.model_runner import (
+            _resolve_attention_metadata_padding,
+        )
+
+        with pytest.raises(ValueError, match="fewer tokens"):
+            _resolve_attention_metadata_padding(
+                "npu",
+                CUDAGraphMode.NONE,
+                BatchDescriptor(num_tokens=14),
+                num_tokens_unpadded=15,
+                num_reqs_unpadded=15,
+            )
+
+
 # =============================================================================
 # Layer 1: ExecuteModelState Data Structure Tests
 # =============================================================================
@@ -1926,6 +2001,65 @@ class TestReserveModularMoeWorkspace:
         workspace_manager.get_simultaneous.assert_called_once_with(
             ((64 * 8 * 256,), torch.bfloat16),
             ((64, 8, 1024), torch.bfloat16),
+        )
+
+    def test_honors_distributed_workspace_token_bound(self):
+        from vllm_fl.worker.model_runner import _reserve_modular_moe_workspace
+
+        class FakePrepareFinalize:
+            def max_workspace_tokens(self, max_num_tokens):
+                del self
+                return max_num_tokens * 3
+
+        class FakeExperts:
+            @staticmethod
+            def workspace_shapes(
+                tokens,
+                intermediate_dim,
+                hidden_dim,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            ):
+                del intermediate_dim, top_k, global_num_experts
+                del local_num_experts, expert_tokens_meta, activation
+                return (tokens, hidden_dim), (1,), (tokens, hidden_dim)
+
+            @staticmethod
+            def workspace_dtype(in_dtype):
+                return in_dtype
+
+        moe_layer = torch.nn.Module()
+        moe_layer.quant_method = MagicMock()
+        moe_layer.quant_method.moe_kernel.is_monolithic = False
+        impl = moe_layer.quant_method.moe_kernel.impl
+        impl.prepare_finalize = FakePrepareFinalize()
+        impl.fused_experts = FakeExperts()
+        moe_layer.moe_config = MagicMock(
+            hidden_dim=1024,
+            experts_per_token=8,
+            num_experts=256,
+            in_dtype=torch.bfloat16,
+        )
+        moe_layer.global_num_experts = 256
+        moe_layer.w13_weight = torch.empty(128, 512, 1024, device="meta")
+        moe_layer.activation = "silu"
+
+        model = torch.nn.Module()
+        model.add_module("moe", moe_layer)
+        workspace_manager = MagicMock()
+
+        num_kernels, reserved_bytes = _reserve_modular_moe_workspace(
+            model, max_num_tokens=64, workspace_manager=workspace_manager
+        )
+
+        assert num_kernels == 1
+        assert reserved_bytes == (192 * 1024 + 1) * 2
+        workspace_manager.get_simultaneous.assert_called_once_with(
+            ((192 * 1024,), torch.bfloat16),
+            ((1,), torch.bfloat16),
         )
 
     def test_skips_monolithic_moe_kernel(self):

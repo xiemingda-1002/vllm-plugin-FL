@@ -25,6 +25,7 @@ def apply_ascend_patches() -> None:
 
     patch_mamba_config()
     patch_mamba_utils()
+    patch_dsa_kv_cache_manager()
     patch_gdn_ascend_ops()
     patch_op_cls()
 
@@ -73,6 +74,14 @@ def patch_mamba_utils() -> None:
 
     apply_mamba_utils_patch()
     logger.info("Patched Mamba batch memcpy for Ascend")
+
+
+def patch_dsa_kv_cache_manager() -> None:
+    """Install compressed-token block management for Ascend DSA models."""
+    from .impl.dsa_cache_manager import install_dsa_cache_manager
+
+    install_dsa_cache_manager()
+    logger.info("Installed Ascend DSA KV-cache manager")
 
 
 def patch_op_cls() -> None:
