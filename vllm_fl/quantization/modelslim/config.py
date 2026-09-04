@@ -281,7 +281,6 @@ class AscendModelSlimConfig(QuantizationConfig):
         )
         from vllm.model_executor.layers.linear import (
             LinearBase,
-            UnquantizedLinearMethod,
         )
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             UnquantizedEmbeddingMethod,
@@ -299,7 +298,11 @@ class AscendModelSlimConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             quant_type = self._get_linear_quant_type(prefix)
             if quant_type == "FLOAT":
-                return UnquantizedLinearMethod()
+                from vllm_fl.dispatch.backends.vendor.ascend.impl.linear import (
+                    AscendUnquantizedLinearMethod,
+                )
+
+                return AscendUnquantizedLinearMethod()
 
             from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
                 AscendModelSlimLinearMethod,

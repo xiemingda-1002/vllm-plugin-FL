@@ -60,6 +60,10 @@ def _make_layer(method, *, num_experts=2, hidden_size=2, intermediate_size=1):
     layer.activation = MoEActivation.SILU
     layer.apply_router_weight_on_input = False
     layer.expert_map = None
+    layer.local_num_experts = num_experts
+    layer.global_num_experts = num_experts
+    layer.logical_num_experts = num_experts
+    layer.ep_rank = 0
     method.create_weights(
         layer,
         num_experts=num_experts,
@@ -72,7 +76,48 @@ def _make_layer(method, *, num_experts=2, hidden_size=2, intermediate_size=1):
 
 
 def _mock_expert_kernels(monkeypatch):
+    routing_state = {}
     monkeypatch.setattr(moe, "_npu_format_nz", lambda tensor: tensor)
+
+    def fake_init_routing(
+        x,
+        topk_ids,
+        *,
+        active_num,
+        expert_num,
+        active_expert_range,
+    ):
+        first_expert, last_expert = active_expert_range
+        routing_state["topk_ids"] = topk_ids.clone()
+        routing_state["expert_num"] = expert_num
+        routing_state["active_expert_range"] = active_expert_range
+        pairs = []
+        for token_idx in range(topk_ids.shape[0]):
+            for topk_idx in range(topk_ids.shape[1]):
+                expert_idx = int(topk_ids[token_idx, topk_idx])
+                if first_expert <= expert_idx < last_expert:
+                    flat_idx = token_idx * topk_ids.shape[1] + topk_idx
+                    pairs.append((expert_idx, flat_idx, token_idx))
+        pairs.sort(key=lambda item: item[0])
+        routing_state["pairs"] = pairs
+        routing_state["num_tokens"] = x.shape[0]
+        routing_state["top_k"] = topk_ids.shape[1]
+
+        sorted_x = x.new_zeros((active_num, x.shape[-1]))
+        expanded_row_idx = topk_ids.new_zeros(active_num)
+        expert_tokens = torch.zeros(
+            last_expert - first_expert,
+            dtype=torch.int64,
+        )
+        for sorted_idx, (expert_idx, flat_idx, token_idx) in enumerate(pairs):
+            sorted_x[sorted_idx] = x[token_idx]
+            expanded_row_idx[sorted_idx] = flat_idx
+            expert_tokens[expert_idx - first_expert] += 1
+        input_scale = torch.ones(active_num, dtype=torch.float32)
+        assert expert_num >= last_expert
+        return sorted_x, expanded_row_idx, expert_tokens, input_scale
+
+    monkeypatch.setattr(moe, "_npu_moe_init_routing", fake_init_routing)
     monkeypatch.setattr(
         moe,
         "_npu_dynamic_quant",
@@ -81,16 +126,63 @@ def _mock_expert_kernels(monkeypatch):
             torch.ones(tensor.shape[0], dtype=torch.float32),
         ),
     )
+
+    def fake_grouped_quant_matmul(
+        x,
+        weight,
+        weight_scale,
+        per_token_scale,
+        expert_tokens,
+        *,
+        output_dtype,
+    ):
+        del weight_scale, per_token_scale
+        output = torch.zeros(
+            (x.shape[0], weight.shape[-1]),
+            dtype=output_dtype,
+        )
+        start = 0
+        for expert_idx, token_count in enumerate(expert_tokens.tolist()):
+            end = start + token_count
+            output[start:end] = (
+                x[start:end].float() @ weight[expert_idx].float()
+            ).to(output_dtype)
+            start = end
+        return output
+
     monkeypatch.setattr(
         moe,
-        "_npu_quant_matmul",
-        lambda x, weight, scale, **kwargs: x.float() @ weight.float(),
+        "_npu_grouped_quant_matmul",
+        fake_grouped_quant_matmul,
     )
     monkeypatch.setattr(
         moe,
         "_npu_moe_activation",
         lambda activation, tensor: tensor[:, :1] * tensor[:, 1:],
     )
+
+    def fake_token_unpermute(routed, expanded_row_idx, topk_weights):
+        del expanded_row_idx
+        output = routed.new_zeros(
+            (routing_state["num_tokens"], routed.shape[-1])
+        )
+        for sorted_idx, (_, flat_idx, token_idx) in enumerate(
+            routing_state["pairs"]
+        ):
+            if topk_weights is None:
+                weight = 1.0
+            else:
+                topk_idx = flat_idx % routing_state["top_k"]
+                weight = topk_weights[token_idx, topk_idx]
+            output[token_idx] += routed[sorted_idx] * weight
+        return output
+
+    monkeypatch.setattr(
+        moe,
+        "_npu_moe_token_unpermute",
+        fake_token_unpermute,
+    )
+    return routing_state
 
 
 def _load_known_weights(layer):
@@ -257,7 +349,7 @@ def test_vllm_weight_loader_merges_w1_w3_channel_parameters():
 
 
 def test_post_load_and_local_topk_accumulation(monkeypatch):
-    _mock_expert_kernels(monkeypatch)
+    routing_state = _mock_expert_kernels(monkeypatch)
     method = AscendModelSlimW8A8DynamicMoEMethod(_moe_config())
     layer = _make_layer(method)
     _load_known_weights(layer)
@@ -266,6 +358,8 @@ def test_post_load_and_local_topk_accumulation(monkeypatch):
     assert layer.w13_weight.shape == (2, 2, 2)
     assert layer.w2_weight.shape == (2, 1, 2)
     assert layer.w13_weight_scale.shape == (2, 2)
+    assert layer.w13_weight_scale_fp32.shape == (2, 2)
+    assert layer.w13_weight_scale_fp32.dtype == torch.float32
     assert layer.w2_weight_scale.shape == (2, 2)
 
     output = method.apply(
@@ -280,26 +374,33 @@ def test_post_load_and_local_topk_accumulation(monkeypatch):
         output,
         torch.tensor([[21.25, 29.0], [25.0, 50.0]]),
     )
+    assert routing_state["expert_num"] == 2
+    assert routing_state["active_expert_range"] == [0, 2]
 
 
 def test_expert_map_skips_non_local_experts(monkeypatch):
-    _mock_expert_kernels(monkeypatch)
+    routing_state = _mock_expert_kernels(monkeypatch)
     method = AscendModelSlimW8A8DynamicMoEMethod(_moe_config())
     layer = _make_layer(method)
     _load_known_weights(layer)
     method.process_weights_after_loading(layer)
-    # global expert 0 -> local 1, expert 1 is remote, expert 2 -> local 0
-    layer.expert_map = torch.tensor([1, -1, 0])
+    # Rank 0 owns global experts 0 and 1; global expert 2 is remote.
+    layer.expert_map = torch.tensor([0, 1, -1])
+    layer.global_num_experts = 3
+    layer.logical_num_experts = 3
 
     output = method.apply(
         layer,
         torch.tensor([[2.0, 3.0]]),
         topk_weights=torch.tensor([[0.5, 0.25, 0.25]]),
-        topk_ids=torch.tensor([[0, 1, 2]]),
+        topk_ids=torch.tensor([[0, 2, 1]]),
         shared_experts_input=None,
     )
 
-    assert torch.allclose(output, torch.tensor([[14.5, 20.0]]))
+    assert torch.allclose(output, torch.tensor([[8.75, 13.0]]))
+    assert torch.equal(routing_state["topk_ids"], torch.tensor([[0, 2, 1]]))
+    assert routing_state["expert_num"] == 3
+    assert routing_state["active_expert_range"] == [0, 2]
 
 
 def test_nonzero_moe_weight_offset_is_rejected(monkeypatch):

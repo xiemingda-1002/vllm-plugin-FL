@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 import vllm.model_executor.parameter as parameter_module
@@ -44,6 +47,29 @@ def _mock_tensor_parallel_state(monkeypatch):
 
 def _weight_loader(*args, **kwargs):
     del args, kwargs
+
+
+def test_npu_format_nz_enables_internal_format(monkeypatch):
+    state = {}
+    config = SimpleNamespace(allow_internal_format=False)
+
+    def fake_format_cast(weight, format_code):
+        state["weight"] = weight
+        state["format_code"] = format_code
+        return weight
+
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(config=config))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu_format_cast=fake_format_cast),
+    )
+    weight = torch.ones(2, 2)
+
+    assert w8a8._npu_format_nz(weight) is weight
+    assert config.allow_internal_format is True
+    assert state["weight"] is weight
+    assert state["format_code"] == 29
 
 
 def _make_layer(method, output_partition_sizes, params_dtype=torch.bfloat16):

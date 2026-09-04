@@ -119,8 +119,8 @@ def _load_local() -> bool:
         op_api_lib = opp / "op_api" / "lib"
         _prepend_env_path("LD_LIBRARY_PATH", op_api_lib)
         try:
-            # The FL binding registers only the Qwen3.6-required schemas and
-            # dispatch implementations.  The actual kernels come from OPP.
+            # The FL binding registers the schemas and dispatch implementations
+            # used by its Ascend model paths. The actual kernels come from OPP.
             custom_opapi = op_api_lib / "libcust_opapi.so"
             if custom_opapi.is_file():
                 torch.ops.load_library(str(custom_opapi))

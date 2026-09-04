@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the FL-local CANN custom operators used by Qwen3.6 on A2/A3.
+# Build the FL-local CANN custom operators used by Ascend model backends.
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ case "${soc_version}" in
     prebuilt_dir=ascend910_93
     ;;
   *)
-    echo "Unsupported Qwen3.6 Ascend SOC_VERSION: ${soc_version}" >&2
+    echo "Unsupported Ascend SOC_VERSION: ${soc_version}" >&2
     exit 2
     ;;
 esac
@@ -46,6 +46,17 @@ ops=(
   moe_gating_top_k
   moe_init_routing_custom
   apply_top_k_top_p_custom
+  hc_pre_sinkhorn
+  hc_pre_inv_rms
+  hc_post
+  scatter_nd_update_v2
+  compressor
+  inplace_partial_rotary_mul
+  quant_lightning_indexer
+  quant_lightning_indexer_metadata
+  rms_norm_dynamic_quant
+  sparse_attn_sharedkv
+  sparse_attn_sharedkv_metadata
 )
 ops_csv=$(IFS=,; echo "${ops[*]}")
 

@@ -126,6 +126,7 @@ def test_selects_float_and_dynamic_linear_methods():
     float_config = AscendModelSlimConfig({"model.proj.weight": "FLOAT"})
     float_method = float_config.get_quant_method(_LinearStub(), "model.proj")
     assert isinstance(float_method, UnquantizedLinearMethod)
+    assert type(float_method).__name__ == "AscendUnquantizedLinearMethod"
 
     dynamic_config = AscendModelSlimConfig(
         {"model.proj.weight": "W8A8_DYNAMIC"}
@@ -167,6 +168,7 @@ def test_model_prefix_adapter_is_registered_outside_generic_config():
     method = config.get_quant_method(_LinearStub(), "proj")
 
     assert isinstance(method, UnquantizedLinearMethod)
+    assert type(method).__name__ == "AscendUnquantizedLinearMethod"
 
 
 def test_npu_pre_register_adds_ascend_quantization_choice(monkeypatch):
