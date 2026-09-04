@@ -2,6 +2,7 @@
 # FL router subclasses that route ops through call_op dispatch.
 
 import torch
+import torch.nn.functional as F
 from functools import partial
 
 from vllm._aiter_ops import rocm_aiter_ops
@@ -96,7 +97,10 @@ def _fl_grouped_topk(
         "Number of tokens mismatch"
     )
 
-    if e_score_correction_bias is not None:
+    if (
+        e_score_correction_bias is not None
+        and scoring_func != "sqrtsoftplus"
+    ):
         if scoring_func == "sigmoid":
             topk_values, topk_indices = _grouped_topk(
                 gating_output,
@@ -129,28 +133,42 @@ def _fl_grouped_topk(
         scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
         scores = torch.sigmoid(gating_output)
+    elif scoring_func == "sqrtsoftplus":
+        scores = F.softplus(gating_output).sqrt()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    selection_scores = scores
+    if e_score_correction_bias is not None:
+        selection_scores = scores + e_score_correction_bias.unsqueeze(0)
 
     num_experts = scores.size(-1)
     group_size = num_experts // num_expert_group
 
-    scores_grouped = scores.view(-1, num_expert_group, group_size)
-    group_scores = scores_grouped.amax(dim=-1)
-    _, selected_groups = torch.topk(
-        group_scores, k=topk_group, dim=-1, sorted=False
+    # Selecting every group leaves the expert candidate set unchanged.  In
+    # particular, models with a single group must not build a redundant mask:
+    # the former per-expert loop emitted one ScatterElements kernel for every
+    # expert when captured as a full graph.
+    if topk_group != num_expert_group:
+        scores_grouped = selection_scores.view(
+            -1, num_expert_group, group_size
+        )
+        group_scores = scores_grouped.amax(dim=-1)
+        _, selected_groups = torch.topk(
+            group_scores, k=topk_group, dim=-1, sorted=False
+        )
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(1, selected_groups, True)
+        expert_mask = group_mask.unsqueeze(-1).expand(
+            -1, -1, group_size
+        ).reshape_as(selection_scores)
+        selection_scores = selection_scores.masked_fill(
+            ~expert_mask, float("-inf")
+        )
+    _, topk_ids = torch.topk(
+        selection_scores, k=topk, dim=-1, sorted=False
     )
-    mask = torch.zeros_like(scores)
-    for i in range(topk_group):
-        group_idx = selected_groups[:, i]
-        start = group_idx * group_size
-        for j in range(group_size):
-            mask.scatter_(1, (start + j).unsqueeze(1), 1.0)
-
-    scores = scores * mask
-    topk_weights, topk_ids = torch.topk(
-        scores, k=topk, dim=-1, sorted=False
-    )
+    topk_weights = scores.gather(1, topk_ids)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     if routed_scaling_factor != 1.0:

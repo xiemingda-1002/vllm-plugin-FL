@@ -1,13 +1,76 @@
+import ast
+import inspect
+import textwrap
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
 )
 
 from vllm_fl.ops.fused_moe import fused_moe_utils
+from vllm_fl.ops.fused_moe.router import _fl_grouped_topk
+
+
+def _legacy_grouped_topk_reference(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    routed_scaling_factor: float,
+    e_score_correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference for the pre-vectorization grouped routing semantics."""
+    assert hidden_states.size(0) == gating_output.size(0)
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = torch.sigmoid(gating_output)
+    elif scoring_func == "sqrtsoftplus":
+        scores = F.softplus(gating_output).sqrt()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    selection_scores = scores
+    if e_score_correction_bias is not None:
+        selection_scores = scores + e_score_correction_bias.unsqueeze(0)
+
+    num_experts = scores.size(-1)
+    group_size = num_experts // num_expert_group
+    scores_grouped = selection_scores.view(
+        -1, num_expert_group, group_size
+    )
+    group_scores = scores_grouped.amax(dim=-1)
+    selected_groups = torch.topk(
+        group_scores, k=topk_group, dim=-1, sorted=False
+    ).indices
+    mask = torch.zeros_like(scores)
+    for i in range(topk_group):
+        group_idx = selected_groups[:, i]
+        start = group_idx * group_size
+        for j in range(group_size):
+            mask.scatter_(1, (start + j).unsqueeze(1), 1.0)
+
+    selection_scores = selection_scores.masked_fill(
+        ~mask.bool(), float("-inf")
+    )
+    topk_ids = torch.topk(
+        selection_scores, k=topk, dim=-1, sorted=False
+    ).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(
+            dim=-1, keepdim=True
+        )
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
 def _import_ascend_backend_module():
@@ -214,3 +277,175 @@ def test_ascend_native_topk_fast_path_is_not_registered_for_other_routers():
 
     assert "grouped_topk" not in ascend.AscendBackend.__dict__
     assert "fused_topk_bias" not in ascend.AscendBackend.__dict__
+
+
+def test_grouped_topk_supports_sqrtsoftplus_with_correction_bias():
+    hidden_states = torch.zeros(1, 4)
+    gating_output = torch.tensor(
+        [[-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]]
+    )
+    correction_bias = torch.tensor(
+        [10.0, -10.0, -10.0, -10.0, 0.0, 0.0, 0.0, 0.0]
+    )
+
+    weights, ids = _fl_grouped_topk(
+        hidden_states,
+        gating_output,
+        topk=2,
+        renormalize=True,
+        num_expert_group=2,
+        topk_group=1,
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=1.5,
+        e_score_correction_bias=correction_bias,
+    )
+
+    scores = F.softplus(gating_output).sqrt()
+    scores_for_choice = scores + correction_bias.unsqueeze(0)
+    selected_group = scores_for_choice.view(1, 2, 4).amax(-1).argmax(-1)
+    group_mask = torch.zeros_like(scores, dtype=torch.bool)
+    group_start = selected_group * 4
+    group_mask[:, group_start.item() : group_start.item() + 4] = True
+    expected_ids = torch.topk(
+        scores_for_choice.masked_fill(~group_mask, float("-inf")),
+        k=2,
+        dim=-1,
+        sorted=False,
+    ).indices
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights *= 1.5
+
+    torch.testing.assert_close(weights, expected_weights)
+    assert torch.equal(ids, expected_ids.to(torch.int32))
+
+
+@pytest.mark.parametrize(
+    (
+        "seed",
+        "num_tokens",
+        "num_experts",
+        "num_expert_group",
+        "topk_group",
+        "topk",
+        "scoring_func",
+        "renormalize",
+        "routed_scaling_factor",
+        "with_correction_bias",
+    ),
+    [
+        (11, 7, 16, 4, 2, 3, "softmax", False, 1.0, False),
+        (23, 5, 12, 3, 2, 4, "sigmoid", True, 0.75, False),
+        (37, 6, 24, 4, 2, 5, "sqrtsoftplus", True, 1.5, True),
+        # Selecting every group is the fast path used by DeepSeek-V4-Flash:
+        # its absent n_group/topk_group config values both default to one.
+        (41, 8, 32, 4, 4, 6, "sqrtsoftplus", True, 1.5, True),
+    ],
+    ids=(
+        "multi-token-multi-group-softmax",
+        "multi-token-multi-group-sigmoid-renorm-scale",
+        "sqrtsoftplus-correction-bias",
+        "all-groups-selected",
+    ),
+)
+def test_grouped_topk_vectorized_matches_legacy_routing(
+    seed,
+    num_tokens,
+    num_experts,
+    num_expert_group,
+    topk_group,
+    topk,
+    scoring_func,
+    renormalize,
+    routed_scaling_factor,
+    with_correction_bias,
+):
+    generator = torch.Generator().manual_seed(seed)
+    hidden_states = torch.randn(
+        num_tokens, 13, generator=generator, dtype=torch.float32
+    )
+    # The monotonic expert offset makes exact top-k ties vanishingly unlikely,
+    # so ID parity checks the group-mask transformation rather than tie order.
+    gating_output = torch.randn(
+        num_tokens, num_experts, generator=generator, dtype=torch.float32
+    )
+    gating_output += torch.arange(num_experts, dtype=torch.float32) * 1e-4
+    correction_bias = (
+        torch.randn(num_experts, generator=generator, dtype=torch.float32)
+        if with_correction_bias
+        else None
+    )
+
+    actual_weights, actual_ids = _fl_grouped_topk(
+        hidden_states,
+        gating_output,
+        topk=topk,
+        renormalize=renormalize,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        scoring_func=scoring_func,
+        routed_scaling_factor=routed_scaling_factor,
+        e_score_correction_bias=correction_bias,
+    )
+    expected_weights, expected_ids = _legacy_grouped_topk_reference(
+        hidden_states,
+        gating_output,
+        topk=topk,
+        renormalize=renormalize,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        scoring_func=scoring_func,
+        routed_scaling_factor=routed_scaling_factor,
+        e_score_correction_bias=correction_bias,
+    )
+
+    assert torch.equal(actual_ids, expected_ids)
+    torch.testing.assert_close(actual_weights, expected_weights)
+
+
+def test_grouped_topk_all_groups_selected_skips_mask(monkeypatch):
+    hidden_states = torch.zeros(4, 8)
+    gating_output = torch.randn(4, 16)
+
+    def unexpected_zeros_like(*args, **kwargs):
+        pytest.fail("selecting every group must not allocate a group mask")
+
+    monkeypatch.setattr(torch, "zeros_like", unexpected_zeros_like)
+
+    weights, ids = _fl_grouped_topk(
+        hidden_states,
+        gating_output,
+        topk=4,
+        renormalize=True,
+        num_expert_group=4,
+        topk_group=4,
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=1.5,
+        e_score_correction_bias=torch.linspace(-0.2, 0.2, 16),
+    )
+
+    assert weights.shape == (4, 4)
+    assert ids.shape == (4, 4)
+
+
+def test_grouped_topk_has_no_scatter_inside_python_loop():
+    """Prevent reintroducing one ScatterElements launch per expert."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_fl_grouped_topk)))
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    scatter_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "scatter_"
+    ]
+    assert len(scatter_calls) == 1
+
+    ancestor = parents.get(scatter_calls[0])
+    while ancestor is not None:
+        assert not isinstance(ancestor, (ast.For, ast.AsyncFor, ast.While))
+        ancestor = parents.get(ancestor)
