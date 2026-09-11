@@ -22,7 +22,6 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
-from vllm.config import MultiModalConfig
 
 MIN_PAD_SIZE = 64  # min_size to pad weight
 MAX_PAD_SIZE = 128  # max_size to pad weight
@@ -37,7 +36,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         scale: float | None = None,
         num_kv_heads: int | None = None,
         prefix: str = "",
-        multimodal_config: MultiModalConfig | None = None,
     ) -> None:
         """
         Args:
@@ -47,7 +45,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             num_kv_heads: number of kv heads.
             prefix: This has no effect, it is only here to make it easier to
                     swap between Attention and MMEncoderAttention.
-            multimodal_config: configs for multi-modal.
         """
         super().__init__(
             num_heads=num_heads,
@@ -55,7 +52,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             scale=scale,
             num_kv_heads=num_kv_heads,
             prefix=prefix,
-            multimodal_config=multimodal_config,
         )
 
     def reshape_qkv_to_3d(
@@ -83,13 +79,13 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         return query, key, value
 
     def forward_oot(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            cu_seqlens: torch.Tensor | None = None,
-            max_seqlen: torch.Tensor
-        | None = None,  # Only used for Flash Attention
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        sequence_lengths: torch.Tensor | None = None,
     ):
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)

@@ -72,6 +72,8 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
     elif current_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
+    elif current_platform.device_type == "npu":
+        _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.TRITON]
     return _AVAILABLE_BACKENDS
 
 ## Adopt from select_unquantized_moe_backend
@@ -88,6 +90,9 @@ def select_unquantized_moe_backend_oot(moe_config: FusedMoEConfig,
 
     if current_platform.is_tpu():
         return UnquantizedMoeBackend.TPU, None
+
+    if current_platform.device_type == "npu":
+        return UnquantizedMoeBackend.TRITON, TritonExpertsFL
 
     if current_platform.is_out_of_tree() and use_flaggems():
         return UnquantizedMoeBackend.TRITON, TritonExpertsFL
@@ -277,6 +282,10 @@ def _prepare_expert_assignment(
     )
 
 class TritonExpertsFL(TritonExperts):
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return current_platform.device_type == "npu" or TritonExperts._supports_current_device()
+
     def apply(
         self,
         output: torch.Tensor,
@@ -295,6 +304,28 @@ class TritonExpertsFL(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if current_platform.device_type == "npu":
+            if self._lora_context is not None:
+                raise NotImplementedError("Ascend unquantized MoE LoRA is not part of the TP2 BF16 closure")
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.fused_moe import (
+                fused_experts_impl,
+            )
+
+            output.copy_(
+                fused_experts_impl(
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation=activation.value,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                )
+            )
+            return
+
         # Fast path (no LoRA, NVIDIA only): single fused FlagGems call.
         if self._lora_context is None and current_platform.is_cuda():
             import flag_gems

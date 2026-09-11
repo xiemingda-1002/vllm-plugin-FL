@@ -146,3 +146,22 @@ class AscendBackend(Backend):
                 raise NotImplementedError("MLA with sparse attention is not implemented for Ascend yet.")
             return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendMLABackend"
         return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendAttentionBackend"
+
+    def topk_softmax(
+        self,
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+        token_expert_indices: torch.Tensor,
+        gating_output: torch.Tensor,
+        renormalize: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fill vLLM's preallocated softmax top-k outputs on Ascend."""
+        from .impl.fused_moe import topk_softmax_ascend
+
+        return topk_softmax_ascend(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+        )
