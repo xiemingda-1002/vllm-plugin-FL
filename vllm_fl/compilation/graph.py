@@ -27,6 +27,11 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_fl.compilation.graph_runtime import (
+    GraphRuntimeController,
+    StaticInputBindings,
+)
+
 logger = init_logger(__name__)
 
 
@@ -37,22 +42,6 @@ def weak_ref_tensors(tensor: Any) -> Any:
         return weak_ref_tensors(tensor)
     except Exception:
         return tensor
-
-
-# FL-specific: platform-agnostic graph class selection
-class Graph:
-    if current_platform.device_type == "cuda":
-        graph = torch.cuda.CUDAGraph
-    elif current_platform.device_type == "npu":
-        graph = torch.npu.NPUGraph
-    elif current_platform.device_type == "musa":
-        graph = torch.musa.MUSAGraph
-    elif current_platform.device_type == "ptpu":
-        graph = torch.ptpu.PTPUGraph
-    elif current_platform.device_type == "txda":
-        graph = None
-    else:
-        raise NotImplementedError("not support graph")
 
 
 # Re-export CUDAGraphStat for compatibility
@@ -67,7 +56,14 @@ class GraphEntry:
 
     # for graph debugging, track the input addresses
     # during capture, and check if they are the same during replay
-    input_addresses: list[int] | None = None
+    input_bindings: StaticInputBindings | None = None
+
+    @property
+    def input_addresses(self) -> list[int] | None:
+        """Compatibility view used by the pre-controller graph contract."""
+        if self.input_bindings is None:
+            return None
+        return list(self.input_bindings.addresses)
 
 
 @dataclasses.dataclass
@@ -93,11 +89,15 @@ class GraphWrapper:
                  runnable: Callable,
                  vllm_config: VllmConfig,
                  runtime_mode: CUDAGraphMode,
-                 cudagraph_options: GraphOptions | None = None):
+                 cudagraph_options: GraphOptions | None = None,
+                 graph_runtime: GraphRuntimeController | None = None):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
+        self.graph_runtime = graph_runtime or GraphRuntimeController(
+            vllm_config=vllm_config
+        )
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -177,11 +177,8 @@ class GraphWrapper:
             # validate that cudagraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            entry.input_addresses = input_addresses
-            graph = Graph.graph()
+            entry.input_bindings = self.graph_runtime.bind_static_inputs(args)
+            graph = self.graph_runtime.create_graph()
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -192,32 +189,34 @@ class GraphWrapper:
                               lambda: None)
                     )
 
-            if self.graph_pool is not None:
-                set_graph_pool_id(self.graph_pool)
-            else:
-                set_graph_pool_id(current_platform.graph_pool_handle())
+                if self.graph_pool is not None:
+                    set_graph_pool_id(self.graph_pool)
+                else:
+                    set_graph_pool_id(current_platform.graph_pool_handle())
 
-            # Sync offloader's copy stream before capture if available.
-            try:
-                from vllm.model_executor.offloader.base import get_offloader
-                get_offloader().sync_prev_onload()
-            except (ImportError, RuntimeError):
-                pass
-
-            # FL-specific: use platform-agnostic graph capture
-            with current_platform.torch_device_fn.graph(
-                graph, pool=self.graph_pool
-            ):
-                # `output` is managed by pytorch's cudagraph pool
-                output = self.runnable(*args, **kwargs)
-                # Join offloader's copy stream after forward if available
+                # Sync offloader's copy stream before capture if available.
                 try:
                     from vllm.model_executor.offloader.base import get_offloader
-                    get_offloader().join_after_forward()
+                    get_offloader().sync_prev_onload()
                 except (ImportError, RuntimeError):
                     pass
-                if self.cudagraph_options.weak_ref_output:
-                    output = weak_ref_tensors(output)
+
+                # FL-specific: use platform-agnostic graph capture. The runtime
+                # scope receives the live attention metadata via ForwardContext.
+                with self.graph_runtime.capture_scope(forward_context):
+                    with current_platform.torch_device_fn.graph(
+                        graph, pool=self.graph_pool
+                    ):
+                        # `output` is managed by pytorch's graph pool
+                        output = self.runnable(*args, **kwargs)
+                        # Join offloader's copy stream after forward if available
+                        try:
+                            from vllm.model_executor.offloader.base import get_offloader
+                            get_offloader().join_after_forward()
+                        except (ImportError, RuntimeError):
+                            pass
+                        if self.cudagraph_options.weak_ref_output:
+                            output = weak_ref_tensors(output)
 
             entry.output = weak_ref_tensors(output)
             entry.graph = graph
@@ -231,14 +230,8 @@ class GraphWrapper:
 
         if self.is_debugging_mode:
             # check if the input addresses are the same
-            new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            assert new_input_addresses == entry.input_addresses, (
-                f"Input addresses for cudagraphs are different "
-                f"during replay. Expected {entry.input_addresses}, "
-                f"got {new_input_addresses}"
-            )
+            assert entry.input_bindings is not None
+            entry.input_bindings.validate(args)
 
         # Sync offloader before replay if available
         try:
@@ -247,7 +240,6 @@ class GraphWrapper:
         except (ImportError, RuntimeError):
             pass
 
-        if current_platform.device_type == "npu":
-            current_platform.torch_device_fn.synchronize()
-        entry.graph.replay()
+        with self.graph_runtime.replay_scope(forward_context):
+            entry.graph.replay()
         return entry.output

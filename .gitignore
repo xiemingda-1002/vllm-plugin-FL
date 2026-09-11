@@ -1,6 +1,20 @@
 *.egg-info
 __pycache__/
 build/
+.deps/
+csrc/ascend/third_party/
+# The current-vllm-ascend-0.24rc1 OPP packaging sources live under a
+# directory named build. Keep only the two source patches needed by the OPP
+# dependency build visible to git/snapshot delivery; generated build trees
+# remain ignored.
+!csrc/ascend/cmake/third_party/build/
+csrc/ascend/cmake/third_party/build/*
+!csrc/ascend/cmake/third_party/build/modules/
+csrc/ascend/cmake/third_party/build/modules/*
+!csrc/ascend/cmake/third_party/build/modules/patch/
+csrc/ascend/cmake/third_party/build/modules/patch/*
+!csrc/ascend/cmake/third_party/build/modules/patch/protobuf-hide_absl_symbols.patch
+!csrc/ascend/cmake/third_party/build/modules/patch/protobuf_25.1_change_version.patch
 dist/
 vllm_fl/_version.py
 

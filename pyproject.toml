@@ -96,6 +96,16 @@ include = ["vllm_fl*"]
 
 [tool.setuptools.package-data]
 "vllm_fl.dispatch.config" = ["*.yaml"]
+"vllm_fl" = [
+    "_cann_ops_custom/**/*",
+    "_cann_ops_custom/**/*.so",
+    "_cann_ops_custom/**/*.o",
+    "_cann_ops_custom/**/*.json",
+    "_cann_ops_custom/**/*.h",
+    "_cann_ops_custom/**/*.py",
+    "_cann_ops_custom/**/*.sh",
+    "_cann_ops_custom/**/version.info",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

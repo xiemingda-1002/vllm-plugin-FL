@@ -101,10 +101,6 @@ def register():
     _patch_flash_attn_import()
     _patch_transformers_compat()
 
-    # Model-specific platform patches
-    from vllm_fl.patches.glm_moe_dsa import apply_platform_patches as glm5_platform
-    glm5_platform()
-
     # Note: FlagCX connector registration is deferred to register_model()
     # to avoid circular imports during VllmConfig.__post_init__ in spawned
     # subprocesses.
@@ -148,15 +144,32 @@ def _register_gdn_packed_decode_patch() -> bool:
     try:
         patch_module = importlib.import_module("vllm_fl.patches.gdn_packed_decode")
         patch_fn = patch_module.patch_vllm_packed_gdn_beta
-    except (ImportError, AttributeError) as exc:
+    except (ImportError, AttributeError, SystemError) as exc:
         logger.debug("Packed GDN decode patch is unavailable: %s", exc)
         return False
 
     return patch_fn()
 
 
+def _patch_ascend_torch_accelerator() -> None:
+    """Install the Ascend memory shim in every general-plugin process."""
+    from vllm.platforms import current_platform
+
+    if (
+        current_platform.vendor_name == "ascend"
+        and current_platform.device_type == "npu"
+    ):
+        from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_torch_accelerator import (
+            patch_torch_accelerator,
+        )
+
+        patch_torch_accelerator()
+
+
 def register_model():
-    """Register FL-specific models not yet upstream."""
+    """Register FL model extensions for the matched vLLM release."""
+    _patch_ascend_torch_accelerator()
+
     # General plugins are loaded independently in spawned model-inspection and
     # worker processes, so all runtime compatibility hooks must be idempotent.
     from vllm_fl.patches.moe_sum import patch_vllm_moe_sum
@@ -172,14 +185,3 @@ def register_model():
     register_router()
 
     _register_gdn_packed_decode_patch()
-
-    # Register GLM-5 (GlmMoeDsa) — config not yet upstream
-    try:
-        from vllm.transformers_utils.config import _CONFIG_REGISTRY
-        from vllm_fl.configs.glm_moe_dsa import GlmMoeDsaConfig
-        _CONFIG_REGISTRY["glm_moe_dsa"] = GlmMoeDsaConfig
-
-        #from vllm_fl.patches.glm_moe_dsa import apply_model_patches as glm5_model
-        #glm5_model()
-    except Exception as e:
-        logger.error(f"Register GlmMoeDsa model error: {str(e)}")

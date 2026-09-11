@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from shutil import which
 
-from setuptools import Extension, setup
+from setuptools import Distribution, Extension, setup
 from setuptools.command.build_ext import build_ext
 
 ROOT_DIR = Path(__file__).parent.resolve()
@@ -32,11 +32,48 @@ NVCC_THREADS = os.environ.get("NVCC_THREADS")
 CMAKE_BUILD_TYPE = os.environ.get("CMAKE_BUILD_TYPE")
 VERBOSE = os.environ.get("VERBOSE", "0") == "1"
 
-SUPPORTED_VENDORS = ("cuda",)
+SUPPORTED_VENDORS = ("cuda", "ascend")
+
+
+class BinaryDistribution(Distribution):
+    """Keep wheels with an Ascend extension/OPP payload platform tagged."""
+
+    def has_ext_modules(self) -> bool:
+        return True
 
 
 def _is_cuda() -> bool:
     return VLLM_VENDOR == "cuda"
+
+
+def _is_ascend() -> bool:
+    return VLLM_VENDOR == "ascend"
+
+
+def _ascend_soc() -> tuple[str, str]:
+    """Return the concrete CANN SOC and its OPP family directory.
+
+    The accepted values match vLLM-Ascend 0.24.0rc1's build_aclnn.sh.
+    A build must be explicit: silently producing A2 binaries for an A3 wheel
+    is worse than failing during installation.
+    """
+
+    # Current Ascend builder images normally export SOC_VERSION. Preserve the
+    # project delivery default for generic A3 build images which do not.
+    soc = os.environ.get("SOC_VERSION", "ascend910_93").strip().lower()
+    aliases = {
+        "910b": "ascend910b1",
+        "910c": "ascend910_9392",
+    }
+    soc = aliases.get(soc, soc)
+    if soc.startswith("ascend910b"):
+        return soc, "ascend910b"
+    if soc.startswith("ascend910_93"):
+        return soc, "ascend910_93"
+    raise ValueError(
+        "VLLM_VENDOR=ascend requires an A2/A3 SOC_VERSION supported by "
+        f"the Qwen GDN closure; got {soc}"
+    )
 
 
 def _which(name: str) -> bool:
@@ -85,6 +122,14 @@ class CMakeBuildExt(build_ext):
             f"-DVLLM_PYTHON_EXECUTABLE={sys.executable}",
         ]
 
+        if _is_ascend():
+            soc, _ = _ascend_soc()
+            cmake_args.append(f"-DSOC_VERSION={soc}")
+            if ascend_home := os.environ.get("ASCEND_HOME_PATH"):
+                cmake_args.append(f"-DASCEND_HOME_PATH={ascend_home}")
+            if torch_npu_path := os.environ.get("TORCH_NPU_PATH"):
+                cmake_args.append(f"-DTORCH_NPU_PATH={torch_npu_path}")
+
         if VERBOSE:
             cmake_args.append("-DCMAKE_VERBOSE_MAKEFILE=ON")
 
@@ -127,9 +172,22 @@ class CMakeBuildExt(build_ext):
             subprocess.check_output(["cmake", "--version"], stderr=subprocess.STDOUT)
         except (OSError, subprocess.CalledProcessError) as exc:
             raise RuntimeError(
-                "CMake is required to build vllm_fl._C. "
-                "Install cmake and run with VLLM_VENDOR=cuda."
+                "CMake is required to build vllm-fl native extensions. "
+                "Install cmake and set VLLM_VENDOR to cuda or ascend."
             ) from exc
+
+        if _is_ascend():
+            soc, family = _ascend_soc()
+            subprocess.check_call(
+                [
+                    "bash",
+                    str(ROOT_DIR / "csrc" / "ascend" / "build_opp.sh"),
+                    str(ROOT_DIR),
+                    soc,
+                    family,
+                ],
+                cwd=ROOT_DIR,
+            )
 
         os.makedirs(self.build_temp, exist_ok=True)
 
@@ -167,6 +225,17 @@ class CMakeBuildExt(build_ext):
                 )
             shutil.copy2(built_ext, dest_path)
 
+        if _is_ascend():
+            source_opp = ROOT_DIR / "vllm_fl" / "_cann_ops_custom"
+            dest_opp = Path(self.build_lib) / "vllm_fl" / "_cann_ops_custom"
+            if not source_opp.is_dir():
+                raise RuntimeError(
+                    f"Ascend OPP build did not produce {source_opp}"
+                )
+            if dest_opp.exists():
+                shutil.rmtree(dest_opp)
+            shutil.copytree(source_opp, dest_opp)
+
 
 ext_modules = []
 if VLLM_VENDOR:
@@ -175,12 +244,12 @@ if VLLM_VENDOR:
             f"Unsupported vendor: {VLLM_VENDOR}. "
             f"Supported vendors: {', '.join(SUPPORTED_VENDORS)}"
         )
-    ext_modules.append(
-        CMakeExtension(name="vllm_fl._C", cmake_lists_dir=str(ROOT_DIR / "csrc"))
-    )
+    extension_name = "vllm_fl._C_ascend" if _is_ascend() else "vllm_fl._C"
+    ext_modules.append(CMakeExtension(name=extension_name, cmake_lists_dir=str(ROOT_DIR / "csrc")))
 
 
 setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuildExt} if ext_modules else {},
+    distclass=BinaryDistribution if VLLM_VENDOR == "ascend" else Distribution,
 )
