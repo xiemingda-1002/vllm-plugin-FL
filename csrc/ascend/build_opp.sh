@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build the current vLLM-Ascend 0.24.0rc1 operators required by Qwen3.6.
+# Build the current vLLM-Ascend 0.24.0rc1 native closure (Qwen plus
+# DeepSeek V4 DSA).  Catlass remains an external build-only dependency for
+# the pre-existing Qwen operators; no Catlass source is vendored into FL.
 
 set -euo pipefail
 
@@ -37,7 +39,22 @@ ops=(
   chunk_gated_delta_rule_fwd_h
   chunk_fwd_o
   moe_gating_top_k
+  moe_gating_top_k_hash
+  dequant_swiglu_quant
   moe_init_routing_custom
+  scatter_nd_update_v2
+  hc_pre
+  hc_post
+  hc_pre_inv_rms
+  hc_pre_sinkhorn
+  sparse_attn_sharedkv
+  sparse_attn_sharedkv_metadata
+  compressor
+  compressor_metadata
+  vllm_quant_lightning_indexer
+  vllm_quant_lightning_indexer_metadata
+  inplace_partial_rotary_mul
+  rms_norm_dynamic_quant
 )
 ops_arg=$(IFS=';'; echo "${ops[*]}")
 

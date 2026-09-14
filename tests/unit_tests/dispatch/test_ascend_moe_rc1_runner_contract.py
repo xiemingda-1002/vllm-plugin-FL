@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[3]
 MOE = (
     ROOT
@@ -51,13 +50,32 @@ def test_rc1_weight_conversion_is_idempotent_and_loader_safe() -> None:
 def test_unmigrated_execution_modes_fail_closed() -> None:
     runner = _source("fused_moe.py")
     for feature in (
-        "unquantized BF16/FP16",
         "fused MC2",
         "shared-expert DP",
         "shared-expert multistream",
         "EPLB",
     ):
         assert feature in runner
+
+    modelslim_moe = (
+        ROOT
+        / "vllm_fl"
+        / "dispatch"
+        / "backends"
+        / "vendor"
+        / "ascend"
+        / "impl"
+        / "quantization"
+        / "moe.py"
+    ).read_text(encoding="utf-8")
+    assert 'quant_type.upper() == "W8A8_DYNAMIC"' in modelslim_moe
+    assert "supports only ALLGATHER communication" in modelslim_moe
+    assert "fused MC2 is not migrated" in modelslim_moe
+
+    moe_mlp = _source("moe_mlp.py")
+    assert "elif HAS_TRITON:" in moe_mlp
+    assert "from vllm_fl.dispatch.backends.vendor.ascend.impl.triton.activation.swiglu_quant import" in moe_mlp
+    assert "quantized Triton SwiGLU is not migrated" not in moe_mlp
 
     device_operator = (
         ROOT
@@ -69,4 +87,9 @@ def test_unmigrated_execution_modes_fail_closed() -> None:
         / "impl"
         / "device_operator.py"
     ).read_text(encoding="utf-8")
-    assert "does not support MXFP MoE quantization" in device_operator
+    # The current rc1 A2 implementation forwards W8A8 routing's quant_mode to
+    # the native operator.  A local BF16-only guard would reject DeepSeek's
+    # quantized path before the operator can produce its dynamic scales.
+    assert "quant_mode=quant_mode" in device_operator
+    assert "does not support quantized routing" not in device_operator
+    assert "MXFP MoE quantization is only supported on Ascend A5" in device_operator

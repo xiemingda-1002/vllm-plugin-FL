@@ -73,9 +73,7 @@ npugraph_ex；这些开关是该正确性 Case 的条件，不是通用性能推
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=<NPU0>,<NPU1>
-export VLLM_PLUGINS=fl
-export VLLM_FL_PLATFORM=ascend
-export USE_FLAGGEMS=0
+export VLLM_PLUGINS=fl USE_FLAGGEMS=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export OMP_NUM_THREADS=1 OMP_PROC_BIND=false TASK_QUEUE_ENABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -95,6 +93,10 @@ vllm serve <MODEL_DIR> \
   --cudagraph-metrics --generation-config vllm --trust-remote-code --seed 0 \
   --enable-log-requests --host 127.0.0.1 --port 19432
 ```
+
+FL 会通过运行时设备探测选择 Ascend，并在平台 kernel 导入阶段发布 wheel
+内置的 OPP；普通启动不需要设置 `VLLM_FL_PLATFORM=ascend`。该变量仅保留为
+平台自动探测不可用时的显式覆盖选项。
 
 eager 基线使用相同的环境变量、模型和并行参数，只替换图配置并追加 `--enforce-eager`：
 

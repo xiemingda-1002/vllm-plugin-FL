@@ -12,7 +12,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -509,6 +509,32 @@ class ModelRunnerFL(GPUModelRunner):
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
 
+        # DeepSeek-V4 compressed DSA has a runner-owned cache and metadata
+        # lifecycle.  Keep this deliberately narrower than a generic
+        # ``compress_ratios`` check: other vendors and other DeepSeek paths
+        # must continue to use the upstream runner contract.
+        hf_config = self.model_config.hf_config
+        self.use_compress = (
+            current_platform.device_type == "npu"
+            and getattr(hf_config, "model_type", None) == "deepseek_v4"
+            and hasattr(hf_config, "compress_ratios")
+        )
+        if self.use_compress:
+            if self.speculative_config is not None:
+                raise NotImplementedError(
+                    "FL Ascend DeepSeek-V4 compressed DSA does not support "
+                    "MTP/speculative decoding yet."
+                )
+            from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
+                get_ascend_config,
+            )
+
+            if getattr(get_ascend_config(), "enable_sparse_c8", False):
+                raise NotImplementedError(
+                    "FL Ascend DeepSeek-V4 compressed DSA sparse-C8 is not "
+                    "migrated for A2/A3."
+                )
+
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
@@ -519,6 +545,7 @@ class ModelRunnerFL(GPUModelRunner):
             full_graph_wrapper_type=GraphWrapper,
             breakable_graph_wrapper_type=BreakableCUDAGraphWrapper,
             ubatch_wrapper_type=UBatchWrapper,
+            update_attention_tasks=not self.use_compress,
         )
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
@@ -804,6 +831,16 @@ class ModelRunnerFL(GPUModelRunner):
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        # DSA metadata consumes host positions while its device-side RoPE path
+        # consumes ``self.positions``.  The pinned buffer is populated during
+        # scheduling and never inferred back from device tensors.
+        self._dsa_positions_cpu_buf: torch.Tensor | None = None
+        self._dsa_positions_np_buf: np.ndarray | None = None
+        if self.use_compress:
+            self._dsa_positions_cpu_buf = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, pin_memory=self.pin_memory
+            )
+            self._dsa_positions_np_buf = self._dsa_positions_cpu_buf.numpy()
         # Ascend FIA may append one virtual request so the final query-start
         # offset equals the TP/graph-padded token count. Keep other vendors on
         # the upstream allocation contract.
@@ -2090,6 +2127,16 @@ class ModelRunnerFL(GPUModelRunner):
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
+        if self.use_compress:
+            assert self._dsa_positions_np_buf is not None
+            # Do this on CPU at scheduling time. In particular, do not derive
+            # this from the GPU position tensor: async scheduling can make the
+            # latter optimistic while DSA's host metadata needs this batch's
+            # stable request-position mapping.
+            np.copyto(
+                self._dsa_positions_np_buf[:total_num_scheduled_tokens],
+                positions_np,
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2520,7 +2567,15 @@ class ModelRunnerFL(GPUModelRunner):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
-        cm_base = CommonAttentionMetadata(
+        common_metadata_cls: type[CommonAttentionMetadata] = CommonAttentionMetadata
+        if self.use_compress:
+            from vllm_fl.dispatch.backends.vendor.ascend.attention.utils import (
+                AscendCommonAttentionMetadata,
+            )
+
+            common_metadata_cls = AscendCommonAttentionMetadata
+
+        cm_base = common_metadata_cls(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
@@ -2528,7 +2583,11 @@ class ModelRunnerFL(GPUModelRunner):
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_reqs=num_reqs_padded,
-            num_actual_tokens=num_tokens_padded,
+            # DSA keeps real local forward tokens distinct from padded RoPE
+            # and slot-mapping inputs (set below), matching rc1.
+            num_actual_tokens=(
+                num_tokens if self.use_compress else num_tokens_padded
+            ),
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
@@ -2538,6 +2597,13 @@ class ModelRunnerFL(GPUModelRunner):
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
         )
+        if self.use_compress:
+            assert self._dsa_positions_cpu_buf is not None
+            # These fields are intentionally Ascend-only extensions. They are
+            # required by AscendDSAMetadataBuilder and are absent from the
+            # upstream metadata contract used by every other vendor.
+            cm_base.positions_cpu = self._dsa_positions_cpu_buf
+            cm_base.num_input_tokens = num_tokens_padded
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2575,8 +2641,18 @@ class ModelRunnerFL(GPUModelRunner):
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
         ) -> None:
+            nonlocal prefill_ratio_to_sas_metadata
+            nonlocal decode_ratio_to_sas_metadata
+            nonlocal common_ratio_to_sas_metadata
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
+            is_dsa_builder = False
+            if self.use_compress:
+                from vllm_fl.dispatch.backends.vendor.ascend.attention.dsa_v1 import (
+                    AscendDSAMetadataBuilder,
+                )
+
+                is_dsa_builder = isinstance(builder, AscendDSAMetadataBuilder)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
@@ -2607,7 +2683,31 @@ class ModelRunnerFL(GPUModelRunner):
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
 
-            if for_cudagraph_capture:
+            if is_dsa_builder:
+                # rc1 DSA shares ratio-derived SAS metadata across cache
+                # groups in one forward. Capture must start with fresh maps so
+                # mutable eager metadata never leaks into a graph warmup.
+                if for_cudagraph_capture:
+                    dsa_prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
+                    dsa_decode_ratio_to_sas_metadata: dict[Any, Any] = {}
+                    dsa_common_ratio_to_sas_metadata: dict[Any, Any] = {}
+                else:
+                    dsa_prefill_ratio_to_sas_metadata = prefill_ratio_to_sas_metadata
+                    dsa_decode_ratio_to_sas_metadata = decode_ratio_to_sas_metadata
+                    dsa_common_ratio_to_sas_metadata = common_ratio_to_sas_metadata
+                attn_metadata_i = builder.build(
+                    common_prefix_len=cascade_attn_prefix_len,
+                    common_attn_metadata=common_attn_metadata,
+                    num_reqs_actual=num_reqs,
+                    prefill_ratio_to_sas_metadata=dsa_prefill_ratio_to_sas_metadata,
+                    decode_ratio_to_sas_metadata=dsa_decode_ratio_to_sas_metadata,
+                    common_ratio_to_sas_metadata=dsa_common_ratio_to_sas_metadata,
+                    block_size=attn_group.kv_cache_spec.block_size,
+                )
+                prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata
+                decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata
+                common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata
+            elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -2641,6 +2741,9 @@ class ModelRunnerFL(GPUModelRunner):
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        prefill_ratio_to_sas_metadata: dict[Any, Any] = {}
+        decode_ratio_to_sas_metadata: dict[Any, Any] = {}
+        common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
@@ -4041,6 +4144,17 @@ class ModelRunnerFL(GPUModelRunner):
         finally:
             self.prepare_inputs_event.record()
 
+    @staticmethod
+    def _set_ascend_forward_input_ids(input_ids: torch.Tensor | None) -> None:
+        # rc1 hash routing consumes the same (possibly padded) token IDs as
+        # the model. Bind each forward, including profiling/capture, without
+        # adding Ascend fields to the upstream ForwardContext class.
+        if (
+            getattr(current_platform, "vendor_name", None) == "ascend"
+            and current_platform.device_type == "npu"
+        ):
+            get_forward_context().additional_kwargs["input_ids"] = input_ids
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4065,6 +4179,7 @@ class ModelRunnerFL(GPUModelRunner):
         Returns:
             Model output tensor
         """
+        self._set_ascend_forward_input_ids(input_ids)
         model_output = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -4685,7 +4800,7 @@ class ModelRunnerFL(GPUModelRunner):
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
+                if pad_attn or has_separate_kv_update or self.use_compress
                 else num_tokens_unpadded,
                 num_reqs_padded=(
                     num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
@@ -4697,7 +4812,9 @@ class ModelRunnerFL(GPUModelRunner):
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_tokens_padded=(
+                        num_tokens_padded if pad_attn or self.use_compress else None
+                    ),
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded if pad_attn else None,
                     max_query_len=max_num_scheduled_tokens,
@@ -4751,7 +4868,18 @@ class ModelRunnerFL(GPUModelRunner):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        ascend_actual_tokens_scope = nullcontext()
+        if current_platform.device_type == "npu":
+            from vllm_fl.ascend_forward_context import override_actual_num_tokens
+
+            # rc1 keeps normal scheduled rows distinct from graph/DP padding
+            # for MC2's active mask. Dummy/capture forwards intentionally use
+            # their padded dummy extent and do not enter this scope.
+            ascend_actual_tokens_scope = override_actual_num_tokens(
+                scheduler_output.total_num_scheduled_tokens
+            )
         with (
+            ascend_actual_tokens_scope,
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -6299,6 +6427,10 @@ class ModelRunnerFL(GPUModelRunner):
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
+        # Keep the rc1 dummy lifecycle exactly: DSA dummy metadata always
+        # sees the padding sentinel, while eager attention warmup resets the
+        # reusable position buffers before returning.
+        dsa_dummy_positions = self.use_compress
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
@@ -6380,11 +6512,27 @@ class ModelRunnerFL(GPUModelRunner):
                 # requests can corrupt Mamba state.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                if dsa_dummy_positions:
+                    # rc1 captures DSA's padded decode positions with 127,
+                    # then restores the reusable buffers.  This is a graph
+                    # contract, not a model position calculation.
+                    self.positions.fill_(127)
+                    assert self._dsa_positions_cpu_buf is not None
+                    self._dsa_positions_cpu_buf.fill_(127)
+
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs_padded,
+                    num_tokens_padded=(
+                        num_tokens_padded if pad_attn or self.use_compress else None
+                    ),
+                    # rc1 keeps the rank-local dummy request count separate
+                    # from the DP/graph-padded shape for compressed DSA.  In
+                    # particular, the metadata builder must still identify
+                    # and clear padded block-table rows on an idle DP rank.
+                    # Preserve the upstream contract for every other backend.
+                    num_reqs=(num_reqs if self.use_compress else num_reqs_padded),
+                    num_reqs_padded=(num_reqs_padded if self.use_compress else None),
                     max_query_len=max_query_len,
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
                     for_cudagraph_capture=is_graph_capturing,
@@ -6477,6 +6625,13 @@ class ModelRunnerFL(GPUModelRunner):
                     slot_mapping=slot_mappings,
                 ),
             ):
+                self._set_ascend_forward_input_ids(input_ids)
+                if current_platform.device_type == "npu":
+                    # rc1 balances expert routing during memory profiling,
+                    # including the extra MC2 communication-buffer warmup.
+                    get_forward_context().additional_kwargs["in_profile_run"] = (
+                        is_profile
+                    )
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -6555,6 +6710,11 @@ class ModelRunnerFL(GPUModelRunner):
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+
+        if self.use_compress and force_attention:
+            self.positions.zero_()
+            assert self._dsa_positions_cpu_buf is not None
+            self._dsa_positions_cpu_buf.zero_()
 
         if current_platform.device_type == "npu":
             # Match the current vLLM-Ascend dummy lifecycle. In particular, an
@@ -6782,6 +6942,25 @@ class ModelRunnerFL(GPUModelRunner):
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        if current_platform.device_type == "npu":
+            from vllm_fl.ascend_forward_context import (
+                MoECommType,
+                get_mc2_tokens_capacity,
+                select_moe_comm_method,
+            )
+
+            # The normal max-token profile may use AllToAll. Reserve MC2's
+            # HCCL buffers too, before available KV-cache memory is measured,
+            # as in the matching vLLM-Ascend model runner.
+            mc2_capacity = get_mc2_tokens_capacity()
+            if (
+                mc2_capacity is not None
+                and self.max_num_tokens > mc2_capacity
+                and select_moe_comm_method(mc2_capacity, self.vllm_config)
+                is MoECommType.MC2
+            ):
+                self._dummy_run(mc2_capacity, is_profile=True)
+
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -7576,6 +7755,23 @@ class ModelRunnerFL(GPUModelRunner):
             corresponding memory buffer for KV cache.
         """
         layer_kv_cache_specs = self._get_layer_kv_cache_specs(kv_cache_config)
+        if self.use_compress:
+            # DSV4's cache closure is made exclusively of attention-backed
+            # compressed/SWA/state/indexer pages.  Do not let an unrelated
+            # cache spec silently enter the generic allocation path: that
+            # would break the positional cache tuple consumed by DSA kernels.
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                unsupported_layers = [
+                    layer_name
+                    for layer_name in kv_cache_tensor.shared_by
+                    if not isinstance(layer_kv_cache_specs[layer_name], AttentionSpec)
+                ]
+                if unsupported_layers:
+                    raise NotImplementedError(
+                        "FL Ascend DeepSeek-V4 compressed DSA only supports "
+                        "compressed/SWA/state/indexer attention caches; got "
+                        f"{unsupported_layers}."
+                    )
         self.hybrid_with_attn_and_mamba = any(
             any(
                 isinstance(layer_kv_cache_specs[layer_name], AttentionSpec)
@@ -7720,6 +7916,70 @@ class ModelRunnerFL(GPUModelRunner):
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
                     if (
+                        self.use_compress
+                        and getattr(kv_cache_spec, "model_version", None)
+                        == "deepseek_v4"
+                    ):
+                        # The DSA indexer cache packs K and its scale in each
+                        # logical page.  A plain ``view`` would place all K
+                        # pages before all scale pages; retain rc1's strided
+                        # per-page layout so the compressor/indexer/state/SWA
+                        # closure is passed to the model unchanged.
+                        assert packing is None, (
+                            "DeepSeek-V4 compressed DSA does not support a "
+                            "packed block-stride cache layout."
+                        )
+                        dtype_size = get_dtype_size(kv_cache_spec.dtype)
+                        page_elements = (
+                            kv_cache_spec.page_size_bytes // dtype_size
+                        )
+                        k_shape = kv_cache_shape
+                        k_page_elements = math.prod(k_shape[1:])
+                        assert k_page_elements <= page_elements
+                        k_strides = list(torch.empty(k_shape).stride())
+                        k_strides[0] = page_elements
+                        k_cache = torch.as_strided(
+                            raw_tensor.view(kv_cache_spec.dtype),
+                            size=k_shape,
+                            stride=tuple(k_strides),
+                        )
+                        scale_dim = getattr(kv_cache_spec, "scale_dim", 0)
+                        if scale_dim:
+                            scale_dtype = kv_cache_spec.scale_dtype
+                            scale_shape = attn_backend.get_kv_cache_shape(
+                                kernel_num_blocks,
+                                shape_block_size,
+                                kv_cache_spec.num_kv_heads,
+                                scale_dim,
+                                cache_dtype_str=self.cache_config.cache_dtype,
+                            )
+                            scale_dtype_size = get_dtype_size(scale_dtype)
+                            assert (
+                                kv_cache_spec.page_size_bytes % scale_dtype_size
+                                == 0
+                            )
+                            scale_strides = list(torch.empty(scale_shape).stride())
+                            scale_strides[0] = (
+                                kv_cache_spec.page_size_bytes // scale_dtype_size
+                            )
+                            scale_offset = (
+                                k_page_elements * dtype_size // scale_dtype_size
+                            )
+                            assert (
+                                k_page_elements * dtype_size % scale_dtype_size
+                                == 0
+                            )
+                            scale_cache = torch.as_strided(
+                                raw_tensor.view(scale_dtype),
+                                size=scale_shape,
+                                stride=tuple(scale_strides),
+                                storage_offset=scale_offset,
+                            )
+                            kv_caches[layer_name] = (k_cache, scale_cache)
+                        else:
+                            kv_caches[layer_name] = (k_cache,)
+                        continue
+                    if (
                         current_platform.device_type == "npu"
                         and self.hybrid_with_attn_and_mamba
                     ):
@@ -7861,7 +8121,10 @@ class ModelRunnerFL(GPUModelRunner):
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups):  # vllm 0.24.0: cache_dtype arg removed
+        if (
+            not self.use_compress
+            and self.use_uniform_kv_cache(self.attn_groups)
+        ):  # vllm 0.24.0: cache_dtype arg removed
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -7888,15 +8151,38 @@ class ModelRunnerFL(GPUModelRunner):
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
-        bind_kv_cache(
-            kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_caches,
-            num_attn_module,
-        )
+        if self.use_compress:
+            # DeepSeek-V4's DSA kernels consume the cache closure in a stable
+            # per-transformer-layer order (compress, SWA, compressor state,
+            # indexer state/K/scale). ``bind_kv_cache``'s generic grouping
+            # loses that closure, so mirror rc1's explicit binding.
+            from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
+                extract_dsv4_layer_index,
+            )
+
+            assert not self.kv_caches
+            for layer_name in sorted(
+                kv_caches,
+                key=lambda name: (
+                    extract_dsv4_layer_index(self.model_config.hf_config, name),
+                    name,
+                ),
+            ):
+                self.kv_caches.append(kv_caches[layer_name])
+            for layer_name, kv_cache in kv_caches.items():
+                self.compilation_config.static_forward_context[layer_name].kv_cache = [
+                    kv_cache
+                ]
+        else:
+            num_attn_module = (
+                2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
+            )
+            bind_kv_cache(
+                kv_caches,
+                self.compilation_config.static_forward_context,
+                self.kv_caches,
+                num_attn_module,
+            )
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

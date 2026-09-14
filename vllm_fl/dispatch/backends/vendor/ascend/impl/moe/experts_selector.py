@@ -19,9 +19,8 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 from vllm.distributed import get_tp_group
-from vllm.forward_context import get_forward_context
 
-from vllm_fl.ascend_forward_context import MoECommType
+from vllm_fl.ascend_forward_context import MoECommType, _EXTRA_CTX
 from vllm_fl.dispatch.backends.vendor.ascend.impl.device_operator import DeviceOperator
 from .compat import split_tensor_along_first_dim
 
@@ -246,17 +245,15 @@ def _select_experts_with_fusion_ops(
     renorm = int(renormalize)
     if scoring_func == "sqrtsoftplus":
         if tid2eid is not None:
-            forward_context = get_forward_context()
-            input_ids = forward_context.input_ids.to(torch.int64)
-            # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
+            input_ids = _EXTRA_CTX.input_ids.to(torch.int64)
             tid2eid_ones = tid2eid.to(torch.int32)
-            if forward_context.moe_comm_type == MoECommType.ALLGATHER:
-                prepare_finalize = forward_context.moe_comm_method.prepare_finalize
+            if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
+                prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
                 input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
             else:
-                input_ids = forward_context.moe_comm_method.pad_and_split_input_ids(input_ids)
+                input_ids = _EXTRA_CTX.moe_comm_method.pad_and_split_input_ids(input_ids)
 
-            if forward_context.flash_comm_v1_enabled and forward_context.moe_comm_type != MoECommType.ALLGATHER:
+            if _EXTRA_CTX.flash_comm_v1_enabled and _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER:
                 # Process for Flash Comm V1
                 tp_size = get_tp_group().world_size
                 tp_rank = get_tp_group().rank_in_group

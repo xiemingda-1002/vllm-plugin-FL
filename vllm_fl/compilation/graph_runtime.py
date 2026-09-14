@@ -78,6 +78,7 @@ class GraphRuntimeController:
         full_graph_wrapper_type: type[Any] | None = None,
         breakable_graph_wrapper_type: type[Any] | None = None,
         ubatch_wrapper_type: type[Any] | None = None,
+        update_attention_tasks: bool = True,
     ) -> None:
         self._vllm_config = vllm_config
         self._device_type = device_type
@@ -85,6 +86,7 @@ class GraphRuntimeController:
         self._full_graph_wrapper_type = full_graph_wrapper_type
         self._breakable_graph_wrapper_type = breakable_graph_wrapper_type
         self._ubatch_wrapper_type = ubatch_wrapper_type
+        self._update_attention_tasks = update_attention_tasks
         self.phase = GraphPhase.IDLE
         self._update_stream: Any | None = None
 
@@ -173,7 +175,8 @@ class GraphRuntimeController:
             from vllm_fl.compilation.graph_params import prepare_graph_params
 
             num_tokens = self._num_tokens(forward_context)
-            prepare_graph_params(num_tokens)
+            if self._update_attention_tasks:
+                prepare_graph_params(num_tokens)
             # vllm-ascend 0.24rc1 uses this bit to distinguish the one real
             # capture from preceding warmups in attention/model components.
             forward_context.capturing = True
@@ -184,7 +187,8 @@ class GraphRuntimeController:
             try:
                 from vllm_fl.compilation.graph_params import weak_ref_workspace
 
-                weak_ref_workspace(self._num_tokens(forward_context))
+                if self._update_attention_tasks:
+                    weak_ref_workspace(self._num_tokens(forward_context))
             finally:
                 forward_context.capturing = False
 
@@ -195,7 +199,7 @@ class GraphRuntimeController:
 
     def after_replay(self, forward_context: Any) -> None:
         """Update NPU task parameters after replay enqueue releases its event."""
-        if self.device_type == "npu":
+        if self.device_type == "npu" and self._update_attention_tasks:
             if self._vllm_config is None:
                 raise RuntimeError(
                     "Ascend full-graph replay requires GraphRuntimeController "

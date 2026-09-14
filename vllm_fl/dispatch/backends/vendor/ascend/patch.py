@@ -17,12 +17,18 @@ def apply_ascend_patches():
     # Register the current-v0.24 Qwen kernels before importing the patch module
     # which installs model methods. These are required capabilities and must
     # fail visibly instead of leaving the CUDA/FlagGems implementation active.
-    from .impl.linearnorm import split_qkv_rmsnorm_mrope  # noqa: F401
+    from .core.deepseek_v4_kv_cache import apply_deepseek_v4_kv_cache_patches
     from .impl.graph_fusion_ops import ensure_graph_fusion_ops_registered
+    from .impl.linearnorm import split_qkv_rmsnorm_mrope  # noqa: F401
     from .impl.moe_custom_ops import ensure_ascend_moe_custom_ops_registered
+    from .ops.dsa import ensure_dsa_forward_registered
+    from vllm_fl.patches.deepseek_v4 import apply_deepseek_v4_patches
 
     ensure_graph_fusion_ops_registered()
     ensure_ascend_moe_custom_ops_registered()
+    ensure_dsa_forward_registered()
+    apply_deepseek_v4_patches()
+    apply_deepseek_v4_kv_cache_patches()
     register_flashcomm_ops_and_layers()
 
     enable_ascend_native_ops()

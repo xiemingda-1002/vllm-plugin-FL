@@ -145,6 +145,15 @@ class PlatformFL(Platform):
         and device_info.vendor_name not in ("iluvatar", "hygon")
     ) else device_info.device_type
     device_type = device_info.device_type
+    if vendor_name == "ascend" and device_type == "npu":
+        # Must precede VllmConfig construction: DeepSeek-V4 otherwise enables
+        # CUDA's breakable/PIECEWISE wrapper before FL selects its NPU route.
+        # Do not import the Ascend package here: its patches depend on the
+        # fully resolved current_platform and would create an import cycle.
+        import vllm.envs as _vllm_envs
+
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
+        _vllm_envs.VLLM_USE_BREAKABLE_CUDAGRAPH = False
     # Small standalone torch.compile helpers must not use Inductor on NPU.
     # The model compilation path is selected separately by get_compile_backend.
     simple_compile_backend = "eager" if device_type == "npu" else "inductor"
@@ -348,6 +357,15 @@ class PlatformFL(Platform):
             from vllm_fl.dispatch.backends.vendor.ascend.patch import refresh_block_size
 
             refresh_block_size(vllm_config)
+            if model_config is not None:
+                # vLLM-Ascend rc1 discovers ModelSlim after VllmConfig creation
+                # and rebuilds quant_config before model loading. Keep this
+                # checkpoint-specific discovery off every other vendor path.
+                from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
+                    maybe_auto_detect_quantization,
+                )
+
+                maybe_auto_detect_quantization(vllm_config)
 
         # TODO(lucas): handle this more gracefully
         # Note: model_config may be None during testing
@@ -485,13 +503,32 @@ class PlatformFL(Platform):
 
         use_mla = attn_selector_config.use_mla
         use_sparse = attn_selector_config.use_sparse
+        # ``use_compress`` was added by the DeepSeek-V4 DSA path after the
+        # original selector configuration. Keep the getattr so this platform
+        # remains compatible with the matching upstream selector while also
+        # accepting the extended rc1 configuration.
+        use_compress = getattr(attn_selector_config, "use_compress", False)
 
-        backend_path = call_op("attention_backend", use_mla=use_mla, use_sparse=use_sparse)
+        if cls.device_type == "npu":
+            backend_path = call_op(
+                "attention_backend",
+                use_mla=use_mla,
+                use_sparse=use_sparse,
+                use_compress=use_compress,
+            )
+        else:
+            # Other vendor dispatch implementations predate use_compress;
+            # retain their call contract unchanged.
+            backend_path = call_op(
+                "attention_backend", use_mla=use_mla, use_sparse=use_sparse
+            )
 
         logger.info_once(
-            "Using attention backend via dispatch (use_mla=%s, use_sparse=%s): %s",
+            "Using attention backend via dispatch (use_mla=%s, use_sparse=%s, "
+            "use_compress=%s): %s",
             use_mla,
             use_sparse,
+            use_compress,
             backend_path,
             scope="local",
         )
@@ -500,6 +537,26 @@ class PlatformFL(Platform):
             % (use_mla, backend_path)
         )
         return backend_path
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        """Register Ascend KV-cache specs after upstream's built-in specs."""
+        if cls.device_type != "npu":
+            return super().register_custom_kv_cache_specs(vllm_config)
+
+        from vllm_fl.dispatch.backends.vendor.ascend.core.deepseek_v4_kv_cache import (
+            apply_deepseek_v4_kv_cache_patches,
+        )
+        from vllm_fl.dispatch.backends.vendor.ascend.core.kv_cache_interface import (
+            register_ascend_kv_cache_specs,
+        )
+
+        # This hook runs in EngineCore as well as workers. Install the cache
+        # planner/coordinator bindings here so the engine cannot create the
+        # upstream packed plan that the Ascend DSA runner intentionally
+        # rejects. Both operations are idempotent.
+        register_ascend_kv_cache_specs()
+        apply_deepseek_v4_kv_cache_patches()
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
@@ -624,6 +681,11 @@ class PlatformFL(Platform):
     def pre_register_and_update(cls, parser=None) -> None:
         if cls.device_name == "npu":
             import vllm_fl.dispatch.backends.vendor.ascend
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
+                register_modelslim,
+            )
+
+            register_modelslim(parser)
         if cls.vendor_name == "iluvatar":
             # Patches are applied at module import time in iluvatar.py.
             # Also call chained-or patch here explicitly from the main process,

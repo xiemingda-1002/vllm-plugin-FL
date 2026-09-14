@@ -11,8 +11,10 @@ package on another vendor cannot initialize an Ascend runtime.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 from vllm.forward_context import get_forward_context
@@ -32,6 +34,28 @@ class MoECommType(Enum):
 
 _mc2_tokens_capacity: int | None = None
 _reserved_mc2_mask: torch.Tensor | None = None
+_actual_num_tokens: ContextVar[int | None] = ContextVar(
+    "ascend_actual_num_tokens", default=None
+)
+
+
+@contextmanager
+def override_actual_num_tokens(num_actual_tokens: int) -> Iterator[None]:
+    """Scope rc1's real-token count around one Ascend normal forward.
+
+    Upstream's platform hook accepts only the padded execution extent.  Keep
+    the missing count in a ContextVar so a normal runner forward can preserve
+    MC2's active-row contract without changing upstream or another vendor.
+    Dummy/capture forwards deliberately do not enter this scope: rc1 passes
+    their padded dummy extent as the actual count.
+    """
+    if num_actual_tokens < 0:
+        raise ValueError(f"num_actual_tokens must be non-negative, got {num_actual_tokens}")
+    token = _actual_num_tokens.set(num_actual_tokens)
+    try:
+        yield
+    finally:
+        _actual_num_tokens.reset(token)
 
 
 def _is_moe_model(vllm_config: Any) -> bool:
@@ -108,34 +132,62 @@ def _select_a2_moe_comm_method(
     return MoECommType.ALLGATHER
 
 
+def _get_ascend_device_type():
+    """Import the vendor generation accessor only on an Ascend MoE path."""
+    from vllm_fl.dispatch.backends.vendor.ascend.hardware import (
+        get_ascend_device_type,
+    )
+
+    return get_ascend_device_type()
+
+
+def _active_ep_world_size() -> int:
+    """Read the initialized MoE EP group rather than reconstructing topology."""
+    from vllm.distributed.parallel_state import get_ep_group
+
+    return get_ep_group().world_size
+
+
+def _select_a3_moe_comm_method(
+    num_tokens: int, mc2_tokens_capacity: int | None
+) -> MoECommType:
+    """Select ordinary rc1 A3 transport; fused MC2 remains unsupported."""
+    if mc2_tokens_capacity is not None and num_tokens <= mc2_tokens_capacity:
+        return MoECommType.MC2
+    return MoECommType.ALLTOALL
+
+
 def select_moe_comm_method(
     num_tokens: int,
     vllm_config: Any,
     is_draft_model: bool = False,
 ) -> MoECommType | None:
-    """Select the current rc1 A2 communication path.
-
-    FL's first supported closure is A2 BF16.  A3/310P/A5 selection must be
-    added together with their corresponding communication kernels rather than
-    silently selecting an implementation that is not present.
-    """
+    """Select the supported vendor-scoped ordinary MoE communication path."""
     del is_draft_model
     if not _is_moe_model(vllm_config):
         return None
     if not vllm_config.parallel_config.enable_expert_parallel:
         return MoECommType.ALLGATHER
-    if _ep_world_size(vllm_config) == 1:
+    if _active_ep_world_size() == 1:
         return MoECommType.ALLGATHER
-    return _select_a2_moe_comm_method(
-        num_tokens,
-        vllm_config,
-        get_mc2_tokens_capacity(),
-    )
+    mc2_tokens_capacity = get_mc2_tokens_capacity()
+    from vllm_fl.dispatch.backends.vendor.ascend.hardware import AscendDeviceType
+
+    device_type = _get_ascend_device_type()
+    if device_type is AscendDeviceType.A3:
+        return _select_a3_moe_comm_method(num_tokens, mc2_tokens_capacity)
+    if device_type is AscendDeviceType.A2:
+        return _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
+    if device_type is AscendDeviceType._310P:
+        return MoECommType.ALLGATHER
+    if device_type is AscendDeviceType.A5:
+        raise NotImplementedError("FL Ascend A5 ordinary MoE communication is not migrated")
+    raise ValueError(f"Unsupported Ascend device type: {device_type}")
 
 
 def _get_moe_comm_method(moe_comm_type: MoECommType) -> Any:
-    # Importing the communication implementation pulls in torch_npu and
-    # vLLM-Ascend. Keep it behind the Ascend platform hook.
+    # Importing the communication implementation pulls in Ascend-only torch_npu
+    # consumers. Keep it behind the Ascend platform hook.
     from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.moe_comm_method import (
         get_moe_comm_method,
     )
@@ -159,28 +211,41 @@ def build_additional_forward_context(
     The arguments mirror ``Platform.set_additional_forward_context`` exactly;
     graph metadata remains owned by upstream vLLM.
     """
-    del num_tokens_across_dp, cudagraph_runtime_mode, batch_descriptor, ubatch_slices
+    del cudagraph_runtime_mode, batch_descriptor, ubatch_slices
 
     if num_tokens is None and attn_metadata:
         num_tokens = next(iter(attn_metadata.values())).num_actual_tokens
     has_num_tokens = num_tokens is not None
     num_tokens = int(num_tokens or 0)
-
-    moe_comm_type = select_moe_comm_method(num_tokens, vllm_config)
-    moe_comm_method = None
-    if moe_comm_type is not None:
-        moe_comm_method = _get_moe_comm_method(moe_comm_type)
+    actual_num_tokens = _actual_num_tokens.get()
+    if actual_num_tokens is None:
+        actual_num_tokens = num_tokens
+    if actual_num_tokens > num_tokens:
+        raise ValueError(
+            "Ascend actual token count cannot exceed the padded execution "
+            f"extent, got {actual_num_tokens} and {num_tokens}"
+        )
 
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     flash_comm_v1_enabled = flashcomm1_enabled_for_forward(
         vllm_config,
         num_tokens if has_num_tokens else None,
     )
+    # The same transport must be selected on every DP rank. Prefer the
+    # upstream-synchronized input; retain dp_metadata as compatibility
+    # fallback for callers that do not pass it yet.
     max_tokens_across_dp = num_tokens
-    if dp_metadata is not None:
+    if num_tokens_across_dp is not None:
+        max_tokens_across_dp = int(num_tokens_across_dp.max().item())
+    elif dp_metadata is not None:
         max_tokens_across_dp = int(
             dp_metadata.num_tokens_across_dp_cpu.max().item()
         )
+
+    moe_comm_type = select_moe_comm_method(max_tokens_across_dp, vllm_config)
+    moe_comm_method = None
+    if moe_comm_type is not None:
+        moe_comm_method = _get_moe_comm_method(moe_comm_type)
 
     padded_length = None
     pad_size = 0
@@ -195,8 +260,8 @@ def build_additional_forward_context(
     reserved_mc2_mask = get_mc2_mask()
     if reserved_mc2_mask is not None:
         mc2_mask = reserved_mc2_mask[:padded_num_tokens]
-        mc2_mask[:num_tokens] = True
-        mc2_mask[num_tokens:] = False
+        mc2_mask[:actual_num_tokens] = True
+        mc2_mask[actual_num_tokens:] = False
 
     return {
         "moe_comm_type": moe_comm_type,
@@ -242,6 +307,7 @@ __all__ = [
     "build_additional_forward_context",
     "get_mc2_mask",
     "get_mc2_tokens_capacity",
+    "override_actual_num_tokens",
     "select_moe_comm_method",
     "set_mc2_mask",
     "set_mc2_tokens_capacity",

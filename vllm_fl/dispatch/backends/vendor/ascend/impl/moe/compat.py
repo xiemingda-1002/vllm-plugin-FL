@@ -69,6 +69,33 @@ def get_ascend_config():
     compilation = _nested_config(extra, "ascend_compilation_config")
     fusion = _nested_config(extra, "ascend_fusion_config")
     eplb = _nested_config(extra, "eplb_config")
+    finegrained_tp = _nested_config(extra, "finegrained_tp_config")
+    finegrained_defaults = {
+        "lmhead_tensor_parallel_size": 0,
+        "oproj_tensor_parallel_size": 0,
+        "embedding_tensor_parallel_size": 0,
+        "mlp_tensor_parallel_size": 0,
+        "olora_tensor_parallel_size": 0,
+    }
+    unknown_finegrained = set(finegrained_tp) - set(finegrained_defaults)
+    if unknown_finegrained:
+        raise ValueError(
+            "Config has no attribute "
+            f"'{sorted(unknown_finegrained)[0]}' in finegrained_tp_config"
+        )
+    requested_finegrained = {
+        key: finegrained_tp.get(key, default)
+        for key, default in finegrained_defaults.items()
+    }
+    for key, value in requested_finegrained.items():
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"finegrained_tp_config.{key} must be a non-negative integer"
+            )
+        if value > 0:
+            raise NotImplementedError(
+                f"FL Ascend fine-grained TP ({key}) is not migrated"
+            )
 
     # rc1's EplbConfig defaults.  Preserve dormant tuning values, but reject
     # the settings that actually select the unmigrated EPLB execution chain.
@@ -172,6 +199,20 @@ def get_ascend_config():
             f"got {mega_moe_max_tokens!r}"
         )
 
+    enable_mlapo = extra.get(
+        "enable_mlapo",
+        bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", "1"))),
+    )
+    weight_nz_mode = extra.get(
+        "weight_nz_mode",
+        int(os.getenv("VLLM_ASCEND_ENABLE_NZ", "1")),
+    )
+    if weight_nz_mode not in (0, 1, 2):
+        raise ValueError(
+            "additional_config.weight_nz_mode must be 0, 1, or 2, "
+            f"got {weight_nz_mode!r}"
+        )
+
     return SimpleNamespace(
         enable_fused_mc2=enable_fused_mc2,
         # Keep the rc1-shaped fields for consumers. Unsupported true requests
@@ -183,6 +224,18 @@ def get_ascend_config():
         mix_placement=False,
         enable_mc2_hierarchy_comm=False,
         mega_moe_max_tokens=mega_moe_max_tokens,
+        multistream_dsv4_dsa_overlap=bool(
+            extra.get("multistream_dsv4_dsa_overlap", True)
+        ),
+        pa_shape_list=extra.get("pa_shape_list", []),
+        enable_mlapo=bool(enable_mlapo),
+        weight_nz_mode=weight_nz_mode,
+        recompute_scheduler_enable=bool(
+            extra.get("recompute_scheduler_enable", False)
+        ),
+        finegrained_tp_config=SimpleNamespace(
+            **requested_finegrained,
+        ),
         ascend_compilation_config=SimpleNamespace(
             enable_npugraph_ex=compilation.get("enable_npugraph_ex", True),
             enable_static_kernel=False,
@@ -265,7 +318,7 @@ def should_skip_allreduce_across_dp_group(
     _vllm_config=None,
     is_draft_model: bool = False,
 ) -> bool:
-    """Accept the rc1 call contract while leaving unmigrated MC2 disabled."""
+    """Keep the non-PD synchronized-token rc1 contract on the DP path."""
     return False
 
 
@@ -307,7 +360,17 @@ def shared_experts_calculation_stream():
 
 
 def get_mc2_group():
-    require_a2_bf16_allgather("MC2 communication")
+    """Return the worker-initialized Ascend MC2 group.
+
+    The vendor worker creates this group after upstream model-parallel setup;
+    a communication call site must only consume it, never create another
+    group with potentially different rank ordering.
+    """
+    from vllm_fl.dispatch.backends.vendor.ascend.distributed.parallel_state import (
+        get_mc2_group as _get_mc2_group,
+    )
+
+    return _get_mc2_group()
 
 
 def split_tensor_along_first_dim(tensor: torch.Tensor, group) -> torch.Tensor:

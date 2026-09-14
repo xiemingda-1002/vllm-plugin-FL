@@ -123,7 +123,12 @@ class AscendBackend(Backend):
             inplace=inplace,
         )
 
-    def attention_backend(self, use_mla: bool = False, use_sparse: bool = False) -> str:
+    def attention_backend(
+        self,
+        use_mla: bool = False,
+        use_sparse: bool = False,
+        use_compress: bool = False,
+    ) -> str:
         """
         Get the attention backend class path for Ascend NPU.
 
@@ -137,10 +142,19 @@ class AscendBackend(Backend):
         Args:
             use_mla: Whether to use Multi-head Latent Attention (MLA)
             use_sparse: Whether to use Deepseek Sparse Attention (DSA)
+            use_compress: Whether the DeepSeek-V4 compressed DSA cache is in use
 
         Returns:
             Fully qualified class path string
         """
+        # This is the current vLLM-Ascend non-MTP/non-DSA-CP selector
+        # semantic. DSA is distinguished from normal MLA by compression, not
+        # by a model-name special case.
+        if use_mla and not use_sparse and use_compress:
+            return (
+                "vllm_fl.dispatch.backends.vendor.ascend.attention.dsa_v1."
+                "AscendDSABackend"
+            )
         if use_mla:
             if use_sparse:
                 raise NotImplementedError("MLA with sparse attention is not implemented for Ascend yet.")

@@ -87,10 +87,13 @@ def test_stream_guard_rejects_cross_stream_matches() -> None:
     )
 
 
-def test_unquantized_norm_pass_registers_zero_patterns(monkeypatch) -> None:
+def test_norm_quant_pass_registers_dynamic_patterns_without_fl_custom_op(
+    monkeypatch,
+) -> None:
     import vllm_fl.compilation.passes.norm_quant_fusion_pass as norm_module
 
     events = []
+    registered = []
 
     class PatternMatcher:
         def __init__(self, **kwargs):
@@ -101,14 +104,119 @@ def test_unquantized_norm_pass_registers_zero_patterns(monkeypatch) -> None:
             return 0
 
     monkeypatch.setattr(norm_module, "PatternMatcherPass", PatternMatcher)
-    fusion = norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config())
-    assert fusion.matched_count == 0
+    monkeypatch.setattr(
+        norm_module.BasePattern,
+        "register",
+        lambda self, _pm_pass: registered.append(self.__class__.__name__),
+    )
+    monkeypatch.setattr(
+        norm_module,
+        "is_add_rms_norm_dynamic_mx_quant_fusion_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        norm_module,
+        "is_rms_norm_dynamic_mx_quant_fusion_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(norm_module, "_static_norm_quant_patterns_available", lambda: False)
+    norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config())
     assert events == [("init", {"pass_name": "rmsnorm_quant_fusion_pass"})]
+    assert registered == [
+        "AddRMSNormDynamicQuantPattern",
+        "AddRMSNormDynamicQuantSPPattern",
+        "AddRMSNormDynamicQuantPattern",
+        "AddRMSNormDynamicQuantSPPattern",
+    ]
 
-    with pytest.raises(NotImplementedError, match="quantized models"):
-        norm_module.AddRMSNormQuantFusionPass(
-            _minimal_vllm_config(quant_config=object())
-        )
+
+def test_norm_quant_pass_keeps_mx_and_static_branches_capability_gated(
+    monkeypatch,
+) -> None:
+    import vllm_fl.compilation.passes.norm_quant_fusion_pass as norm_module
+
+    registered = []
+
+    class PatternMatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(norm_module, "PatternMatcherPass", PatternMatcher)
+    monkeypatch.setattr(
+        norm_module.BasePattern,
+        "register",
+        lambda self, _pm_pass: registered.append(self.__class__.__name__),
+    )
+    monkeypatch.setattr(
+        norm_module,
+        "is_add_rms_norm_dynamic_mx_quant_fusion_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        norm_module,
+        "is_rms_norm_dynamic_mx_quant_fusion_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(norm_module, "_static_norm_quant_patterns_available", lambda: True)
+    norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config())
+
+    assert registered.count("AddRMSNormDynamicQuantPattern") == 2
+    assert registered.count("AddRMSNormDynamicMXQuantPattern") == 2
+    assert registered.count("RMSNormDynamicMXQuantPattern") == 2
+    # Static producer-gated patterns include static quant and dynamic+bias.
+    assert registered.count("AddRMSNormQuantPattern") == 2
+    assert registered.count("AddRMSNormDynamicQuantPatternWithBias") == 2
+
+
+def test_norm_quant_pass_rejects_w4a4_and_unsupported_dtype(monkeypatch) -> None:
+    import vllm_fl.compilation.passes.norm_quant_fusion_pass as norm_module
+
+    registered = []
+
+    class PatternMatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(norm_module, "PatternMatcherPass", PatternMatcher)
+    monkeypatch.setattr(
+        norm_module.BasePattern,
+        "register",
+        lambda self, _pm_pass: registered.append(self.__class__.__name__),
+    )
+    w4a4 = SimpleNamespace(quant_description={"layer": "W4A4_DYNAMIC"})
+    norm_module.AddRMSNormQuantFusionPass(
+        _minimal_vllm_config(quant_config=w4a4)
+    )
+    norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config(dtype=torch.float32))
+    assert registered == []
+
+
+def test_static_norm_quant_gate_requires_the_actual_fl_producer(monkeypatch) -> None:
+    import vllm_fl.compilation.passes.norm_quant_fusion_pass as norm_module
+
+    monkeypatch.setattr(norm_module, "enable_custom_op", lambda: False)
+    assert not norm_module._static_norm_quant_patterns_available()
+
+    monkeypatch.setattr(norm_module, "enable_custom_op", lambda: True)
+    monkeypatch.setattr(
+        norm_module.torch,
+        "ops",
+        SimpleNamespace(
+            _C_ascend=SimpleNamespace(npu_add_rms_norm_bias=object()),
+            vllm=SimpleNamespace(),
+        ),
+    )
+    assert not norm_module._static_norm_quant_patterns_available()
+
+    monkeypatch.setattr(
+        norm_module.torch,
+        "ops",
+        SimpleNamespace(
+            _C_ascend=SimpleNamespace(npu_add_rms_norm_bias=object()),
+            vllm=SimpleNamespace(quantize=object()),
+        ),
+    )
+    assert norm_module._static_norm_quant_patterns_available()
 
 
 def test_qknorm_registers_bias_and_no_bias_patterns_for_bf16_head128(

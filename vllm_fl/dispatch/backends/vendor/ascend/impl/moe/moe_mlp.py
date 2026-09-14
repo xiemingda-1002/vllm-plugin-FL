@@ -429,9 +429,27 @@ def quant_apply_mlp(
                 hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
                     hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
                 )
+            elif swiglu_limit > 0:
+                # The Triton fallback does not accept the model clamp. Keep it
+                # for the zero-limit case, but use the vendor clipped primitive
+                # when a routed W8A8 layer requests a positive SwiGLU limit.
+                hidden_states = torch_npu.npu_clipped_swiglu(
+                    hidden_states,
+                    interleaved=False,
+                    alpha=swiglu_alpha,
+                    limit=swiglu_limit,
+                    bias=swiglu_beta,
+                )
+                hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
+                    hidden_states, act_quant_type=act_quant_type, use_mxfp_quant=use_mxfp_quant
+                )
             elif HAS_TRITON:
-                raise NotImplementedError(
-                    "FL Ascend rc1 MoE quantized Triton SwiGLU is not migrated"
+                from vllm_fl.dispatch.backends.vendor.ascend.impl.triton.activation.swiglu_quant import (
+                    swiglu_quant,
+                )
+
+                hidden_states, swiglu_out_scale = swiglu_quant(
+                    hidden_states, group_list, group_list_type
                 )
             else:
                 hidden_states = torch_npu.npu_swiglu(hidden_states)

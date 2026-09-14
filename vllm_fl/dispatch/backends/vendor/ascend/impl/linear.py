@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.nn.parameter import Parameter
+
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
 from vllm.model_executor.layers.linear import (
@@ -22,16 +24,26 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
-from torch.nn.parameter import Parameter
 
 from .linear_op import (
-    SequenceRowParallelOp,
     flashcomm1_configured,
     get_parallel_op,
     get_replicated_op,
 )
+from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    is_310p,
+    maybe_trans_nz,
+)
 
 _UNQUANTIZED_GEMM_REGISTERED = False
+
+
+def _should_keep_nd_for_310p_weight(weight: torch.Tensor) -> bool:
+    return is_310p() and weight.ndim >= 2 and (
+        weight.shape[-1] == 1 or weight.shape[-2] == 1
+    )
 
 
 def _unquantized_gemm(
@@ -74,6 +86,18 @@ def ensure_ascend_linear_custom_ops_registered() -> None:
 
 
 class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Apply the current rc1 Ascend layout used by DeepSeek and Qwen."""
+        super().process_weights_after_loading(layer)
+        keep_nd_weight = _should_keep_nd_for_310p_weight(layer.weight.data)
+        if getattr(layer, "precast_fp32_weight", False):
+            weight_fp32 = layer.weight.data.to(torch.float32)
+            layer.weight_fp32 = (
+                weight_fp32 if keep_nd_weight else maybe_trans_nz(weight_fp32)
+            )
+        if "conv1d" not in layer.prefix and not keep_nd_weight:
+            layer.weight.data = maybe_trans_nz(layer.weight.data)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -379,11 +403,57 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         if self.custom_op is not None:
             self.custom_op.update_attrs()
         self.prefix = prefix
+        if "wo_a" in prefix:
+            hf_config = get_current_vllm_config().model_config.hf_text_config
+            self.n_local_groups = getattr(hf_config, "o_groups", 0) // self.tp_size
+            self.o_lora_rank = getattr(hf_config, "o_lora_rank", 0)
 
     def forward(self, input_):
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
         return super().forward(input_)
+
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        if "wo_a" in self.prefix and get_ascend_device_type() != AscendDeviceType.A5:
+            if self.weight.ndim == 2:
+                super().weight_loader(param, loaded_weight)
+                self.weight.data = (
+                    self.weight.data.view(
+                        self.n_local_groups,
+                        self.o_lora_rank,
+                        -1,
+                    )
+                    .transpose(2, 1)
+                    .contiguous()
+                )
+            else:
+                # Preserve the grouped layout when RL update flows reload a
+                # weight after the initial checkpoint transformation.
+                shard_size = self.n_local_groups * self.o_lora_rank
+                start_idx = self.tp_rank * shard_size
+                if loaded_weight.shape[0] != shard_size:
+                    loaded_weight = loaded_weight.narrow(
+                        0, start_idx, shard_size
+                    )
+                loaded_weight = (
+                    loaded_weight.view(
+                        self.n_local_groups,
+                        self.o_lora_rank,
+                        -1,
+                    )
+                    .transpose(2, 1)
+                    .contiguous()
+                )
+
+                if loaded_weight.shape != self.weight.shape:
+                    raise ValueError(
+                        "Unexpected wo_a weight shape "
+                        f"{tuple(loaded_weight.shape)}, expected "
+                        f"{tuple(self.weight.shape)}"
+                    )
+                self.weight.data.copy_(loaded_weight)
+        else:
+            super().weight_loader(param, loaded_weight)
 
 
 class AscendReplicatedLinear(ReplicatedLinear):

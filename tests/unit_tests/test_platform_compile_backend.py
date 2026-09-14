@@ -5,7 +5,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from vllm.config import CUDAGraphMode, CompilationMode
+from vllm.config import CompilationMode, CUDAGraphMode
 
 
 def _platform_config(*, mode=CompilationMode.VLLM_COMPILE):
@@ -205,6 +205,117 @@ def test_ascend_forward_context_hook_delegates_lazily(monkeypatch) -> None:
         vllm_config=None,
         dp_metadata=None,
     ) is expected
+
+
+def test_ascend_attention_selector_uses_compress_for_dsa(monkeypatch) -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.ascend import AscendBackend
+    from vllm_fl.platform import PlatformFL
+
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    monkeypatch.setattr(
+        "vllm_fl.dispatch.call_op",
+        lambda _name, **kwargs: AscendBackend().attention_backend(**kwargs),
+    )
+
+    dsa_config = SimpleNamespace(
+        use_mla=True, use_sparse=False, use_compress=True
+    )
+    assert PlatformFL.get_attn_backend_cls(None, dsa_config) == (
+        "vllm_fl.dispatch.backends.vendor.ascend.attention.dsa_v1.AscendDSABackend"
+    )
+
+    # Existing MHA and MLA selector branches retain their original paths.
+    assert PlatformFL.get_attn_backend_cls(
+        None, SimpleNamespace(use_mla=False, use_sparse=False)
+    ) == "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendAttentionBackend"
+    assert PlatformFL.get_attn_backend_cls(
+        None, SimpleNamespace(use_mla=True, use_sparse=False, use_compress=False)
+    ) == "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendMLABackend"
+
+
+def test_non_npu_attention_selector_keeps_existing_dispatch_contract(
+    monkeypatch,
+) -> None:
+    from vllm_fl.platform import PlatformFL
+
+    captured = {}
+    monkeypatch.setattr(PlatformFL, "device_type", "cuda")
+
+    def capture_call(name, **kwargs):
+        captured.update(name=name, **kwargs)
+        return "fallback.backend"
+
+    monkeypatch.setattr("vllm_fl.dispatch.call_op", capture_call)
+
+    assert PlatformFL.get_attn_backend_cls(
+        None, SimpleNamespace(use_mla=False, use_sparse=False, use_compress=True)
+    ) == "fallback.backend"
+    assert captured == {
+        "name": "attention_backend",
+        "use_mla": False,
+        "use_sparse": False,
+    }
+
+
+def test_ascend_kv_cache_spec_hook_is_vendor_scoped_and_idempotent(monkeypatch) -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.core import (
+        deepseek_v4_kv_cache,
+        kv_cache_interface,
+    )
+    from vllm_fl.platform import PlatformFL
+
+    calls = []
+    monkeypatch.setattr(
+        kv_cache_interface,
+        "register_ascend_kv_cache_specs",
+        lambda: calls.append("ascend"),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_kv_cache,
+        "apply_deepseek_v4_kv_cache_patches",
+        lambda: calls.append("patch"),
+    )
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    PlatformFL.register_custom_kv_cache_specs(None)
+    PlatformFL.register_custom_kv_cache_specs(None)
+    assert calls == ["ascend", "patch", "ascend", "patch"]
+
+    monkeypatch.setattr(PlatformFL, "device_type", "cuda")
+    PlatformFL.register_custom_kv_cache_specs(None)
+    assert calls == ["ascend", "patch", "ascend", "patch"]
+
+
+def test_ascend_kv_cache_specs_register_the_expected_managers() -> None:
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_spec_registry import _REGISTRY_KVCACHESPEC_LIST
+
+    from vllm_fl.dispatch.backends.vendor.ascend.core.deepseek_v4_kv_cache import (
+        CompressAttentionManager,
+    )
+    from vllm_fl.dispatch.backends.vendor.ascend.core.kv_cache_interface import (
+        AscendMLAAttentionSpec,
+        AscendSFAIndexerCacheSpec,
+        AscendSlidingWindowMLASpec,
+        register_ascend_kv_cache_specs,
+    )
+
+    register_ascend_kv_cache_specs()
+    register_ascend_kv_cache_specs()
+    assert (
+        _REGISTRY_KVCACHESPEC_LIST[AscendMLAAttentionSpec].manager_class
+        is CompressAttentionManager
+    )
+    assert (
+        _REGISTRY_KVCACHESPEC_LIST[AscendSFAIndexerCacheSpec].manager_class
+        is FullAttentionManager
+    )
+    assert (
+        _REGISTRY_KVCACHESPEC_LIST[AscendSlidingWindowMLASpec].manager_class
+        is SlidingWindowManager
+    )
 
 
 def test_full_decode_only_rejects_launch_blocking(monkeypatch) -> None:

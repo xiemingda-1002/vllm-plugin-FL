@@ -76,6 +76,30 @@ def test_npu_capture_flag_is_reset_when_capture_fails() -> None:
     assert runtime.phase is GraphPhase.IDLE
 
 
+def test_npu_dsa_policy_skips_attention_task_lifecycle(monkeypatch) -> None:
+    import vllm_fl.compilation.graph_params as params
+    import vllm_fl.dispatch.backends.vendor.ascend.impl.attention as attention
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    calls = []
+    monkeypatch.setattr(params, "prepare_graph_params", lambda size: calls.append(("prepare", size)))
+    monkeypatch.setattr(params, "weak_ref_workspace", lambda size: calls.append(("weakref", size)))
+    monkeypatch.setattr(attention.AscendAttentionBackendImpl, "update_graph_params",
+                        lambda *args: calls.append("update"))
+    runtime = GraphRuntimeController(
+        device_type="npu", vllm_config=object(), update_attention_tasks=False,
+        platform=SimpleNamespace(device_type="npu", torch_device_fn=SimpleNamespace(
+            current_stream=lambda: SimpleNamespace(synchronize=lambda: calls.append("sync")))))
+    context = SimpleNamespace(capturing=False, batch_descriptor=SimpleNamespace(num_tokens=2))
+
+    with runtime.capture_scope(context):
+        assert context.capturing is True
+    with runtime.replay_scope(context):
+        calls.append("replay")
+    assert context.capturing is False
+    assert calls == ["sync", "replay"]
+
+
 def test_graph_params_are_per_shape_and_fail_closed_on_duplicate_capture() -> None:
     from vllm_fl.compilation.graph_params import (
         clear_graph_params,

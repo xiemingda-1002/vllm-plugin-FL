@@ -45,7 +45,7 @@ def _opp_root(package_dir: Path) -> Path | None:
 
 
 def bootstrap_custom_op_env() -> None:
-    """Expose FL's packaged OPP before torch_npu initializes custom ops."""
+    """Expose FL's packaged OPP before FL loads its native custom ops."""
 
     opp = _opp_root(Path(__file__).resolve().parent)
     if opp is None:

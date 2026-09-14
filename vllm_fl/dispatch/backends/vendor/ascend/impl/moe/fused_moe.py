@@ -360,14 +360,18 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # nn.Module children for quant_method and would call process_weights_after_loading
         # on the runner with wrong expectations. Set on routed_experts so that
         # self._quant_method (the MoERunner property) returns the Ascend version.
-        if routed_experts.quant_config is not None:
-            raise NotImplementedError(
-                "FL Ascend rc1 MoE currently supports unquantized BF16/FP16 "
-                "experts only"
+        if routed_experts.quant_config is None:
+            routed_experts.quant_method = AscendUnquantizedFusedMoEMethod(
+                self.moe_config, tid2eid=self.tid2eid
             )
-        routed_experts.quant_method = AscendUnquantizedFusedMoEMethod(
-            self.moe_config, tid2eid=self.tid2eid
-        )
+        else:
+            routed_experts.quant_method = routed_experts.quant_config.get_quant_method(
+                routed_experts, self.layer_name, tid2eid=self.tid2eid
+            )
+            if routed_experts.quant_method is None:
+                raise NotImplementedError(
+                    "FL Ascend ModelSlim MoE did not provide a quantized method"
+                )
 
         self.quant_type = self._get_quant_type()
 

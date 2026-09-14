@@ -377,8 +377,12 @@ class WorkerFL(WorkerBase):
             from vllm_fl.dispatch.backends.vendor.ascend.hardware import (
                 check_ascend_device_type,
             )
+            from vllm_fl.dispatch.backends.vendor.ascend.runtime import (
+                configure_native_runtime,
+            )
 
             check_ascend_device_type()
+            configure_native_runtime()
 
         current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -1276,6 +1280,13 @@ def init_worker_distributed_environment(
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+
+    if backend == "hccl":
+        from vllm_fl.dispatch.backends.vendor.ascend.distributed.parallel_state import (
+            init_ascend_model_parallel,
+        )
+
+        init_ascend_model_parallel(parallel_config)
 
     # Init ec connector here before KV caches caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode

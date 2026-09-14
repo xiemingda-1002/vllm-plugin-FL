@@ -71,13 +71,26 @@ def FusedMoEFL(*args, **kwargs) -> MoERunner:
 
         kwargs["runner_cls"] = AscendMoERunner
 
+    if is_ascend:
+        # ``hash`` is consumed by the DeepSeek V4 layer before this factory.
+        # ``tid2eid`` is Ascend runner state, not an upstream factory
+        # argument.  Copy caller-owned runner_args before extending it so a
+        # shared config dict cannot be modified as a side effect.
+        kwargs.pop("hash", None)
+        tid2eid = kwargs.pop("tid2eid", None)
+        if tid2eid is not None:
+            runner_args = kwargs.get("runner_args")
+            runner_args = dict(runner_args) if runner_args is not None else {}
+            runner_args["tid2eid"] = tid2eid
+            kwargs["runner_args"] = runner_args
+
     # Use the original factory captured before monkey-patching to avoid
     # recursion.  Explicit caller-owned runner_cls remains authoritative.
     runner: MoERunner = _OrigFusedMoE(*args, **kwargs)
 
     # 2. Replace only an upstream unquantized method with the vendor-specific
-    # implementation. kwargs are passed through unchanged above, so a caller's
-    # explicit runner_cls/runner_args remain authoritative.
+    # implementation. Ascend-only routing args are normalized above while a
+    # caller's explicit runner_cls and existing runner_args remain authoritative.
     # Quantized methods own their weight/activation scaling metadata and must
     # remain attached to the runner.
     if is_ascend:

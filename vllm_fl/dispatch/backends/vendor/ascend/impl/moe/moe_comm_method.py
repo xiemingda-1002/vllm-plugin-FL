@@ -53,16 +53,22 @@ def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | No
     if moe_comm_type is not None and method is None:
         raise NotImplementedError(
             "FL Ascend rc1 MoE communication method "
-            f"{moe_comm_type.name} is not migrated; only A2 ALLGATHER is supported"
+            f"{moe_comm_type.name} is unregistered or unsupported in this runtime"
         )
     return method
 
 
 def setup_moe_comm_method(moe_config):
-    # Keep rc1's method cache contract but expose only the migrated path.  This
-    # prevents MC2/ALLTOALL from reaching partially adapted dependencies.
     _MoECommMethods.clear()
-    _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+    if moe_config.ep_size > 1:
+        # Keep the ordinary rc1 communication set coherent. FUSED_MC2 remains
+        # deliberately unregistered: its dispatch_ffn_combine native closure
+        # is outside this migration.
+        _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
+        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+        _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
+    else:
+        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
 
 
 def set_gmmswigluquant_method():

@@ -1,4 +1,4 @@
-"""Small current-rc1 device boundary used by the FL-owned Qwen GDN path."""
+"""Current-rc1 device boundary for FL-owned Ascend execution paths."""
 
 from __future__ import annotations
 
@@ -166,10 +166,6 @@ class DeviceOperator:
         quant_mode: int = -1,
         act_quant_type: torch.dtype | None = None,
     ):
-        if act_quant_type is not None or quant_mode != -1:
-            raise NotImplementedError(
-                "FL Ascend A2 BF16 MoE does not support quantized routing"
-            )
         return torch.ops._C_ascend.npu_moe_init_routing_custom(
             hidden_states,
             topk_ids,
@@ -203,22 +199,82 @@ class DeviceOperator:
         return scale
 
     @staticmethod
-    def npu_dynamic_quant(*_args, **_kwargs):
-        raise NotImplementedError(
-            "FL Ascend A2 BF16 MoE does not support MXFP MoE quantization"
-        )
+    def npu_dynamic_quant(
+        hidden_states: torch.Tensor,
+        dynamic_scale: torch.Tensor | None = None,
+        *,
+        act_quant_type=torch.float8_e4m3fn,
+        use_mxfp_quant: bool = False,
+    ):
+        if use_mxfp_quant:
+            raise RuntimeError(
+                "MXFP MoE quantization is only supported on Ascend A5."
+            )
+
+        if dynamic_scale is None:
+            import torch_npu
+
+            return torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=act_quant_type
+            )
+
+        return hidden_states, dynamic_scale
 
     @staticmethod
     def npu_grouped_matmul_swiglu_quant(*_args, **_kwargs):
         raise NotImplementedError(
-            "FL Ascend A2 BF16 MoE does not support MXFP MoE quantization"
+            "FL Ascend grouped-matmul SwiGLU quant fusion is not migrated"
         )
 
-    @staticmethod
-    def npu_grouped_matmul_gmm2(*_args, **_kwargs):
-        raise NotImplementedError(
-            "FL Ascend A2 BF16 MoE does not support MXFP MoE quantization"
-        )
+    @classmethod
+    def npu_grouped_matmul_gmm2(
+        cls,
+        *,
+        hidden_states: torch.Tensor,
+        weight: list[torch.Tensor] | torch.Tensor,
+        weight_scale: list[torch.Tensor] | torch.Tensor,
+        per_token_scale: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+        input_dtype: torch.dtype,
+        act_quant_type,
+        weight_quant_type,
+        scale_type,
+        per_token_scale_type,
+        use_bf16: bool = True,
+        use_mxfp_quant: bool = False,
+        bias=None,
+        fallback_output_dtype: torch.dtype | None = None,
+        mxfp_quant_dtype=None,
+    ) -> torch.Tensor:
+        del cls, act_quant_type, weight_quant_type, scale_type
+        del per_token_scale_type, use_bf16, mxfp_quant_dtype
+        if use_mxfp_quant:
+            raise RuntimeError(
+                "MXFP MoE quantization is only supported on Ascend A5."
+            )
+
+        if fallback_output_dtype is None:
+            fallback_output_dtype = (
+                weight_scale[0].dtype
+                if isinstance(weight_scale, list)
+                else weight_scale.dtype
+            )
+
+        import torch_npu
+
+        return torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=weight,
+            scale=weight_scale,
+            bias=bias,
+            per_token_scale=[per_token_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=fallback_output_dtype,
+        )[0]
 
     @staticmethod
     def split_qkv_rmsnorm_rope(
