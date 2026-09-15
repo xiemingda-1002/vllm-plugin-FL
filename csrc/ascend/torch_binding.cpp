@@ -16,6 +16,7 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
+#include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 
@@ -647,6 +648,15 @@ std::tuple<at::Tensor, at::Tensor> npu_dequant_swiglu_quant(
 
 namespace meta {
 
+std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine(
+    const at::Tensor&, const at::TensorList&, const at::TensorList&,
+    const at::Tensor&, const at::TensorList&, const at::TensorList&,
+    const at::TensorList&, const at::TensorList&, const at::Tensor&,
+    c10::string_view, int64_t, at::Tensor& out, at::Tensor& expert_token_nums,
+    const c10::optional<at::Tensor>&, double) {
+  return {out, expert_token_nums};
+}
+
 at::Tensor npu_hc_post(const at::Tensor&, const at::Tensor& residual,
                        const at::Tensor&, const at::Tensor&) {
   return at::empty_symint(residual.sym_sizes(), residual.options());
@@ -1057,6 +1067,11 @@ npu_moe_init_routing_custom(
 }  // namespace vllm_fl_native
 
 TORCH_LIBRARY(_C_ascend, ops) {
+  ops.def("dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, "
+          "Tensor expert_idx, Tensor[] scale1, Tensor[] scale2, Tensor[] bias1, "
+          "Tensor[] bias2, Tensor probs, str group, int max_output_size, "
+          "Tensor! out, Tensor! expert_token_nums, Tensor? x_active_mask=None, "
+          "float swiglu_limit=1000000.0) -> (Tensor out, Tensor expert_token_nums)");
   ops.def("npu_causal_conv1d_custom(Tensor output, Tensor x, Tensor weight, "
           "Tensor conv_state, Tensor? bias_opt, Tensor? query_start_loc_opt, "
           "Tensor? cache_indices_opt, Tensor? initial_state_mode_opt, "
@@ -1122,6 +1137,7 @@ TORCH_LIBRARY(_C_ascend, ops) {
 }
 
 TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, ops) {
+  ops.impl("dispatch_ffn_combine", &vllm_fl_native::dispatch_ffn_combine);
   ops.impl("npu_causal_conv1d_custom",
            &vllm_fl_native::npu_causal_conv1d_custom);
   ops.impl("npu_recurrent_gated_delta_rule",
@@ -1153,6 +1169,7 @@ TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, ops) {
 }
 
 TORCH_LIBRARY_IMPL(_C_ascend, Meta, ops) {
+  ops.impl("dispatch_ffn_combine", &vllm_fl_native::meta::dispatch_ffn_combine);
   ops.impl("npu_causal_conv1d_custom",
            &vllm_fl_native::meta::npu_causal_conv1d_custom);
   ops.impl("npu_recurrent_gated_delta_rule",

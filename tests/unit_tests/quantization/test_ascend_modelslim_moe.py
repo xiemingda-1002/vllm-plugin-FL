@@ -67,7 +67,7 @@ def moe_module(monkeypatch: pytest.MonkeyPatch):
 
     forward = types.ModuleType("vllm_fl.ascend_forward_context")
     forward.MoECommType = types.SimpleNamespace(
-        ALLGATHER="allgather", MC2="mc2", ALLTOALL="alltoall"
+        ALLGATHER="allgather", MC2="mc2", ALLTOALL="alltoall", FUSED_MC2="fused_mc2"
     )
     forward._EXTRA_CTX = types.SimpleNamespace(
         moe_comm_type="allgather", moe_comm_method=None
@@ -197,6 +197,16 @@ def test_dynamic_moe_postload_transposes_nz_and_retains_scales(moe_module, monke
     assert layer.w13_weight_scale_fp32.dtype is torch.float32
 
 
+def test_dynamic_moe_fused_mc2_preserves_fp32_scale_bits(moe_module) -> None:
+    module, _, _ = moe_module
+    scale = torch.tensor([1.0, -0.5, 0.0], dtype=torch.float32)
+
+    packed = module.scale_from_float_to_int64(scale)
+
+    assert packed.dtype is torch.int64
+    assert packed.tolist() == [0x3F800000, -1090519040, 0]
+
+
 def test_dynamic_moe_apply_preserves_runner_result_and_runtime_arguments(
     moe_module, monkeypatch
 ):
@@ -281,18 +291,21 @@ def test_dynamic_moe_accepts_ordinary_rc1_communication_methods(moe_module, comm
     assert received["input"]["swiglu_limit"] == 10.0
 
 
-@pytest.mark.parametrize(
-    ("config_name", "message"),
-    [("dynamic_eplb", "EPLB"), ("enable_fused_mc2", "fused MC2")],
-)
-def test_dynamic_moe_constructor_rejects_unported_modes(
-    moe_module, monkeypatch, config_name, message
-):
+def test_dynamic_moe_constructor_rejects_dynamic_eplb(moe_module, monkeypatch):
     module, _, _ = moe_module
     config = types.SimpleNamespace(
-        eplb_config=types.SimpleNamespace(dynamic_eplb=config_name == "dynamic_eplb"),
-        enable_fused_mc2=int(config_name == "enable_fused_mc2"),
+        eplb_config=types.SimpleNamespace(dynamic_eplb=True), enable_fused_mc2=0
     )
     monkeypatch.setattr(module, "get_ascend_config", lambda: config)
-    with pytest.raises(NotImplementedError, match=message):
+    with pytest.raises(NotImplementedError, match="EPLB"):
         module.AscendW8A8DynamicFusedMoEMethod()
+
+
+def test_dynamic_moe_constructor_accepts_fused_mc2_w8a8(moe_module, monkeypatch):
+    module, _, _ = moe_module
+    config = types.SimpleNamespace(
+        eplb_config=types.SimpleNamespace(dynamic_eplb=False), enable_fused_mc2=1
+    )
+    monkeypatch.setattr(module, "get_ascend_config", lambda: config)
+
+    assert module.AscendW8A8DynamicFusedMoEMethod().quant_type == "w8a8"

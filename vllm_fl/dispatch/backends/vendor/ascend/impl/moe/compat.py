@@ -8,9 +8,11 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_fl.ascend_flashcomm import (
     enable_flashcomm1,
+    shared_expert_dp_enabled_for_config,
 )
 from vllm_fl.dispatch.backends.vendor.ascend.hardware import (
     AscendDeviceType as AscendDeviceType,
@@ -19,21 +21,45 @@ from vllm_fl.dispatch.backends.vendor.ascend.hardware import (
 
 ACL_FORMAT_FRACTAL_NZ = 29
 _SHARED_EXPERTS_CALCULATION_STREAM = None
+_WORKER_VLLM_CONFIG = None
+logger = init_logger(__name__)
+
+
+def init_ascend_config(vllm_config) -> None:
+    """Retain the worker owner, as rc1 does during worker initialization.
+
+    Store the VllmConfig rather than a computed compatibility view: explicit
+    current-config contexts still take precedence and refreshed settings are
+    not frozen into a stale SimpleNamespace.
+    """
+    global _WORKER_VLLM_CONFIG
+    _WORKER_VLLM_CONFIG = vllm_config
+
+
+def clear_ascend_config() -> None:
+    global _WORKER_VLLM_CONFIG
+    _WORKER_VLLM_CONFIG = None
+
+
+def _current_vllm_config_or_none():
+    try:
+        from vllm.config import get_current_vllm_config
+
+        return get_current_vllm_config()
+    except AssertionError:
+        return _WORKER_VLLM_CONFIG
 
 
 def _additional_config() -> Mapping[str, object]:
-    """Return vLLM's additional config, only defaulting without a context.
+    """Read active/worker config, defaulting only without either owner.
 
     rc1 nests the MoE-related settings below ``additional_config``.  Do not
     turn a malformed in-context configuration into an empty mapping: doing so
     makes an explicitly requested but unsupported execution mode look like the
     supported AllGather default.
     """
-    try:
-        from vllm.config import get_current_vllm_config
-
-        vllm_config = get_current_vllm_config()
-    except AssertionError:
+    vllm_config = _current_vllm_config_or_none()
+    if vllm_config is None:
         return {}
     extra = vllm_config.additional_config
     if extra is None:
@@ -65,6 +91,7 @@ def _reject_unsupported(enabled: bool, feature: str) -> None:
 
 def get_ascend_config():
     """Return the rc1 MoE config view and fail closed for unmigrated opt-ins."""
+    vllm_config = _current_vllm_config_or_none()
     extra = _additional_config()
     compilation = _nested_config(extra, "ascend_compilation_config")
     fusion = _nested_config(extra, "ascend_fusion_config")
@@ -172,10 +199,6 @@ def get_ascend_config():
             "additional_config.enable_fused_mc2 must be 0 or 1, "
             f"got {enable_fused_mc2!r}"
         )
-    _reject_unsupported(enable_fused_mc2 == 1, "fused MC2 communication")
-    _reject_unsupported(
-        bool(extra.get("enable_shared_expert_dp", False)), "shared-expert DP"
-    )
     _reject_unsupported(
         bool(extra.get("mix_placement", False)), "mixed shared-expert placement"
     )
@@ -213,14 +236,27 @@ def get_ascend_config():
             f"got {weight_nz_mode!r}"
         )
 
+    enable_shared_expert_dp = shared_expert_dp_enabled_for_config(vllm_config)
+    if enable_shared_expert_dp:
+        assert enable_sp(
+            vllm_config=vllm_config,
+            enable_shared_expert_dp=True,
+        )
+
+    multistream_overlap_shared_expert = bool(
+        extra.get("multistream_overlap_shared_expert", False)
+    )
+    if enable_fused_mc2 == 1 and multistream_overlap_shared_expert:
+        multistream_overlap_shared_expert = False
+        logger.warning_once(
+            "enable_fused_mc2 and multistream_overlap_shared_expert cannot "
+            "be enabled together; disabling shared-expert overlap."
+        )
+
     return SimpleNamespace(
         enable_fused_mc2=enable_fused_mc2,
-        # Keep the rc1-shaped fields for consumers. Unsupported true requests
-        # above never reach them; the supported default remains false.
-        enable_shared_expert_dp=False,
-        multistream_overlap_shared_expert=bool(
-            extra.get("multistream_overlap_shared_expert", False)
-        ),
+        enable_shared_expert_dp=enable_shared_expert_dp,
+        multistream_overlap_shared_expert=multistream_overlap_shared_expert,
         mix_placement=False,
         enable_mc2_hierarchy_comm=False,
         mega_moe_max_tokens=mega_moe_max_tokens,
@@ -284,18 +320,15 @@ def enable_sp(
 ) -> bool:
     """Compatibility name for the current rc1 FlashComm1 runtime gate."""
     return enable_flashcomm1(
-        vllm_config,
+        _current_vllm_config_or_none() if vllm_config is None else vllm_config,
         enable_shared_expert_dp=enable_shared_expert_dp,
     )
 
 
 def enable_sp_by_pass() -> bool:
     """Keep compiler-pass SP distinct from the FlashComm1 runtime gate."""
-    try:
-        from vllm.config import get_current_vllm_config
-
-        vllm_config = get_current_vllm_config()
-    except AssertionError:
+    vllm_config = _current_vllm_config_or_none()
+    if vllm_config is None:
         return False
 
     model_config = getattr(vllm_config, "model_config", None)
@@ -373,12 +406,21 @@ def get_mc2_group():
     return _get_mc2_group()
 
 
-def split_tensor_along_first_dim(tensor: torch.Tensor, group) -> torch.Tensor:
-    world_size = group.world_size
-    rank = group.rank_in_group
-    if tensor.shape[0] % world_size != 0:
-        raise ValueError("first dimension must be divisible by the group size")
-    return tensor.chunk(world_size, dim=0)[rank]
+def split_tensor_along_first_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Compatibility import for rc1's first-dimension partition API."""
+    from vllm_fl.dispatch.backends.vendor.ascend.distributed.utils import (
+        split_tensor_along_first_dim as _split_tensor_along_first_dim,
+    )
+
+    return _split_tensor_along_first_dim(
+        tensor,
+        num_partitions=num_partitions,
+        contiguous_split_chunks=contiguous_split_chunks,
+    )
 
 
 def get_moe_num_logical_experts(

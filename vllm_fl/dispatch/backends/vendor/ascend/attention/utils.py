@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -19,8 +19,56 @@ from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
     is_pd_decode_recompute_scheduler_enabled,
 )
 from vllm_fl.dispatch.backends.vendor.ascend.attention.kvcomp import KVCompMetaData
+from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import AscendAttentionState
 
 SFA_QSFA_TILE_SIZE = 128
+
+
+def classify_dsa_attention_state(
+    num_computed_tokens: Sequence[int],
+    num_scheduled_tokens: Sequence[int],
+    num_valid_tokens: Sequence[int],
+    enable_chunked_prefill: bool,
+    speculative_method: str | None,
+) -> AscendAttentionState:
+    """Match rc1's DSA phase classification without runner-side state.
+
+    The compressed-DSA runner is the only current caller.  Keeping this
+    classifier vendor-local makes its cache/metadata phase contract testable
+    without changing the upstream model-runner path.
+    """
+    if all(tokens == 0 for tokens in num_computed_tokens):
+        return AscendAttentionState.PrefillNoCache
+    if all(tokens == 1 for tokens in num_scheduled_tokens):
+        return (
+            AscendAttentionState.SpecDecoding
+            if speculative_method == "mtp"
+            else AscendAttentionState.DecodeOnly
+        )
+    if all(tokens == 1 for tokens in num_valid_tokens):
+        # rc1 returns SpecDecoding from its local classifier, but stores
+        # ChunkedPrefill for every non-MTP speculative method before common
+        # metadata is built. Return the stored/common-metadata value here.
+        return (
+            AscendAttentionState.SpecDecoding
+            if speculative_method == "mtp"
+            else AscendAttentionState.ChunkedPrefill
+        )
+    if enable_chunked_prefill:
+        return AscendAttentionState.ChunkedPrefill
+    return AscendAttentionState.PrefillCacheHit
+
+
+def get_dsa_dummy_attention_state(
+    create_mixed_batch: bool = False,
+) -> AscendAttentionState:
+    """Return rc1's explicit phase for DSA capture, warmup, and idle dummies."""
+    if create_mixed_batch:
+        raise NotImplementedError(
+            "create_mixed_batch is used for warmup deepgemm; compressed DSA "
+            "does not support it"
+        )
+    return AscendAttentionState.DecodeOnly
 
 
 def get_sfa_qsfa_packed_head_dim(

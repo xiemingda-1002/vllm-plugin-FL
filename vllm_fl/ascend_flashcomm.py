@@ -10,6 +10,7 @@ whose package initializer loads Ascend operator implementations.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -59,6 +60,19 @@ def is_moe_model(vllm_config: Any) -> bool:
     return bool(get_num_experts and get_num_experts() > 0)
 
 
+def shared_expert_dp_enabled_for_config(vllm_config: Any | None) -> bool:
+    """Return rc1's effective shared-expert-DP opt-in for one config."""
+    additional_config = getattr(vllm_config, "additional_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return bool(
+        isinstance(additional_config, Mapping)
+        and additional_config.get("enable_shared_expert_dp", False)
+        and parallel_config is not None
+        and getattr(parallel_config, "enable_expert_parallel", False)
+        and getattr(parallel_config, "tensor_parallel_size", 1) > 1
+    )
+
+
 def enable_flashcomm1(
     vllm_config: Any | None = None,
     *,
@@ -86,7 +100,11 @@ def enable_flashcomm1(
             additional_config
             and additional_config.get("enable_flashcomm1", False)
         )
-        if not _ENABLE_FLASHCOMM1 and enable_shared_expert_dp:
+        effective_shared_expert_dp = (
+            enable_shared_expert_dp
+            or shared_expert_dp_enabled_for_config(vllm_config)
+        )
+        if not _ENABLE_FLASHCOMM1 and effective_shared_expert_dp:
             _ENABLE_FLASHCOMM1 = True
 
     return bool(_ENABLE_FLASHCOMM1)
@@ -171,5 +189,6 @@ __all__ = [
     "flashcomm1_enabled_for_forward",
     "is_vl_model",
     "is_moe_model",
+    "shared_expert_dp_enabled_for_config",
     "validate_and_update_flashcomm1_config",
 ]

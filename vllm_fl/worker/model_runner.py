@@ -520,6 +520,9 @@ class ModelRunnerFL(GPUModelRunner):
             and hasattr(hf_config, "compress_ratios")
         )
         if self.use_compress:
+            # Updated for each real compressed-DSA batch. Dummy metadata must
+            # pass its own explicit phase and never consume this value.
+            self._dsa_attn_state = None
             if self.speculative_config is not None:
                 raise NotImplementedError(
                     "FL Ascend DeepSeek-V4 compressed DSA does not support "
@@ -2116,6 +2119,41 @@ class ModelRunnerFL(GPUModelRunner):
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
+        if self.use_compress:
+            # This is the rc1 phase lifecycle for DSA metadata. In particular,
+            # a normal one-token decode must not fall through to the metadata
+            # extension's None/default prefill state.
+            if not scheduler_output.scheduled_spec_decode_tokens:
+                num_valid_tokens = num_scheduled_tokens
+            else:
+                num_valid_tokens = np.array(
+                    [
+                        scheduler_output.num_scheduled_tokens[req_id]
+                        - len(
+                            scheduler_output.scheduled_spec_decode_tokens.get(
+                                req_id, []
+                            )
+                        )
+                        for req_id in self.input_batch.req_ids
+                    ],
+                    dtype=np.int32,
+                )
+            from vllm_fl.dispatch.backends.vendor.ascend.attention.utils import (
+                classify_dsa_attention_state,
+            )
+
+            self._dsa_attn_state = classify_dsa_attention_state(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                num_scheduled_tokens,
+                num_valid_tokens,
+                self.scheduler_config.enable_chunked_prefill,
+                (
+                    self.speculative_config.method
+                    if self.speculative_config is not None
+                    else None
+                ),
+            )
+
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens = self._get_cumsum_and_arange(
@@ -2446,6 +2484,21 @@ class ModelRunnerFL(GPUModelRunner):
             spec_decode_metadata,
         )
 
+    def _set_dsa_common_attention_state(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        dsa_attn_state: Any | None,
+    ) -> None:
+        """Attach the compressed-DSA phase without affecting other backends."""
+        if not self.use_compress:
+            return
+        if dsa_attn_state is None:
+            dsa_attn_state = self._dsa_attn_state
+        assert dsa_attn_state is not None, (
+            "compressed DSA metadata requires an explicit attention state"
+        )
+        common_attn_metadata.attn_state = dsa_attn_state
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -2460,6 +2513,7 @@ class ModelRunnerFL(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        dsa_attn_state: Any | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2604,6 +2658,7 @@ class ModelRunnerFL(GPUModelRunner):
             # upstream metadata contract used by every other vendor.
             cm_base.positions_cpu = self._dsa_positions_cpu_buf
             cm_base.num_input_tokens = num_tokens_padded
+        self._set_dsa_common_attention_state(cm_base, dsa_attn_state)
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2652,7 +2707,16 @@ class ModelRunnerFL(GPUModelRunner):
                     AscendDSAMetadataBuilder,
                 )
 
-                is_dsa_builder = isinstance(builder, AscendDSAMetadataBuilder)
+                # DSA-CP consumes the same compressed-cache common metadata as
+                # regular DSA, while its builder owns TP/SP-specific request
+                # metadata. Keep the actual-token versus padded-input split.
+                from vllm_fl.dispatch.backends.vendor.ascend.attention.context_parallel.dsa_cp import (
+                    AscendDSACPMetadataBuilder,
+                )
+
+                is_dsa_builder = isinstance(
+                    builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)
+                )
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
@@ -2704,9 +2768,19 @@ class ModelRunnerFL(GPUModelRunner):
                     common_ratio_to_sas_metadata=dsa_common_ratio_to_sas_metadata,
                     block_size=attn_group.kv_cache_spec.block_size,
                 )
-                prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata
-                decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata
-                common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata
+                # The regular DSA builder publishes three ratio maps. DSA-CP
+                # intentionally owns only the common map; its TP-sharded
+                # metadata must not be replaced with a fabricated split map.
+                if isinstance(builder, AscendDSAMetadataBuilder):
+                    prefill_ratio_to_sas_metadata = (
+                        builder.prefill_ratio_to_sas_metadata
+                    )
+                    decode_ratio_to_sas_metadata = (
+                        builder.decode_ratio_to_sas_metadata
+                    )
+                common_ratio_to_sas_metadata = (
+                    builder.common_ratio_to_sas_metadata
+                )
             elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
@@ -6520,6 +6594,16 @@ class ModelRunnerFL(GPUModelRunner):
                     assert self._dsa_positions_cpu_buf is not None
                     self._dsa_positions_cpu_buf.fill_(127)
 
+                dsa_dummy_attn_state = None
+                if self.use_compress:
+                    from vllm_fl.dispatch.backends.vendor.ascend.attention.utils import (
+                        get_dsa_dummy_attention_state,
+                    )
+
+                    dsa_dummy_attn_state = get_dsa_dummy_attention_state(
+                        create_mixed_batch
+                    )
+
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -6538,6 +6622,10 @@ class ModelRunnerFL(GPUModelRunner):
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                    # Dummy capture, eager warmup, and an idle DP dummy all
+                    # use rc1's explicit decode metadata contract. Do not
+                    # inherit an earlier real batch's phase.
+                    dsa_attn_state=dsa_dummy_attn_state,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -7159,7 +7247,14 @@ class ModelRunnerFL(GPUModelRunner):
         if not supports_encoder_cudagraph(raw_model):
             return None
 
-        return EncoderCudaGraphManager(
+        manager_cls = EncoderCudaGraphManager
+        if current_platform.device_type == "npu":
+            from vllm_fl.dispatch.backends.vendor.ascend.worker.encoder_acl_graph import (
+                EncoderAclGraphManager,
+            )
+
+            manager_cls = EncoderAclGraphManager
+        return manager_cls(
             vllm_config=self.vllm_config,
             device=self.device,
             dtype=self.dtype,

@@ -7,9 +7,61 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import torch
+
+
+def test_canonical_rotary_triton_dispatch_preserves_inputs_and_contract(
+    monkeypatch,
+) -> None:
+    """The rc1 Triton route must remain functional at the canonical boundary."""
+    import vllm_fl.dispatch.backends.vendor.ascend.impl.canonical_rotary as rotary
+    import vllm_fl.dispatch.backends.vendor.ascend.impl.rope as rope_module
+
+    calls = []
+
+    def fake_rope(query, key, **kwargs):
+        calls.append((query, key, kwargs))
+        # Mutate the received tensors deliberately: canonical_rotary must have
+        # supplied functional copies rather than the caller-owned inputs.
+        query.add_(1)
+        key.add_(2)
+        return query, key
+
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setattr(rotary, "HAS_TRITON", True)
+    monkeypatch.setattr(rope_module, "rope_forward_triton", fake_rope)
+
+    query = torch.randn(2, 12)
+    key = torch.randn(2, 8)
+    original_query = query.clone()
+    original_key = key.clone()
+    positions = torch.tensor([[1], [3]])
+    cos_sin_cache = torch.randn(8, 2)
+
+    rotated_query, rotated_key = rotary.npu_rotary_embedding(
+        positions,
+        query,
+        key,
+        cos_sin_cache,
+        head_size=4,
+        rotary_dim=2,
+        is_neox_style=False,
+    )
+
+    assert torch.equal(query, original_query)
+    assert torch.equal(key, original_key)
+    assert torch.equal(rotated_query, original_query + 1)
+    assert torch.equal(rotated_key, original_key + 2)
+    assert len(calls) == 1
+    dispatched_query, dispatched_key, kwargs = calls[0]
+    assert dispatched_query.shape == (2, 3, 4)
+    assert dispatched_key.shape == (2, 2, 4)
+    assert kwargs["cos_sin_cache"] is cos_sin_cache
+    assert torch.equal(kwargs["positions"], torch.tensor([1, 3]))
+    assert kwargs["rope_dim"] == 2
+    assert kwargs["is_neox_style"] is False
 
 
 def test_npu_rotary_forward_emits_canonical_functional_op(monkeypatch) -> None:

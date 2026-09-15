@@ -40,7 +40,9 @@ def apply_ascend_patches():
     patch_causal_conv1d()
     patch_fla_ops()
     from .patches import patch_qwen3_5  # noqa: F401
+    from .patches.patch_qwen3vl import apply_qwen3vl_patch
 
+    apply_qwen3vl_patch()
     patch_op_cls()
     patch_fused_moe()
     _patches_applied = True

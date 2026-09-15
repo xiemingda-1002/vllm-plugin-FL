@@ -149,12 +149,15 @@ def _active_ep_world_size() -> int:
 
 
 def _select_a3_moe_comm_method(
-    num_tokens: int, mc2_tokens_capacity: int | None
+    num_tokens: int, mc2_tokens_capacity: int | None, enable_fused_mc2: int
 ) -> MoECommType:
-    """Select ordinary rc1 A3 transport; fused MC2 remains unsupported."""
+    """Select rc1 A3 transport, with the bounded W8A8 fused-MC2 gate."""
+    # dispatch_ffn_combine is an A3 W8A8 candidate only for active EP <= 32;
+    # native build/runtime validation remains an explicit downstream gate.
+    fused_enabled = enable_fused_mc2 == 1 and _active_ep_world_size() <= 32
     if mc2_tokens_capacity is not None and num_tokens <= mc2_tokens_capacity:
-        return MoECommType.MC2
-    return MoECommType.ALLTOALL
+        return MoECommType.FUSED_MC2 if fused_enabled else MoECommType.MC2
+    return MoECommType.FUSED_MC2 if fused_enabled and mc2_tokens_capacity is not None else MoECommType.ALLTOALL
 
 
 def select_moe_comm_method(
@@ -175,7 +178,13 @@ def select_moe_comm_method(
 
     device_type = _get_ascend_device_type()
     if device_type is AscendDeviceType.A3:
-        return _select_a3_moe_comm_method(num_tokens, mc2_tokens_capacity)
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat import (
+            get_ascend_config,
+        )
+
+        return _select_a3_moe_comm_method(
+            num_tokens, mc2_tokens_capacity, get_ascend_config().enable_fused_mc2
+        )
     if device_type is AscendDeviceType.A2:
         return _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
     if device_type is AscendDeviceType._310P:

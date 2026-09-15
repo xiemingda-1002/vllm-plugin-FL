@@ -16,12 +16,14 @@ def _config(
     tp_size: int = 2,
     enabled: bool = True,
     refresh: bool = True,
+    shared_expert_dp: bool = False,
     enforce_eager: bool = False,
     capture_sizes: list[int] | None = None,
 ):
     additional_config = {
         "enable_flashcomm1": enabled,
         "refresh": refresh,
+        "enable_shared_expert_dp": shared_expert_dp,
     }
     compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(name="FULL_DECODE_ONLY"),
@@ -54,6 +56,10 @@ def _config(
 def _reset_flashcomm_cache(monkeypatch):
     monkeypatch.setattr(flashcomm, "_ENABLE_FLASHCOMM1", None)
     monkeypatch.setattr(flashcomm, "_IS_VL_MODEL", None)
+    # Context construction now reads the initialized EP group for transport
+    # selection. These CPU tests cover FlashComm/padding, not EP transport;
+    # model an initialized single-rank EP group to retain the AllGather path.
+    monkeypatch.setattr(afc, "_active_ep_world_size", lambda: 1)
 
 
 def _context(config, *, num_tokens: int, dp_tokens=None):
@@ -161,3 +167,42 @@ def test_disabled_gate_does_not_rewrite_graph_shapes() -> None:
     flashcomm.validate_and_update_flashcomm1_config(config)
 
     assert config.compilation_config.cudagraph_capture_sizes == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("enable_ep", "tp_size", "expected"),
+    [
+        (False, 1, False),
+        (False, 2, False),
+        (False, 4, False),
+        (True, 1, False),
+        (True, 2, True),
+        (True, 4, True),
+    ],
+)
+def test_shared_expert_dp_effective_topology(
+    enable_ep: bool, tp_size: int, expected: bool
+) -> None:
+    config = _config(
+        enable_ep=enable_ep,
+        tp_size=tp_size,
+        shared_expert_dp=True,
+    )
+
+    assert flashcomm.shared_expert_dp_enabled_for_config(config) is expected
+
+
+def test_platform_validation_first_forces_valid_shared_dp_without_refresh() -> None:
+    config = _config(
+        enabled=False,
+        refresh=False,
+        shared_expert_dp=True,
+        tp_size=4,
+        capture_sizes=[1, 2, 4, 5, 8],
+    )
+
+    flashcomm.validate_and_update_flashcomm1_config(config)
+
+    assert flashcomm.enable_flashcomm1(config)
+    assert config.compilation_config.cudagraph_capture_sizes == [4, 8]
+    assert config.compilation_config.max_cudagraph_capture_size == 8

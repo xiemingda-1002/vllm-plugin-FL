@@ -89,6 +89,18 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
     hardware.get_ascend_device_type = lambda: object()
     monkeypatch.setitem(sys.modules, hardware.__name__, hardware)
 
+    dsa_compat = types.ModuleType(
+        "vllm_fl.dispatch.backends.vendor.ascend.dsa_compat"
+    )
+    dsa_compat.enable_dsa_cp = lambda: bool(
+        current.additional_config.get("enable_dsa_cp", False)
+        and current.additional_config.get("enable_flashcomm1", False)
+        and hasattr(
+            getattr(current.model_config, "hf_text_config", None), "index_topk"
+        )
+    )
+    monkeypatch.setitem(sys.modules, dsa_compat.__name__, dsa_compat)
+
     utils_spec = importlib.util.spec_from_file_location(
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.linear_utils",
         ROOT
@@ -301,9 +313,9 @@ def test_dynamic_postload_transposes_flattens_and_records_fp32_scale(
     assert layer.weight_scale_fp32.dtype is torch.float32
 
 
-def test_dsa_cp_request_rejects_even_for_small_weight(linear_module):
+def test_dsa_cp_small_weight_uses_normal_dynamic_layout_when_sp_enabled(linear_module):
     module, _, current, _, _ = linear_module
-    current.additional_config = {"enable_dsa_cp": True}
+    current.additional_config = {"enable_dsa_cp": True, "enable_flashcomm1": True}
     current.model_config = types.SimpleNamespace(
         hf_text_config=types.SimpleNamespace(index_topk=1)
     )
@@ -315,9 +327,44 @@ def test_dsa_cp_request_rejects_even_for_small_weight(linear_module):
         weight_scale=torch.nn.Parameter(torch.ones(4, 1), requires_grad=False),
         weight_offset=torch.nn.Parameter(torch.zeros(4, 1), requires_grad=False),
     )
+    # This CPU contract checks layout selection, not torch_npu format casting.
+    module.maybe_trans_nz = lambda tensor: tensor
 
-    with pytest.raises(NotImplementedError, match="DSA-CP"):
-        module.AscendW8A8DynamicLinearMethod().process_weights_after_loading(layer)
+    module.AscendW8A8DynamicLinearMethod().process_weights_after_loading(layer)
+
+    assert layer.weight.shape == (3, 4)
+    assert layer.weight_scale.shape == (4,)
+    assert layer.weight_offset.shape == (4,)
+
+
+def test_dsa_cp_large_wq_b_uses_rc1_two_chunk_layout(linear_module, monkeypatch):
+    module, _, current, _, _ = linear_module
+    current.additional_config = {"enable_dsa_cp": True, "enable_flashcomm1": True}
+    current.model_config = types.SimpleNamespace(
+        hf_text_config=types.SimpleNamespace(index_topk=1)
+    )
+    monkeypatch.setattr(module, "maybe_trans_nz", lambda tensor: tensor)
+    layer = types.SimpleNamespace(
+        prefix="model.layers.0.self_attn.wq_b",
+        weight=torch.nn.Parameter(
+            torch.empty(65535 * 2, 2, dtype=torch.int8), requires_grad=False
+        ),
+        weight_scale=torch.nn.Parameter(
+            torch.ones(65535 * 2, 1), requires_grad=False
+        ),
+        weight_offset=torch.nn.Parameter(
+            torch.zeros(65535 * 2, 1), requires_grad=False
+        ),
+    )
+
+    module.AscendW8A8DynamicLinearMethod().process_weights_after_loading(layer)
+
+    assert layer._chunk_size == 65535
+    assert layer.weight_1.shape == (2, 65535)
+    assert layer.weight_2.shape == (2, 65535)
+    assert layer.weight_1_scale.shape == (65535,)
+    assert layer.weight_2_scale.shape == (65535,)
+    assert not hasattr(layer, "weight")
 
 
 def test_nz_policy_uses_config_before_env_and_skips_float_and_meta(

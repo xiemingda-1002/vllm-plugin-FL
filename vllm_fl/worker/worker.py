@@ -83,20 +83,34 @@ if TYPE_CHECKING:
 
 def _maybe_bind_ascend_worker_cpus(worker: "WorkerFL") -> None:
     """Run the rc1 Ascend CPU-affinity policy after all worker warmups."""
-    if current_platform.device_type != "npu":
+    if (
+        current_platform.device_type != "npu"
+        or getattr(current_platform, "vendor_name", None) != "ascend"
+    ):
         return
     additional_config = worker.vllm_config.additional_config or {}
     if not additional_config.get("enable_cpu_binding", True):
         return
 
+    # CpuAlloc interprets rank_id as an ordinal in this process's visible NPU
+    # list. ``worker.local_rank`` can instead be TP-local when vLLM gives each
+    # DP replica an assigned device shard. The chosen torch.device preserves
+    # the visible ordinal under both full and masked device visibility.
+    device_index = getattr(getattr(worker, "device", None), "index", None)
+    if not isinstance(device_index, int) or isinstance(device_index, bool):
+        logger.warning(
+            "Skip Ascend CPU binding: selected worker device has no visible ordinal."
+        )
+        return
+
     try:
         from vllm_fl.cpu_binding import bind_cpus
 
-        bind_cpus(worker.local_rank)
+        bind_cpus(device_index)
     except Exception as exc:
         logger.warning(
-            "Bind cpus failed in rank%s: %s Skip binding cpu.",
-            worker.local_rank,
+            "Bind cpus failed for visible NPU%s: %s Skip binding cpu.",
+            device_index,
             exc,
         )
 
@@ -138,6 +152,13 @@ class WorkerFL(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        if getattr(current_platform, "vendor_name", None) == "ascend":
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat import (
+                init_ascend_config,
+            )
+
+            init_ascend_config(vllm_config)
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -767,12 +788,15 @@ class WorkerFL(WorkerBase):
 
             logger.debug(msg)
 
-        # Warm up sampler and preallocate memory buffer for logits and other
-        # sampling related tensors of max possible shape to avoid memory
-        # fragmentation issue.
-        # NOTE: This is called after `capture_model` on purpose to prevent
-        # memory buffers from being cleared by `torch.cuda.empty_cache`.
-        if get_pp_group().is_last_rank:
+        # The generic post-capture sampler warmup produces max_num_reqs rows,
+        # whereas the Ascend sampler's profile contract indexes a full
+        # max_num_tokens batch. Current rc1 performs Ascend sampler profiling
+        # through its profile_run lifecycle, before graph capture.
+        # Keep the upstream post-capture lifecycle for non-Ascend platforms.
+        if not (
+            current_platform.device_type == "npu"
+            and getattr(current_platform, "vendor_name", None) == "ascend"
+        ) and get_pp_group().is_last_rank:
             max_num_reqs = min(
                 self.scheduler_config.max_num_seqs,
                 self.scheduler_config.max_num_batched_tokens,
@@ -961,12 +985,27 @@ class WorkerFL(WorkerBase):
             if self.profiler is None:
                 profiler_type = self.profiler_config.profiler
                 if profiler_type == "torch":
-                    self.profiler = TorchProfilerWrapper(
-                        self.profiler_config,
-                        worker_name=trace_name,
-                        local_rank=self.local_rank,
-                        activities=["CPU", "CUDA"],
-                    )
+                    if (
+                        current_platform.device_type == "npu"
+                        and getattr(current_platform, "vendor_name", None)
+                        == "ascend"
+                    ):
+                        from vllm_fl.dispatch.backends.vendor.ascend.profiler import (
+                            TorchNPUProfilerWrapper,
+                        )
+
+                        self.profiler = TorchNPUProfilerWrapper(
+                            self.profiler_config,
+                            trace_name,
+                            self.vllm_config.additional_config,
+                        )
+                    else:
+                        self.profiler = TorchProfilerWrapper(
+                            self.profiler_config,
+                            worker_name=trace_name,
+                            local_rank=self.local_rank,
+                            activities=["CPU", "CUDA"],
+                        )
                     logger.debug(
                         "Starting torch profiler with trace name: %s", trace_name
                     )

@@ -58,11 +58,47 @@ def test_a2_mc2_threshold_matches_rc1(monkeypatch) -> None:
 
 def test_a3_ordinary_selector_uses_capacity_without_fused_mc2(monkeypatch) -> None:
     from vllm_fl.dispatch.backends.vendor.ascend.hardware import AscendDeviceType
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe import compat
 
     monkeypatch.setattr(afc, "_mc2_tokens_capacity", 128)
     monkeypatch.setattr(afc, "_active_ep_world_size", lambda: 16)
     monkeypatch.setattr(afc, "_get_ascend_device_type", lambda: AscendDeviceType.A3)
+    monkeypatch.setattr(
+        compat, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=0)
+    )
     config = _config(ep_size=16, num_experts=256)
+
+    assert afc.select_moe_comm_method(128, config) is afc.MoECommType.MC2
+    assert afc.select_moe_comm_method(129, config) is afc.MoECommType.ALLTOALL
+
+
+def test_a3_fused_mc2_selector_covers_both_capacity_sides(monkeypatch) -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.hardware import AscendDeviceType
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe import compat
+
+    monkeypatch.setattr(afc, "_mc2_tokens_capacity", 128)
+    monkeypatch.setattr(afc, "_active_ep_world_size", lambda: 16)
+    monkeypatch.setattr(afc, "_get_ascend_device_type", lambda: AscendDeviceType.A3)
+    monkeypatch.setattr(
+        compat, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=1)
+    )
+    config = _config(ep_size=16, num_experts=256)
+
+    assert afc.select_moe_comm_method(128, config) is afc.MoECommType.FUSED_MC2
+    assert afc.select_moe_comm_method(129, config) is afc.MoECommType.FUSED_MC2
+
+
+def test_a3_fused_mc2_fails_closed_above_ep32(monkeypatch) -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.hardware import AscendDeviceType
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe import compat
+
+    monkeypatch.setattr(afc, "_mc2_tokens_capacity", 128)
+    monkeypatch.setattr(afc, "_active_ep_world_size", lambda: 33)
+    monkeypatch.setattr(afc, "_get_ascend_device_type", lambda: AscendDeviceType.A3)
+    monkeypatch.setattr(
+        compat, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=1)
+    )
+    config = _config(ep_size=33, num_experts=256)
 
     assert afc.select_moe_comm_method(128, config) is afc.MoECommType.MC2
     assert afc.select_moe_comm_method(129, config) is afc.MoECommType.ALLTOALL

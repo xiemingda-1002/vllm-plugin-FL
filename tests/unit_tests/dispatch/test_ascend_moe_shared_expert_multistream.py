@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import logging
 import sys
 from contextlib import nullcontext
 from enum import Enum
@@ -31,8 +33,21 @@ def _load_compat():
         "vllm_fl.dispatch.backends.vendor.ascend",
     )
     modules = {name: _package(name) for name in package_names}
+
+    def shared_expert_dp_enabled_for_config(vllm_config):
+        additional_config = getattr(vllm_config, "additional_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        return bool(
+            additional_config
+            and additional_config.get("enable_shared_expert_dp", False)
+            and parallel_config is not None
+            and getattr(parallel_config, "enable_expert_parallel", False)
+            and getattr(parallel_config, "tensor_parallel_size", 1) > 1
+        )
+
     modules["vllm_fl.ascend_flashcomm"] = SimpleNamespace(
-        enable_flashcomm1=lambda *_args, **_kwargs: False
+        enable_flashcomm1=lambda *_args, **_kwargs: False,
+        shared_expert_dp_enabled_for_config=shared_expert_dp_enabled_for_config,
     )
     modules["vllm_fl.dispatch.backends.vendor.ascend.hardware"] = SimpleNamespace(
         AscendDeviceType=Enum("AscendDeviceType", "A2 A3 A5 _310P"),
@@ -151,11 +166,7 @@ def test_multistream_forward_retains_stream_and_event_lifecycle() -> None:
 
 def test_unmigrated_neighbor_modes_still_fail_closed() -> None:
     runner = _source("fused_moe.py")
-    for rejection in (
-        "fused MC2 is not migrated",
-        "shared-expert DP is not migrated",
-        "EPLB is not migrated",
-    ):
+    for rejection in ("EPLB is not migrated",):
         assert rejection in runner
 
 
@@ -182,8 +193,6 @@ def test_moe_compat_uses_rc1_nested_defaults(monkeypatch) -> None:
         ({"eplb_config": {"expert_map_record_path": ""}}, "EPLB"),
         ({"eplb_config": {"expert_map_path": "map.json"}}, "EPLB"),
         ({"eplb_config": {"num_redundant_experts": 1}}, "EPLB"),
-        ({"enable_fused_mc2": 1}, "fused MC2"),
-        ({"enable_shared_expert_dp": True}, "shared-expert DP"),
         ({"mix_placement": True}, "mixed shared-expert placement"),
         ({"enable_mc2_hierarchy_comm": True}, "MC2 hierarchy communication"),
         (
@@ -237,13 +246,40 @@ def test_moe_compat_rejects_legacy_flat_eplb_key(monkeypatch) -> None:
         compat.get_ascend_config()
 
 
-def test_moe_compat_rejects_fused_mc2_environment_opt_in(monkeypatch) -> None:
+def test_moe_compat_accepts_fused_mc2_environment_opt_in(monkeypatch) -> None:
     compat = _load_compat()
     monkeypatch.setattr(compat, "_additional_config", lambda: {})
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "1")
 
-    with pytest.raises(NotImplementedError, match="fused MC2 communication"):
-        compat.get_ascend_config()
+    assert compat.get_ascend_config().enable_fused_mc2 == 1
+
+
+def test_fused_mc2_disables_shared_expert_overlap_once_without_caching_config(
+    monkeypatch, caplog
+) -> None:
+    compat = _load_compat()
+    monkeypatch.setattr(
+        compat,
+        "_additional_config",
+        lambda: {
+            "enable_fused_mc2": 1,
+            "multistream_overlap_shared_expert": True,
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        first = compat.get_ascend_config()
+        second = compat.get_ascend_config()
+
+    assert first is not second
+    assert first.enable_fused_mc2 == second.enable_fused_mc2 == 1
+    assert first.multistream_overlap_shared_expert is False
+    assert second.multistream_overlap_shared_expert is False
+    warning = (
+        "enable_fused_mc2 and multistream_overlap_shared_expert cannot "
+        "be enabled together; disabling shared-expert overlap."
+    )
+    assert caplog.text.count(warning) == 1
 
 
 def test_moe_compat_config_overrides_fused_mc2_environment(monkeypatch) -> None:
@@ -263,6 +299,98 @@ def test_moe_compat_preserves_shared_expert_overlap_opt_in(monkeypatch) -> None:
     )
 
     assert compat.get_ascend_config().multistream_overlap_shared_expert is True
+
+
+@pytest.mark.parametrize(
+    ("enable_ep", "tp_size", "expected"),
+    [
+        (True, 2, True),
+        (True, 4, True),
+        (True, 1, False),
+        (False, 2, False),
+    ],
+)
+def test_shared_expert_dp_requires_requested_ep_and_tp_gt_one(
+    monkeypatch, enable_ep, tp_size, expected
+) -> None:
+    compat = _load_compat()
+    vllm_config = SimpleNamespace(
+        additional_config={"enable_shared_expert_dp": True},
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_ep,
+            tensor_parallel_size=tp_size,
+        ),
+    )
+    monkeypatch.setattr(
+        compat, "_current_vllm_config_or_none", lambda: vllm_config
+    )
+    monkeypatch.setattr(
+        compat, "_additional_config", lambda: vllm_config.additional_config
+    )
+    enable_sp = Mock(return_value=True)
+    monkeypatch.setattr(compat, "enable_sp", enable_sp)
+
+    config = compat.get_ascend_config()
+
+    assert config.enable_shared_expert_dp is expected
+    if expected:
+        enable_sp.assert_called_once_with(
+            vllm_config=vllm_config,
+            enable_shared_expert_dp=True,
+        )
+    else:
+        enable_sp.assert_not_called()
+
+
+def test_shared_expert_dp_defaults_false_without_current_config(monkeypatch) -> None:
+    compat = _load_compat()
+    monkeypatch.setattr(compat, "_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        compat,
+        "_additional_config",
+        lambda: {"enable_shared_expert_dp": True},
+    )
+
+    assert compat.get_ascend_config().enable_shared_expert_dp is False
+
+
+def test_all2all_prepare_finalize_honors_shared_expert_dp_skip(monkeypatch) -> None:
+    """Exercise the existing prepare/finalize flag, without a device group."""
+    import torch
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe import prepare_finalize
+
+    method = object.__new__(prepare_finalize.PrepareAndFinalizeWithAll2All)
+    method.tp_size = 2
+    method.tp_rank = 0
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    router_logits = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    input_ids = torch.tensor([1, 2, 3, 4])
+
+    skipped = method.prepare(
+        hidden_states,
+        router_logits,
+        enable_shared_expert_dp=True,
+        replace_allreduce=False,
+    )
+    assert skipped.hidden_states.shape[0] == 4
+    assert skipped.router_logits.shape[0] == 4
+    assert method.pad_and_split_input_ids(input_ids).tolist() == [1, 2, 3, 4]
+
+    all_gather = Mock()
+    monkeypatch.setattr(prepare_finalize.dist, "all_gather", all_gather)
+    finalized = method.finalize(skipped.hidden_states, reduce_results=False)
+    assert finalized.shape[0] == 4
+    all_gather.assert_not_called()
+
+    partitioned = method.prepare(
+        hidden_states,
+        router_logits,
+        enable_shared_expert_dp=False,
+        replace_allreduce=False,
+    )
+    assert partitioned.hidden_states.shape[0] == 2
+    assert partitioned.router_logits.shape[0] == 2
+    assert method.pad_and_split_input_ids(input_ids).tolist() == [1, 2]
 
 
 @pytest.mark.parametrize(
@@ -326,3 +454,210 @@ def test_no_current_context_keeps_supported_defaults(monkeypatch):
         sys.modules, "vllm.config", SimpleNamespace(get_current_vllm_config=no_context)
     )
     assert compat.get_ascend_config().enable_fused_mc2 == 0
+
+
+def _runtime_vllm_config(*, additional_config=None, enable_ep=False, tp_size=1):
+    """Build a real vLLM config while keeping this module CPU-only."""
+    from vllm.config import DeviceConfig, VllmConfig
+
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    vllm_config.additional_config = (
+        {} if additional_config is None else additional_config
+    )
+    vllm_config.parallel_config.enable_expert_parallel = enable_ep
+    vllm_config.parallel_config.tensor_parallel_size = tp_size
+    return vllm_config
+
+
+def test_worker_owned_config_survives_real_vllm_context_exit():
+    """The worker reference, not an expired context, drives fused settings."""
+    from vllm.config import set_current_vllm_config
+
+    compat = _load_compat()
+    worker_config = _runtime_vllm_config(additional_config={"enable_fused_mc2": 1})
+    try:
+        with set_current_vllm_config(worker_config):
+            compat.init_ascend_config(worker_config)
+            assert compat.get_ascend_config().enable_fused_mc2 == 1
+
+        assert compat.get_ascend_config().enable_fused_mc2 == 1
+    finally:
+        compat.clear_ascend_config()
+
+
+def test_active_real_context_overrides_then_restores_worker_reference():
+    from vllm.config import set_current_vllm_config
+
+    compat = _load_compat()
+    worker_config = _runtime_vllm_config(additional_config={"enable_fused_mc2": 1})
+    active_config = _runtime_vllm_config(additional_config={"enable_fused_mc2": 0})
+    try:
+        compat.init_ascend_config(worker_config)
+        assert compat.get_ascend_config().enable_fused_mc2 == 1
+
+        with set_current_vllm_config(active_config):
+            assert compat.get_ascend_config().enable_fused_mc2 == 0
+
+        assert compat.get_ascend_config().enable_fused_mc2 == 1
+    finally:
+        compat.clear_ascend_config()
+
+
+def test_worker_owned_reference_refreshes_and_config_overrides_environment(monkeypatch):
+    compat = _load_compat()
+    worker_config = _runtime_vllm_config(additional_config={})
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "1")
+    try:
+        compat.init_ascend_config(worker_config)
+        assert compat.get_ascend_config().enable_fused_mc2 == 1
+
+        # The stored owner is deliberately a reference, so a worker refresh
+        # takes effect without retaining a stale derived compatibility view.
+        worker_config.additional_config["enable_fused_mc2"] = 0
+        assert compat.get_ascend_config().enable_fused_mc2 == 0
+        worker_config.additional_config["enable_fused_mc2"] = 1
+        assert compat.get_ascend_config().enable_fused_mc2 == 1
+    finally:
+        compat.clear_ascend_config()
+
+
+def test_clear_and_reinit_change_the_outside_context_owner():
+    compat = _load_compat()
+    enabled = _runtime_vllm_config(additional_config={"enable_fused_mc2": 1})
+    disabled = _runtime_vllm_config(additional_config={"enable_fused_mc2": 0})
+    try:
+        compat.init_ascend_config(enabled)
+        assert compat.get_ascend_config().enable_fused_mc2 == 1
+
+        compat.clear_ascend_config()
+        assert compat.get_ascend_config().enable_fused_mc2 == 0
+
+        compat.init_ascend_config(disabled)
+        assert compat.get_ascend_config().enable_fused_mc2 == 0
+    finally:
+        compat.clear_ascend_config()
+
+
+def test_shared_dp_sp_gate_receives_worker_fallback_config_after_context_exit(
+    monkeypatch,
+):
+    from vllm.config import set_current_vllm_config
+
+    compat = _load_compat()
+    worker_config = _runtime_vllm_config(
+        additional_config={"enable_shared_expert_dp": True},
+        enable_ep=True,
+        tp_size=2,
+    )
+    enable_sp = Mock(return_value=True)
+    monkeypatch.setattr(compat, "enable_sp", enable_sp)
+    try:
+        with set_current_vllm_config(worker_config):
+            compat.init_ascend_config(worker_config)
+        config = compat.get_ascend_config()
+    finally:
+        compat.clear_ascend_config()
+
+    assert config.enable_shared_expert_dp is True
+    enable_sp.assert_called_once_with(
+        vllm_config=worker_config,
+        enable_shared_expert_dp=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("additional_config", "error"),
+    [
+        ({"eplb_config": {"dynamic_eplb": True}}, NotImplementedError),
+        ([], TypeError),
+    ],
+)
+def test_outside_context_fallback_remains_fail_closed_for_bad_or_unsupported_config(
+    additional_config, error
+):
+    compat = _load_compat()
+    worker_config = _runtime_vllm_config(additional_config=additional_config)
+    try:
+        compat.init_ascend_config(worker_config)
+        with pytest.raises(error):
+            compat.get_ascend_config()
+    finally:
+        compat.clear_ascend_config()
+
+
+def test_worker_ascend_config_import_is_vendor_guarded_in_constructor_ast():
+    """Non-Ascend workers cannot enter the Ascend import branch at init."""
+    worker_path = ROOT / "vllm_fl" / "worker" / "worker.py"
+    tree = ast.parse(worker_path.read_text(encoding="utf-8"))
+    guarded_imports = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        has_ascend_guard = (
+            isinstance(node.test, ast.Compare)
+            and any(
+                isinstance(comparator, ast.Constant)
+                and comparator.value == "ascend"
+                for comparator in node.test.comparators
+            )
+        )
+        imports_compat = any(
+            isinstance(child, ast.ImportFrom)
+            and child.module
+            == "vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat"
+            and any(alias.name == "init_ascend_config" for alias in child.names)
+            for child in ast.walk(node)
+        )
+        calls_init = any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "init_ascend_config"
+            for child in ast.walk(node)
+        )
+        if has_ascend_guard and imports_compat and calls_init:
+            guarded_imports.append(node)
+
+    assert len(guarded_imports) == 1
+
+    # Execute the actual guard, not a rewritten predicate, without constructing
+    # devices or the rest of WorkerFL. Non-Ascend must not even import compat.
+    import builtins
+
+    branch = compile(ast.Module(body=guarded_imports, type_ignores=[]),
+                     str(worker_path), "exec")
+    for vendor in ("cuda", "musa", None, "ascend"):
+        calls = []
+        owner = object()
+
+        def guarded_import(name, *args, **kwargs):
+            calls.append(("import", name))
+            return SimpleNamespace(
+                init_ascend_config=lambda config: calls.append(("init", config))
+            )
+
+        namespace = {
+            "__builtins__": dict(vars(builtins), __import__=guarded_import),
+            "current_platform": SimpleNamespace(vendor_name=vendor),
+            "vllm_config": owner,
+        }
+        exec(branch, namespace)
+        if vendor == "ascend":
+            assert calls == [
+                ("import", "vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat"),
+                ("init", owner),
+            ]
+        else:
+            assert calls == []
+
+
+def test_sp_helper_resolves_worker_owner_without_explicit_argument(monkeypatch):
+    compat = _load_compat()
+    owner = _runtime_vllm_config(additional_config={"enable_flashcomm1": True})
+    flashcomm = Mock(return_value=True)
+    monkeypatch.setattr(compat, "enable_flashcomm1", flashcomm)
+    try:
+        compat.init_ascend_config(owner)
+        assert compat.enable_sp() is True
+        flashcomm.assert_called_once_with(owner, enable_shared_expert_dp=False)
+    finally:
+        compat.clear_ascend_config()

@@ -56,6 +56,11 @@ ops=(
   inplace_partial_rotary_mul
   rms_norm_dynamic_quant
 )
+if [[ "${soc_family}" == "ascend910_93" ]]; then
+  # dispatch_ffn_combine is the A3 W8A8 fused-MC2 payload.  Keep A2's
+  # selected OPP closure unchanged.
+  ops+=(dispatch_ffn_combine)
+fi
 ops_arg=$(IFS=';'; echo "${ops[*]}")
 
 cd "${script_dir}"

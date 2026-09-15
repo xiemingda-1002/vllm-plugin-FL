@@ -5,6 +5,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import ForwardContext, override_forward_context
@@ -147,3 +148,122 @@ def test_hash_selector_uses_current_extra_context_input_ids(monkeypatch) -> None
         assert observed_input_ids[-1].dtype is torch.int64
 
     assert len(observed_input_ids) == 2
+
+
+@pytest.mark.parametrize("num_partitions", [1, 2, 4])
+def test_rc1_first_dim_split_returns_partitions_and_preserves_views(
+    num_partitions: int,
+) -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.distributed.utils import (
+        split_tensor_along_first_dim,
+    )
+
+    tensor = torch.arange(num_partitions * 8).reshape(num_partitions * 4, 2)[:, :1]
+    assert not tensor.is_contiguous()
+    chunks = split_tensor_along_first_dim(tensor, num_partitions)
+
+    assert isinstance(chunks, tuple)
+    assert len(chunks) == num_partitions
+    assert all(not chunk.is_contiguous() for chunk in chunks)
+    contiguous = split_tensor_along_first_dim(
+        tensor, num_partitions, contiguous_split_chunks=True
+    )
+    assert all(chunk.is_contiguous() for chunk in contiguous)
+
+
+def test_rc1_first_dim_split_rejects_uneven_dimension() -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.distributed.utils import (
+        split_tensor_along_first_dim,
+    )
+
+    with pytest.raises(AssertionError):
+        split_tensor_along_first_dim(torch.arange(5), 2)
+
+
+@pytest.mark.parametrize("comm_type", [MoECommType.MC2, MoECommType.ALLTOALL])
+@pytest.mark.parametrize(
+    ("tp_size", "rank"),
+    [(tp_size, rank) for tp_size in (1, 2, 4) for rank in range(tp_size)],
+)
+def test_hash_selector_flashcomm_uses_rank_local_tp_input_ids(
+    monkeypatch, comm_type, tp_size, rank
+) -> None:
+    captured: list[torch.Tensor] = []
+    all_ids = torch.arange(100, 100 + tp_size * 4, dtype=torch.int32)
+    all_ids[2::4] = -1
+
+    def hash_op(**kwargs):
+        captured.append(kwargs["input_ids"])
+        return torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32), None
+
+    monkeypatch.setattr(torch.ops._C_ascend, "moe_gating_top_k_hash", hash_op, raising=False)
+    monkeypatch.setattr(
+        experts_selector,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp_size, rank_in_group=rank),
+    )
+    comm_method = SimpleNamespace(pad_and_split_input_ids=lambda ids: ids)
+    with override_forward_context(
+        _context(
+            input_ids=all_ids,
+            moe_comm_type=comm_type,
+            moe_comm_method=comm_method,
+            flash_comm_v1_enabled=True,
+        )
+    ):
+        experts_selector._select_experts_with_fusion_ops(
+            hidden_states=torch.empty(1, 4),
+            router_logits=torch.empty(1, 4),
+            top_k=1,
+            use_grouped_topk=False,
+            renormalize=False,
+            e_score_correction_bias=None,
+            topk_group=1,
+            num_expert_group=1,
+            scoring_func="sqrtsoftplus",
+            tid2eid=torch.tensor([[3]], dtype=torch.int64),
+        )
+
+    expected = all_ids[rank * 4 : (rank + 1) * 4].to(torch.int64)
+    expected[2] = 0
+    assert torch.equal(captured[-1], expected)
+    assert captured[-1].is_contiguous()
+    assert captured[-1].dtype is torch.int64
+
+
+def test_hash_selector_flashcomm_keeps_allgather_input_ids_unsplit(monkeypatch) -> None:
+    captured: list[torch.Tensor] = []
+    all_ids = torch.tensor([10, -1, 12, 13], dtype=torch.int32)
+
+    def hash_op(**kwargs):
+        captured.append(kwargs["input_ids"])
+        return torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32), None
+
+    monkeypatch.setattr(torch.ops._C_ascend, "moe_gating_top_k_hash", hash_op, raising=False)
+    comm_method = SimpleNamespace(
+        prepare_finalize=SimpleNamespace(
+            all_gather_input_id_with_dp_group=lambda ids: ids
+        )
+    )
+    with override_forward_context(
+        _context(
+            input_ids=all_ids,
+            moe_comm_type=MoECommType.ALLGATHER,
+            moe_comm_method=comm_method,
+            flash_comm_v1_enabled=True,
+        )
+    ):
+        experts_selector._select_experts_with_fusion_ops(
+            hidden_states=torch.empty(1, 4),
+            router_logits=torch.empty(1, 4),
+            top_k=1,
+            use_grouped_topk=False,
+            renormalize=False,
+            e_score_correction_bias=None,
+            topk_group=1,
+            num_expert_group=1,
+            scoring_func="sqrtsoftplus",
+            tid2eid=torch.tensor([[3]], dtype=torch.int64),
+        )
+
+    assert torch.equal(captured[-1], torch.tensor([10, 0, 12, 13], dtype=torch.int64))

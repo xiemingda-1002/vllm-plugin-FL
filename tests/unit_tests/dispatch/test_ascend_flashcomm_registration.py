@@ -57,11 +57,52 @@ def test_pass_sp_is_disabled_for_eager_model(monkeypatch) -> None:
 def test_shared_expert_dp_forces_unified_gate(monkeypatch) -> None:
     config = _config(flashcomm1=False)
     config.additional_config["enable_shared_expert_dp"] = True
+    config.parallel_config = SimpleNamespace(
+        enable_expert_parallel=True,
+        tensor_parallel_size=4,
+    )
     monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
 
-    assert compat.shared_expert_dp_enabled()
+    assert compat.get_ascend_config().enable_shared_expert_dp
+    assert compat.enable_sp(config, enable_shared_expert_dp=True)
     config.additional_config["refresh"] = False
     assert compat.enable_sp(config)
+
+
+def test_platform_validation_before_compat_forces_shared_dp_without_refresh(
+    monkeypatch,
+) -> None:
+    config = SimpleNamespace(
+        additional_config={
+            "enable_flashcomm1": False,
+            "enable_shared_expert_dp": True,
+            "refresh": False,
+        },
+        parallel_config=SimpleNamespace(
+            is_moe_model=True,
+            enable_expert_parallel=True,
+            tensor_parallel_size=4,
+        ),
+        model_config=SimpleNamespace(
+            enforce_eager=False,
+            get_num_experts=lambda: 128,
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(name="FULL_DECODE_ONLY"),
+            cudagraph_capture_sizes=[1, 2, 4, 8],
+            max_cudagraph_capture_size=8,
+        ),
+    )
+    config.update_sizes_for_sequence_parallelism = lambda sizes: [
+        size for size in sizes if size % 4 == 0
+    ]
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+
+    flashcomm.validate_and_update_flashcomm1_config(config)
+
+    assert compat.get_ascend_config().enable_shared_expert_dp
+    assert compat.enable_sp(config)
+    assert config.compilation_config.cudagraph_capture_sizes == [4, 8]
 
 
 def test_importing_compat_does_not_import_vllm_ascend() -> None:

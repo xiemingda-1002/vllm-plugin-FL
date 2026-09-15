@@ -384,11 +384,19 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self._shared_experts = shared_experts
 
         if ascend_config.enable_fused_mc2:
-            raise NotImplementedError("FL Ascend rc1 MoE fused MC2 is not migrated")
-        if ascend_config.enable_shared_expert_dp:
-            raise NotImplementedError(
-                "FL Ascend rc1 MoE shared-expert DP is not migrated"
+            from vllm_fl.dispatch.backends.vendor.ascend.hardware import (
+                AscendDeviceType,
+                get_ascend_device_type,
             )
+
+            if self.quant_type is not QuantType.W8A8:
+                raise NotImplementedError(
+                    "FL Ascend fused MC2 is packaged only for ModelSlim W8A8_DYNAMIC"
+                )
+            if get_ascend_device_type() is not AscendDeviceType.A3:
+                raise NotImplementedError(
+                    "FL Ascend fused MC2 is an A3-only W8A8 candidate"
+                )
         eplb_config = ascend_config.eplb_config
         if (
             eplb_config.dynamic_eplb
@@ -410,7 +418,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 dtype=vllm_config.model_config.dtype
             )
 
-        self.enable_shared_expert_dp = False
+        self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         # The shared-expert multistream path is enabled only when both the
         # Ascend configuration and a concrete shared-expert module request it.
         self.multistream_overlap_shared_expert = (

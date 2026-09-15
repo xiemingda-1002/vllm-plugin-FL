@@ -377,6 +377,16 @@ class PlatformFL(Platform):
             model_config is not None
             and model_config.use_mla
             and cache_config.block_size is not None
+            # Ascend DSV4 owns its compressed/SWA cache geometry. The rc1
+            # refresh_block_size above accepts 32, 64 and 128; the generic
+            # FlagOS MLA alignment must not overwrite that selection.
+            and not (
+                cls.device_type == "npu"
+                and getattr(cls, "vendor_name", None) == "ascend"
+                and getattr(
+                    getattr(model_config, "hf_config", None), "model_type", None
+                ) == "deepseek_v4"
+            )
         ):
             if cache_config.block_size % 64 != 0:
                 cache_config.block_size = 64

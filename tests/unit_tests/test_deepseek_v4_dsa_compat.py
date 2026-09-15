@@ -19,7 +19,7 @@ def _config(additional_config=None, *, has_indexer=True, kv_transfer_config=None
     )
 
 
-def test_dsa_cp_defaults_off_and_requested_mode_fails_closed(monkeypatch) -> None:
+def test_dsa_cp_defaults_off_and_requires_sp(monkeypatch) -> None:
     monkeypatch.setattr(
         vllm_config_module,
         "get_current_vllm_config",
@@ -32,8 +32,11 @@ def test_dsa_cp_defaults_off_and_requested_mode_fails_closed(monkeypatch) -> Non
         "get_current_vllm_config",
         lambda: _config({"enable_dsa_cp": True}),
     )
-    with pytest.raises(NotImplementedError, match="DSA-CP"):
+    monkeypatch.setattr(dsa_compat, "enable_sp", lambda: False)
+    with pytest.raises(ValueError, match="requires SP"):
         dsa_compat.enable_dsa_cp()
+    monkeypatch.setattr(dsa_compat, "enable_sp", lambda: True)
+    assert dsa_compat.enable_dsa_cp() is True
 
 
 def test_unmigrated_finegrained_tp_fails_closed(monkeypatch) -> None:

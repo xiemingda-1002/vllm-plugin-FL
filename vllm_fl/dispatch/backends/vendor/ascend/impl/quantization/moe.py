@@ -17,10 +17,8 @@
 """rc1 ModelSlim W8A8_DYNAMIC fused-MoE scheme for the Ascend FL backend.
 
 This is a vendor-scoped port of ``vllm_ascend`` 0.24.0rc1
-``method_adapters.py`` and ``methods/w8a8_dynamic.py``.  The FL runtime only
-has the A2 AllGather communication closure at present.  The rc1 MC2/Fused-MC2
-and EPLB branches are therefore rejected explicitly rather than partially
-constructing their metadata.
+``method_adapters.py`` and ``methods/w8a8_dynamic.py``.  It supports the rc1
+W8A8 Fused-MC2 scale representation; EPLB remains rejected explicitly.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.model_executor.layers.fused_moe import (
@@ -49,6 +48,15 @@ from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.moe_runtime_args import (
 from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.quant_type import QuantType
 
 ACL_FORMAT_FRACTAL_NZ = 29
+
+
+def scale_from_float_to_int64(scale: torch.Tensor) -> torch.Tensor:
+    """Use rc1's bit-preserving FP32-to-int64 scale representation."""
+    return torch.from_numpy(
+        np.frombuffer(
+            scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
+        ).astype(np.int64)
+    ).to(scale.device)
 
 
 def _torch_npu():
@@ -208,16 +216,11 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
 
         vllm_config = get_current_vllm_config()
         ascend_config = get_ascend_config()
-        # EPLB and Fused-MC2 are rejected by the FL config compatibility gate.
-        # Retain a fail-closed check here so a direct scheme construction cannot
-        # silently select an unported branch.
+        # Dynamic EPLB has no FL closure. Fused-MC2 is supported only by this
+        # W8A8 scheme and prepares its packed scale representation below.
         if ascend_config.eplb_config.dynamic_eplb:
             raise NotImplementedError(
                 "FL Ascend rc1 W8A8_DYNAMIC MoE EPLB is not migrated"
-            )
-        if ascend_config.enable_fused_mc2:
-            raise NotImplementedError(
-                "FL Ascend rc1 W8A8_DYNAMIC MoE fused MC2 is not migrated"
             )
         self.dynamic_eplb = False
         self.in_dtype = vllm_config.model_config.dtype
@@ -348,6 +351,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 topk_ids.dtype
             )
 
+        fused_scale_flag = (
+            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
+            and get_ascend_config().enable_fused_mc2 == 1
+        )
         result = _EXTRA_CTX.moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -364,8 +371,14 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
-                w1_scale=[layer.w13_weight_scale_fp32],
-                w2_scale=[layer.w2_weight_scale],
+                w1_scale=[layer.fused_w1_scale]
+                if fused_scale_flag else [layer.w13_weight_scale_fp32],
+                w2_scale=[layer.fused_w2_scale]
+                if fused_scale_flag else [layer.w2_weight_scale],
+                w1_scale_bias=[torch.tensor([], dtype=torch.float32)]
+                if fused_scale_flag else None,
+                w2_scale_bias=[torch.tensor([], dtype=torch.float32)]
+                if fused_scale_flag else None,
                 swiglu_limit=layer.swiglu_limit,
                 swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
                 swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
@@ -400,6 +413,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(
             layer.w2_weight_offset.data.shape[0], -1
         )
+        if get_ascend_config().enable_fused_mc2 == 1:
+            layer.fused_w1_scale = scale_from_float_to_int64(
+                layer.w13_weight_scale.data
+            )
+            layer.fused_w2_scale = scale_from_float_to_int64(
+                layer.w2_weight_scale.data
+            )
 
 
 def create_moe_scheme(quant_type: str) -> AscendMoEScheme:
@@ -416,4 +436,5 @@ __all__ = [
     "AscendW8A8DynamicFusedMoEMethod",
     "create_moe_scheme",
     "get_moe_num_logical_experts",
+    "scale_from_float_to_int64",
 ]

@@ -193,17 +193,33 @@ def _patch_fused_moe_factory() -> None:
     import inspect
     import vllm.model_executor.layers.fused_moe as _fused_moe_pkg
     import vllm.model_executor.layers.fused_moe.layer as _fused_moe_layer
+    from vllm.platforms import current_platform
+    from vllm_fl.ops.fused_moe.layer import _OrigFusedMoE
 
     # Patch at the module level so `from vllm...fused_moe import FusedMoE` picks it up.
     _fused_moe_layer.FusedMoE = FusedMoEFL  # noqa F405
     _fused_moe_pkg.FusedMoE = FusedMoEFL   # noqa F405
-    # Be robust when a caller imported qwen3_next before plugin registration.
-    # This is intentionally explicit: the Qwen module is the current-0.24
-    # consumer in this migration, and scanning/mutating arbitrary modules would
-    # make the patch ordering harder to reason about.
+    # Preserve the historic non-Ascend qwen3_next repair. On Ascend, repair
+    # only model-module stale aliases that still bind the exact upstream
+    # factory captured by FL; an explicit caller/custom factory is untouched.
+    # Models may import the factory before platform initialization. Restrict
+    # repair to the model namespace and identity, preserving custom factories.
     import sys
 
-    qwen_module = sys.modules.get("vllm.model_executor.models.qwen3_next")
-    if qwen_module is not None:
-        qwen_module.FusedMoE = FusedMoEFL  # noqa F405
+    module_names = ["vllm.model_executor.models.qwen3_next"]
+    is_ascend = (
+        current_platform.vendor_name == "ascend"
+        and current_platform.device_type == "npu"
+    )
+    if is_ascend:
+        module_names = [
+            name for name in tuple(sys.modules)
+            if name.startswith("vllm.model_executor.models.")
+        ]
+    for module_name in module_names:
+        qwen_module = sys.modules.get(module_name)
+        if qwen_module is not None and (
+            not is_ascend or qwen_module.__dict__.get("FusedMoE") is _OrigFusedMoE
+        ):
+            qwen_module.FusedMoE = FusedMoEFL  # noqa F405
     logger.info("Monkey-patched FusedMoE factory -> FusedMoEFL")

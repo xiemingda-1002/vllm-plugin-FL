@@ -61,12 +61,10 @@ def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | No
 def setup_moe_comm_method(moe_config):
     _MoECommMethods.clear()
     if moe_config.ep_size > 1:
-        # Keep the ordinary rc1 communication set coherent. FUSED_MC2 remains
-        # deliberately unregistered: its dispatch_ffn_combine native closure
-        # is outside this migration.
         _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
         _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
+        _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
     else:
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
 

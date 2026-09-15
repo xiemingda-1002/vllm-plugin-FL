@@ -19,6 +19,7 @@ from vllm_fl.ascend_flashcomm import enable_flashcomm1, is_vl_model
 from vllm_fl.ascend_forward_context import _EXTRA_CTX
 
 from .device_operator import DeviceOperator
+from ..dsa_compat import enable_dsa_cp
 from .moe.compat import shared_expert_dp_enabled
 
 
@@ -155,7 +156,14 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             return tensor_model_parallel_all_reduce(output)
 
         x = input_parallel
-        if _EXTRA_CTX.pad_size > 0:
+        # DSA-CP returns a full, TP-restored attention output at wo_b. Its
+        # sequence extent is already the real local extent, unlike ordinary
+        # FlashComm1 row-parallel inputs, so adding transport padding here
+        # corrupts the paired full-weight projection path.
+        dsa_cp_attention_output = enable_dsa_cp() and (
+            "o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix
+        )
+        if _EXTRA_CTX.pad_size > 0 and not dsa_cp_attention_output:
             x = F.pad(x, (0, 0, 0, _EXTRA_CTX.pad_size))
 
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod

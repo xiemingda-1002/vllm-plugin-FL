@@ -17,9 +17,9 @@
 """rc1 ModelSlim W8A8 static/dynamic Ascend linear schemes.
 
 Ported from vLLM-Ascend 0.24.0rc1's ``w8a8_static.py``, the linear portion of
-``w8a8_dynamic.py``, ``base.py``, and ``method_adapters.py``. Quantized MoE,
-FlashComm2 quantized communication, and DSA-CP are intentionally not included
-in this bounded FL closure and fail explicitly when requested.
+``w8a8_dynamic.py``, ``base.py``, and ``method_adapters.py``. Quantized MoE
+and FlashComm2 quantized communication remain outside this module; the rc1
+DSA-CP large-``wq_b`` split is supported through the Ascend vendor gate.
 """
 
 from __future__ import annotations
@@ -87,25 +87,10 @@ def _torch_npu():
 
 
 def _dsa_cp_enabled() -> bool:
-    """Reject FL's unported DSA-CP path instead of silently losing its split."""
-    from vllm.config import get_current_vllm_config
+    """Use the single rc1-compatible DSA-CP/SP gate for ModelSlim too."""
+    from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import enable_dsa_cp
 
-    vllm_config = get_current_vllm_config()
-    has_indexer = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
-        vllm_config.model_config.hf_text_config, "index_topk"
-    )
-    additional_config = getattr(vllm_config, "additional_config", None)
-    requested = bool(
-        has_indexer
-        and additional_config is not None
-        and additional_config.get("enable_dsa_cp", False)
-    )
-    if requested:
-        raise NotImplementedError(
-            "FL Ascend ModelSlim linear does not yet migrate DSA-CP; "
-            "disable additional_config.enable_dsa_cp"
-        )
-    return False
+    return enable_dsa_cp()
 
 
 def _flashcomm2_requested() -> bool:
@@ -298,8 +283,9 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             and layer.weight.shape[1] >= 65536
             and dsa_cp_enabled
         ):
-            # This is the exact rc1 large-wq_b split, reached only after FL
-            # implements DSA-CP. Today _dsa_cp_enabled rejects that request.
+            # This is the rc1 DSA-CP workaround for the NPU quant-matmul
+            # output-dimension limit.  dsa_cp.py imports this exact scheme
+            # class, so its quantized q path observes the same split layout.
             chunk_size = layer.weight.shape[1] // 2
             assert chunk_size < 65536, (
                 "Even after chunking, the weight dimension is still larger than 65536."

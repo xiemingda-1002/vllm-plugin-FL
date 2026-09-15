@@ -8,10 +8,9 @@ ROOT = Path(__file__).resolve().parents[2]
 ASCEND = ROOT / "vllm_fl/dispatch/backends/vendor/ascend"
 
 # These references are in code shared with other quantization/topology paths,
-# not the current W8A8 AllGather acceptance path. Do not silently treat them
-# as implemented native capabilities when extending that acceptance scope.
+# not the selected A3 W8A8 fused-MC2 payload. Do not silently treat them as
+# implemented native capabilities when extending that acceptance scope.
 CONDITIONAL_NATIVE_PATHS = {
-    "dispatch_ffn_combine": "FUSED_MC2, rejected by current compatibility config",
     "grouped_matmul_swiglu_quant_v2": "W4A8 fused MLP, not W8A8",
     "grouped_matmul_swiglu_quant_weight_nz_tensor_list": "dynamic EPLB fusion, disabled",
     "npu_swiglu_group_quant": "MXFP shared experts, not current W8A8 checkpoint",

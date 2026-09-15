@@ -27,13 +27,23 @@ def enable_dsa_cp() -> bool:
     if text_config is None or not hasattr(text_config, "index_topk"):
         return False
     additional_config = getattr(vllm_config, "additional_config", None) or {}
-    if bool(additional_config.get("enable_dsa_cp", False)):
-        raise NotImplementedError(
-            "FL Ascend DeepSeek V4 DSA-CP is not migrated yet; "
-            "remove additional_config.enable_dsa_cp until the context-parallel "
-            "execution chain is installed"
+    dsa_cp_enabled = bool(additional_config.get("enable_dsa_cp", False))
+    if dsa_cp_enabled and not enable_sp():
+        raise ValueError(
+            "DSA CP requires SP to be enabled. Enable FlashComm1 to use "
+            "additional_config.enable_dsa_cp."
         )
-    return False
+    return dsa_cp_enabled and enable_sp()
+
+
+def enable_dsa_cp_with_o_proj_tp() -> bool:
+    """Match rc1's temporary full o_proj-weight requirement for DSA-CP."""
+    if not enable_dsa_cp():
+        return False
+    from vllm.config import get_current_vllm_config
+
+    kv_transfer_config = get_current_vllm_config().kv_transfer_config
+    return kv_transfer_config is None or kv_transfer_config.is_kv_producer
 
 
 def get_dsv4_compress_ratio(config, layer_idx: int) -> int:

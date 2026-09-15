@@ -3,6 +3,8 @@
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.config import CUDAGraphMode
 
 from vllm_fl import cpu_binding
@@ -86,9 +88,10 @@ def test_platform_does_not_materialize_cpu_binding_for_other_vendors(
     assert config.additional_config is None
 
 
-def _worker(additional_config=None, local_rank=2):
+def _worker(additional_config=None, local_rank=2, device_index=2):
     return SimpleNamespace(
         local_rank=local_rank,
+        device=SimpleNamespace(index=device_index),
         vllm_config=SimpleNamespace(additional_config=additional_config),
     )
 
@@ -96,7 +99,9 @@ def _worker(additional_config=None, local_rank=2):
 def test_ascend_worker_invokes_cpu_binding_by_default(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
-        worker_module, "current_platform", SimpleNamespace(device_type="npu")
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type="npu", vendor_name="ascend"),
     )
     monkeypatch.setattr(cpu_binding, "bind_cpus", calls.append)
 
@@ -108,7 +113,9 @@ def test_ascend_worker_invokes_cpu_binding_by_default(monkeypatch) -> None:
 def test_ascend_worker_honors_explicit_cpu_binding_disable(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
-        worker_module, "current_platform", SimpleNamespace(device_type="npu")
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type="npu", vendor_name="ascend"),
     )
     monkeypatch.setattr(cpu_binding, "bind_cpus", calls.append)
 
@@ -119,10 +126,18 @@ def test_ascend_worker_honors_explicit_cpu_binding_disable(monkeypatch) -> None:
     assert calls == []
 
 
-def test_non_ascend_worker_never_invokes_cpu_binding(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "device_type,vendor_name",
+    [("cuda", "nvidia"), ("npu", "other-npu")],
+)
+def test_non_ascend_worker_never_invokes_cpu_binding(
+    monkeypatch, device_type, vendor_name
+) -> None:
     calls = []
     monkeypatch.setattr(
-        worker_module, "current_platform", SimpleNamespace(device_type="cuda")
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type=device_type, vendor_name=vendor_name),
     )
     monkeypatch.setattr(cpu_binding, "bind_cpus", calls.append)
 
@@ -133,7 +148,9 @@ def test_non_ascend_worker_never_invokes_cpu_binding(monkeypatch) -> None:
 
 def test_ascend_worker_binding_failure_is_nonfatal(monkeypatch, caplog) -> None:
     monkeypatch.setattr(
-        worker_module, "current_platform", SimpleNamespace(device_type="npu")
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type="npu", vendor_name="ascend"),
     )
 
     def fail(_rank):
@@ -141,9 +158,68 @@ def test_ascend_worker_binding_failure_is_nonfatal(monkeypatch, caplog) -> None:
 
     monkeypatch.setattr(cpu_binding, "bind_cpus", fail)
 
-    worker_module._maybe_bind_ascend_worker_cpus(_worker(local_rank=7))
+    worker_module._maybe_bind_ascend_worker_cpus(
+        _worker(local_rank=7, device_index=11)
+    )
 
-    assert "Bind cpus failed in rank7" in caplog.text
+    assert "Bind cpus failed for visible NPU11" in caplog.text
+
+
+def test_ascend_worker_binds_selected_visible_ordinal_for_full_dp_topology(
+    monkeypatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type="npu", vendor_name="ascend"),
+    )
+    monkeypatch.setattr(cpu_binding, "bind_cpus", calls.append)
+
+    # DP4 x TP4 with all 16 NPUs visible: local TP rank repeats 0..3, but
+    # selected visible ordinal must cover each actual NPU once.
+    for device_index in range(16):
+        worker_module._maybe_bind_ascend_worker_cpus(
+            _worker(local_rank=device_index % 4, device_index=device_index)
+        )
+
+    assert calls == list(range(16))
+
+
+def test_ascend_worker_preserves_masked_visible_device_ordinal(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type="npu", vendor_name="ascend"),
+    )
+    monkeypatch.setattr(cpu_binding, "bind_cpus", calls.append)
+
+    # A worker whose visible list is, for example, physical [8, 9, 10, 11]
+    # selects visible ordinal 3. CpuAlloc maps that ordinal through its own
+    # visible list, so the worker must not pass physical 11.
+    worker_module._maybe_bind_ascend_worker_cpus(
+        _worker(local_rank=3, device_index=3)
+    )
+
+    assert calls == [3]
+
+
+def test_ascend_worker_skips_binding_without_selected_device_ordinal(
+    monkeypatch, caplog
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "current_platform",
+        SimpleNamespace(device_type="npu", vendor_name="ascend"),
+    )
+    monkeypatch.setattr(cpu_binding, "bind_cpus", calls.append)
+
+    worker_module._maybe_bind_ascend_worker_cpus(_worker(device_index=None))
+
+    assert calls == []
+    assert "has no visible ordinal" in caplog.text
 
 
 def test_ascend_worker_binds_after_sampler_warmup_before_seed_reset() -> None:
