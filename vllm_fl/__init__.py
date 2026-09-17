@@ -238,14 +238,15 @@ def register_model():
     register_router()
 
     _register_gdn_packed_decode_patch()
-    # Register GLM-5 (GlmMoeDsa) — config not yet upstream
-    try:
-        from vllm.transformers_utils.config import _CONFIG_REGISTRY
+    # Transformers now provides the native GLM configuration used by the
+    # current vLLM-Ascend route.  In particular it preserves rope_parameters,
+    # which the old DeepseekV2-derived compatibility class discarded.  Keep
+    # the legacy bridge for non-Ascend installations that still need it.
+    if getattr(current_platform, "vendor_name", None) != "ascend":
+        try:
+            from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
-        from vllm_fl.configs.glm_moe_dsa import GlmMoeDsaConfig
-        _CONFIG_REGISTRY["glm_moe_dsa"] = GlmMoeDsaConfig
-
-        #from vllm_fl.patches.glm_moe_dsa import apply_model_patches as glm5_model
-        #glm5_model()
-    except Exception as e:
-        logger.error(f"Register GlmMoeDsa model error: {str(e)}")
+            from vllm_fl.configs.glm_moe_dsa import GlmMoeDsaConfig
+            _CONFIG_REGISTRY["glm_moe_dsa"] = GlmMoeDsaConfig
+        except Exception as e:
+            logger.error("Register legacy GlmMoeDsa config error: %s", e)

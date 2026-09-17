@@ -519,10 +519,25 @@ class ModelRunnerFL(GPUModelRunner):
             and getattr(hf_config, "model_type", None) == "deepseek_v4"
             and hasattr(hf_config, "compress_ratios")
         )
-        if self.use_compress:
+        # GLM-5.2's sparse Flash Attention shares the Ascend common-metadata
+        # contract (positions, phase, padded input token count) with DSA, but
+        # does *not* use DeepSeek-V4's compressed-cache runner lifecycle.
+        # Keep the predicates separate: use_compress owns DSV4 allocation and
+        # graph-padding behavior, while this flag only selects the metadata
+        # extension required by the SFA builder.
+        self.use_ascend_sfa = False
+        if getattr(current_platform, "vendor_name", None) == "ascend":
+            from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
+                model_uses_sfa_sparse,
+            )
+
+            self.use_ascend_sfa = model_uses_sfa_sparse(self.model_config)
+        if self.use_compress or getattr(self, "use_ascend_sfa", False):
             # Updated for each real compressed-DSA batch. Dummy metadata must
-            # pass its own explicit phase and never consume this value.
+            # pass its own explicit phase and never consume this value. SFA
+            # uses the same phase enum, but remains outside use_compress.
             self._dsa_attn_state = None
+        if self.use_compress:
             if self.speculative_config is not None:
                 raise NotImplementedError(
                     "FL Ascend DeepSeek-V4 compressed DSA does not support "
@@ -956,6 +971,17 @@ class ModelRunnerFL(GPUModelRunner):
             # explicit config is available. FlashComm linear ops run later
             # without a current-config context and consume this cached value.
             is_vl_model(self.vllm_config)
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.rope import (
+                set_cos_and_sin,
+            )
+
+            set_cos_and_sin(
+                self.vllm_config,
+                self.max_num_reqs,
+                self.uniform_decode_query_len,
+                self.dtype,
+                self.device,
+            )
             # Initialize the fixed buffers used by the rc1 Ascend MoE
             # communication selector. Keep this import out of other vendors.
             from vllm_fl.ascend_forward_context import (
@@ -2119,8 +2145,8 @@ class ModelRunnerFL(GPUModelRunner):
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
-        if self.use_compress:
-            # This is the rc1 phase lifecycle for DSA metadata. In particular,
+        if self.use_compress or getattr(self, "use_ascend_sfa", False):
+            # This is the rc1 phase lifecycle for Ascend DSA/SFA metadata. In particular,
             # a normal one-token decode must not fall through to the metadata
             # extension's None/default prefill state.
             if not scheduler_output.scheduled_spec_decode_tokens:
@@ -2489,13 +2515,13 @@ class ModelRunnerFL(GPUModelRunner):
         common_attn_metadata: CommonAttentionMetadata,
         dsa_attn_state: Any | None,
     ) -> None:
-        """Attach the compressed-DSA phase without affecting other backends."""
-        if not self.use_compress:
+        """Attach the Ascend DSA/SFA phase without affecting other backends."""
+        if not (self.use_compress or getattr(self, "use_ascend_sfa", False)):
             return
         if dsa_attn_state is None:
             dsa_attn_state = self._dsa_attn_state
         assert dsa_attn_state is not None, (
-            "compressed DSA metadata requires an explicit attention state"
+            "Ascend DSA/SFA metadata requires an explicit attention state"
         )
         common_attn_metadata.attn_state = dsa_attn_state
 
@@ -2622,7 +2648,7 @@ class ModelRunnerFL(GPUModelRunner):
                 req_doc_ranges[req_idx] = image_doc_ranges
 
         common_metadata_cls: type[CommonAttentionMetadata] = CommonAttentionMetadata
-        if self.use_compress:
+        if self.use_compress or getattr(self, "use_ascend_sfa", False):
             from vllm_fl.dispatch.backends.vendor.ascend.attention.utils import (
                 AscendCommonAttentionMetadata,
             )
@@ -2640,7 +2666,9 @@ class ModelRunnerFL(GPUModelRunner):
             # DSA keeps real local forward tokens distinct from padded RoPE
             # and slot-mapping inputs (set below), matching rc1.
             num_actual_tokens=(
-                num_tokens if self.use_compress else num_tokens_padded
+                num_tokens
+                if self.use_compress or getattr(self, "use_ascend_sfa", False)
+                else num_tokens_padded
             ),
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
@@ -2651,13 +2679,15 @@ class ModelRunnerFL(GPUModelRunner):
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
         )
-        if self.use_compress:
-            assert self._dsa_positions_cpu_buf is not None
+        if self.use_compress or getattr(self, "use_ascend_sfa", False):
             # These fields are intentionally Ascend-only extensions. They are
-            # required by AscendDSAMetadataBuilder and are absent from the
-            # upstream metadata contract used by every other vendor.
-            cm_base.positions_cpu = self._dsa_positions_cpu_buf
+            # required by AscendDSAMetadataBuilder and AscendSFAMetadataBuilder
+            # and are absent from the upstream metadata contract used by every
+            # other vendor.
             cm_base.num_input_tokens = num_tokens_padded
+            if self.use_compress:
+                assert self._dsa_positions_cpu_buf is not None
+                cm_base.positions_cpu = self._dsa_positions_cpu_buf
         self._set_dsa_common_attention_state(cm_base, dsa_attn_state)
 
         if self.dcp_world_size > 1:
@@ -2702,6 +2732,7 @@ class ModelRunnerFL(GPUModelRunner):
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             is_dsa_builder = False
+            is_sfa_builder = False
             if self.use_compress:
                 from vllm_fl.dispatch.backends.vendor.ascend.attention.dsa_v1 import (
                     AscendDSAMetadataBuilder,
@@ -2717,6 +2748,12 @@ class ModelRunnerFL(GPUModelRunner):
                 is_dsa_builder = isinstance(
                     builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)
                 )
+            if self.use_ascend_sfa:
+                from vllm_fl.dispatch.backends.vendor.ascend.attention.sfa_v1 import (
+                    AscendSFAMetadataBuilder,
+                )
+
+                is_sfa_builder = isinstance(builder, AscendSFAMetadataBuilder)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
@@ -2780,6 +2817,14 @@ class ModelRunnerFL(GPUModelRunner):
                     )
                 common_ratio_to_sas_metadata = (
                     builder.common_ratio_to_sas_metadata
+                )
+            elif is_sfa_builder and for_cudagraph_capture:
+                # SFA's rc1 graph path has an explicit phase-aware builder;
+                # the generic CUDA-graph entry point neither exists on the
+                # SFA builder nor supplies the DecodeOnly contract.
+                assert dsa_attn_state is not None
+                attn_metadata_i = builder.build_for_graph_capture(
+                    common_attn_metadata, dsa_attn_state
                 )
             elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
@@ -4874,7 +4919,12 @@ class ModelRunnerFL(GPUModelRunner):
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update or self.use_compress
+                if (
+                    pad_attn
+                    or has_separate_kv_update
+                    or self.use_compress
+                    or getattr(self, "use_ascend_sfa", False)
+                )
                 else num_tokens_unpadded,
                 num_reqs_padded=(
                     num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
@@ -4887,7 +4937,11 @@ class ModelRunnerFL(GPUModelRunner):
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=(
-                        num_tokens_padded if pad_attn or self.use_compress else None
+                        num_tokens_padded
+                        if pad_attn
+                        or self.use_compress
+                        or getattr(self, "use_ascend_sfa", False)
+                        else None
                     ),
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded if pad_attn else None,
@@ -6595,7 +6649,7 @@ class ModelRunnerFL(GPUModelRunner):
                     self._dsa_positions_cpu_buf.fill_(127)
 
                 dsa_dummy_attn_state = None
-                if self.use_compress:
+                if self.use_compress or getattr(self, "use_ascend_sfa", False):
                     from vllm_fl.dispatch.backends.vendor.ascend.attention.utils import (
                         get_dsa_dummy_attention_state,
                     )
@@ -6608,7 +6662,11 @@ class ModelRunnerFL(GPUModelRunner):
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=(
-                        num_tokens_padded if pad_attn or self.use_compress else None
+                        num_tokens_padded
+                        if pad_attn
+                        or self.use_compress
+                        or getattr(self, "use_ascend_sfa", False)
+                        else None
                     ),
                     # rc1 keeps the rank-local dummy request count separate
                     # from the DP/graph-padded shape for compressed DSA.  In
@@ -7592,13 +7650,38 @@ class ModelRunnerFL(GPUModelRunner):
             )
             attn_backends = {}
             attn_backend_layers = defaultdict(list)
+            # GLM-5.2 SFA exposes its indexer cache as a separate cache-only
+            # layer.  It must use the Ascend placeholder builder rather than
+            # the real SFA metadata builder, whose constructor expects an MLA
+            # attention layer.  This is Ascend-only; all other platforms keep
+            # their upstream backend selection unchanged.
+            if getattr(current_platform, "vendor_name", None) == "ascend":
+                from vllm_fl.dispatch.backends.vendor.ascend.core.kv_cache_interface import (
+                    AscendSFAIndexerCacheSpec,
+                )
+            else:
+                # Keep the vendor module out of non-Ascend runner startup.
+                AscendSFAIndexerCacheSpec = ()
             # Dedupe based on full class name; this is a bit safer than
             # using the class itself as the key because when we create dynamic
             # attention backend subclasses (e.g. ChunkedLocalAttention) unless
             # they are cached correctly, there will be different objects per
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
-                attn_backend = layers[layer_name].get_attn_backend()
+                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                if (
+                    getattr(current_platform, "vendor_name", None) == "ascend"
+                    and isinstance(layer_kv_cache_spec, AscendSFAIndexerCacheSpec)
+                ):
+                    from vllm_fl.dispatch.backends.vendor.ascend.attention.indexer import (
+                        AscendSFAIndexerBackend,
+                    )
+
+                    attn_backend = AscendSFAIndexerBackend
+                else:
+                    attn_backend = layers[layer_name].get_attn_backend()
 
                 if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
                     attn_backend = create_fast_prefill_custom_backend(
@@ -7607,9 +7690,6 @@ class ModelRunnerFL(GPUModelRunner):
                     )
 
                 full_cls_name = attn_backend.full_cls_name()
-                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
                 # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
                 # expose ``num_heads``; fall back to 0 so they cluster as
                 # before. Such layers never coexist with Attention in a
@@ -7879,9 +7959,69 @@ class ModelRunnerFL(GPUModelRunner):
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors
         )
 
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
         packed_backing: torch.Tensor | None = None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            shared_specs = [
+                layer_kv_cache_specs[layer_name]
+                for layer_name in kv_cache_tensor.shared_by
+            ]
+            is_glm_sfa = (
+                getattr(current_platform, "vendor_name", None) == "ascend"
+                and self.model_config.hf_config.model_type == "glm_moe_dsa"
+                and any(
+                    spec.__class__.__name__ in {
+                        "AscendMLAAttentionSpec", "AscendSFAIndexerCacheSpec"
+                    }
+                    for spec in shared_specs
+                )
+            )
+            if is_glm_sfa:
+                if kv_cache_tensor.block_stride > 0:
+                    raise NotImplementedError(
+                        "GLM5.2 SFA non-C8 cache does not support packed block strides"
+                    )
+                if len({type(spec) for spec in shared_specs}) != 1:
+                    raise NotImplementedError(
+                        "GLM5.2 SFA cache groups must not mix main MLA and indexer specs"
+                    )
+                spec = shared_specs[0]
+                if (
+                    getattr(spec, "cache_sparse_c8", False)
+                    or getattr(spec, "scale_dim", 0)
+                    or getattr(spec, "sfa_dcp_replicated_indexer_size", 1) != 1
+                ):
+                    raise NotImplementedError(
+                        "GLM5.2 SFA C8/DCP cache is not migrated"
+                    )
+                num_blocks = kv_cache_tensor.size // spec.page_size_bytes
+                element_size = get_dtype_size(spec.dtype)
+                if spec.__class__.__name__ == "AscendSFAIndexerCacheSpec":
+                    raw_cache = (
+                        torch.zeros(
+                            num_blocks * spec.block_size * spec.num_kv_heads
+                            * spec.head_size * element_size,
+                            dtype=torch.int8,
+                            device=self.device,
+                        ),
+                    )
+                else:
+                    hf_config = self.model_config.hf_text_config
+                    k_bytes = (
+                        num_blocks * spec.block_size * spec.num_kv_heads
+                        * hf_config.kv_lora_rank * element_size
+                    )
+                    v_bytes = (
+                        num_blocks * spec.block_size * spec.num_kv_heads
+                        * hf_config.qk_rope_head_dim * element_size
+                    )
+                    raw_cache = (
+                        torch.zeros(k_bytes, dtype=torch.int8, device=self.device),
+                        torch.zeros(v_bytes, dtype=torch.int8, device=self.device),
+                    )
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = raw_cache
+                continue
             if kv_cache_tensor.block_stride > 0:
                 # Allocate once; all packed tensors alias the same backing.
                 if packed_backing is None:
@@ -7937,7 +8077,7 @@ class ModelRunnerFL(GPUModelRunner):
 
     def _reshape_kv_cache_tensors(
         self,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
         kernel_block_sizes: list[int],
     ) -> dict[str, torch.Tensor]:
         """
@@ -7975,6 +8115,50 @@ class ModelRunnerFL(GPUModelRunner):
                     continue
                 kv_cache_spec = layer_kv_cache_specs[layer_name]
                 raw_tensor = kv_cache_raw_tensors[layer_name]
+                is_glm_sfa = (
+                    getattr(current_platform, "vendor_name", None) == "ascend"
+                    and self.model_config.hf_config.model_type == "glm_moe_dsa"
+                    and kv_cache_spec.__class__.__name__
+                    in {"AscendMLAAttentionSpec", "AscendSFAIndexerCacheSpec"}
+                )
+                if is_glm_sfa:
+                    if not isinstance(raw_tensor, tuple):
+                        raise RuntimeError("GLM5.2 SFA cache must retain its rc1 tuple backing")
+                    if getattr(kv_cache_spec, "cache_sparse_c8", False) or getattr(
+                        kv_cache_spec, "scale_dim", 0
+                    ):
+                        raise NotImplementedError("GLM5.2 SFA C8/DCP cache is not migrated")
+                    if kv_cache_spec.__class__.__name__ == "AscendSFAIndexerCacheSpec":
+                        (raw_k_tensor,) = raw_tensor
+                        indexer_k_cache = raw_k_tensor.view(kv_cache_spec.dtype).view(
+                            attn_backend.get_kv_cache_shape(
+                                raw_k_tensor.numel() // kv_cache_spec.page_size_bytes,
+                                kv_cache_spec.block_size,
+                                kv_cache_spec.num_kv_heads,
+                                kv_cache_spec.head_size,
+                            )
+                        )
+                        kv_caches[layer_name] = (indexer_k_cache,)
+                    else:
+                        raw_k_tensor, raw_v_tensor = raw_tensor
+                        num_blocks = raw_k_tensor.numel() // (
+                            kv_cache_spec.block_size * kv_cache_spec.num_kv_heads
+                            * self.model_config.hf_text_config.kv_lora_rank
+                            * get_dtype_size(kv_cache_spec.dtype)
+                        )
+                        k_cache = raw_k_tensor.view(kv_cache_spec.dtype).view(
+                            num_blocks, kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            self.model_config.hf_text_config.kv_lora_rank,
+                        )
+                        v_cache = raw_v_tensor.view(kv_cache_spec.dtype).view(
+                            num_blocks, kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            self.model_config.hf_text_config.qk_rope_head_dim,
+                        )
+                        kv_caches[layer_name] = (k_cache, v_cache)
+                    continue
+                assert isinstance(raw_tensor, torch.Tensor)
                 packing = layer_packing.get(layer_name)
                 if packing is not None:
                     _, blk_stride = packing
@@ -8216,8 +8400,18 @@ class ModelRunnerFL(GPUModelRunner):
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
+        has_glm_sfa_cache = (
+            getattr(current_platform, "vendor_name", None) == "ascend"
+            and self.model_config.hf_config.model_type == "glm_moe_dsa"
+            and any(
+                spec.__class__.__name__
+                in {"AscendMLAAttentionSpec", "AscendSFAIndexerCacheSpec"}
+                for spec in self._get_layer_kv_cache_specs(kv_cache_config).values()
+            )
+        )
         if (
-            not self.use_compress
+            not has_glm_sfa_cache
+            and not self.use_compress
             and self.use_uniform_kv_cache(self.attn_groups)
         ):  # vllm 0.24.0: cache_dtype arg removed
             kv_caches, cross_layers_kv_cache, attn_backend = (
@@ -8272,7 +8466,14 @@ class ModelRunnerFL(GPUModelRunner):
             num_attn_module = (
                 2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
             )
-            bind_kv_cache(
+            bind_cache = bind_kv_cache
+            if self.use_ascend_sfa:
+                from vllm_fl.dispatch.backends.vendor.ascend.core.kv_cache_binding import (
+                    bind_sfa_kv_cache,
+                )
+
+                bind_cache = bind_sfa_kv_cache
+            bind_cache(
                 kv_caches,
                 self.compilation_config.static_forward_context,
                 self.kv_caches,
@@ -8345,6 +8546,13 @@ class ModelRunnerFL(GPUModelRunner):
 
         # create metadata builders
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+        if getattr(current_platform, "vendor_name", None) == "ascend":
+            # Backend factories may depend on the current VllmConfig context.
+            # Resolve after their metadata builders are initialized, then keep
+            # replay independent of that setup-only context.
+            self.graph_runtime.set_attention_impls(
+                GraphRuntimeController.resolve_attention_impls(self.attn_groups)
+            )
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
@@ -8485,6 +8693,27 @@ class ModelRunnerFL(GPUModelRunner):
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
         for layer_name, attn_module in attn_layers.items():
+            # rc1 models the SFA indexer K cache as an independent cache-only
+            # layer. Preserve that physical allocation and metadata lifetime
+            # instead of letting the generic FullAttentionSpec fold it into
+            # the main MLA cache. The path is unreachable off Ascend.
+            if (
+                getattr(current_platform, "vendor_name", None) == "ascend"
+                and attn_module.__class__.__name__ == "DeepseekV32IndexerCache"
+            ):
+                from vllm_fl.dispatch.backends.vendor.ascend.core.kv_cache_interface import (
+                    AscendSFAIndexerCacheSpec,
+                )
+
+                hf_config = self.model_config.hf_text_config
+                kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
+                    block_size=self.vllm_config.cache_config.block_size,
+                    num_kv_heads=1,
+                    head_size=hf_config.index_head_dim,
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                )
+                continue
             if isinstance(attn_module, Attention) and (
                 kv_tgt_layer := attn_module.kv_sharing_target_layer_name
             ):
@@ -8499,6 +8728,30 @@ class ModelRunnerFL(GPUModelRunner):
                 continue
             # Skip modules that don't need KV cache (eg encoder-only attention)
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                if (
+                    getattr(current_platform, "vendor_name", None) == "ascend"
+                    and isinstance(attn_module, MLAAttention)
+                    and attn_module.impl.__class__.__module__.endswith(
+                        ".attention.sfa_v1"
+                    )
+                ):
+                    from vllm_fl.dispatch.backends.vendor.ascend.core.kv_cache_interface import (
+                        AscendMLAAttentionSpec,
+                    )
+
+                    # GLM5.2 P0 is dense bf16 MLA cache plus the separate
+                    # indexer cache above. C8/FA ModelSlim cache mappings are
+                    # deliberately excluded by the audited checkpoint.
+                    spec = AscendMLAAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=1,
+                        head_size=(
+                            self.model_config.hf_text_config.kv_lora_rank
+                            + self.model_config.hf_text_config.qk_rope_head_dim
+                        ),
+                        dtype=self.kv_cache_dtype,
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    )
                 if isinstance(spec, AttentionSpec):
                     backend = attn_module.get_attn_backend()
                     # indexes_kv_by_block_stride() -> get_kv_cache_stride_order()

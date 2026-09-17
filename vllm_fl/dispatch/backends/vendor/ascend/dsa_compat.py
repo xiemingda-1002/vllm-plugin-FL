@@ -53,6 +53,37 @@ def get_dsv4_compress_ratio(config, layer_idx: int) -> int:
     return compress_ratios[layer_idx]
 
 
+def model_uses_sfa_sparse(model_config) -> bool:
+    """Match rc1's distinction between SFA and compressed DSA models."""
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    return (
+        hf_text_config is not None
+        and hasattr(hf_text_config, "index_topk")
+        and not hasattr(hf_text_config, "compress_ratios")
+        and not hasattr(hf_config, "compress_ratios")
+    )
+
+
+def enable_sfa_dcp_replicated_indexer(vllm_config=None) -> bool:
+    """Use rc1's replicated-indexer path only for SFA decode CP."""
+    if vllm_config is None:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    return (
+        model_uses_sfa_sparse(vllm_config.model_config)
+        and parallel_config.decode_context_parallel_size > 1
+        and parallel_config.prefill_context_parallel_size == 1
+    )
+
+
+def round_up(x: int, align: int) -> int:
+    """Round ``x`` up to the next multiple of ``align`` (rc1 semantics)."""
+    return (x + align - 1) // align * align
+
+
 def extract_dsv4_layer_index(config, prefix: str) -> int:
     from vllm.model_executor.models.utils import extract_layer_index
 

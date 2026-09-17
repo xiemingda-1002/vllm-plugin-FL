@@ -95,18 +95,27 @@ def _dsa_cp_enabled() -> bool:
 
 def _flashcomm2_requested() -> bool:
     """Read rc1's FlashComm2 config precedence for the explicit reject gate."""
-    from vllm.config import get_current_vllm_config
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat import (
+        get_ascend_additional_config,
+    )
 
-    vllm_config = get_current_vllm_config()
-    additional_config = vllm_config.additional_config
-    if additional_config is None:
-        additional_config = {}
+    additional_config = get_ascend_additional_config()
     if "enable_flashcomm2_parallel_size" in additional_config:
         parallel_size = additional_config["enable_flashcomm2_parallel_size"]
     else:
         import os
 
-        parallel_size = int(os.getenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", "0"))
+        raw_parallel_size = os.getenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", "0")
+        try:
+            parallel_size = int(raw_parallel_size)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE must be an integer"
+            ) from exc
+    if isinstance(parallel_size, bool) or not isinstance(parallel_size, int):
+        raise ValueError(
+            "additional_config.enable_flashcomm2_parallel_size must be an integer"
+        )
     return parallel_size > 0
 
 

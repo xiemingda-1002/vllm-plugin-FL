@@ -50,7 +50,7 @@ def _current_vllm_config_or_none():
         return _WORKER_VLLM_CONFIG
 
 
-def _additional_config() -> Mapping[str, object]:
+def get_ascend_additional_config() -> Mapping[str, object]:
     """Read active/worker config, defaulting only without either owner.
 
     rc1 nests the MoE-related settings below ``additional_config``.  Do not
@@ -70,6 +70,13 @@ def _additional_config() -> Mapping[str, object]:
             f"got {type(extra).__name__}"
         )
     return extra
+
+
+# Keep the internal name for the existing MoE compatibility callers.  Other
+# Ascend implementation closures (for example ModelSlim linear) use the
+# public name above so they share the same current-context/worker-owner
+# lifetime semantics rather than reaching into vLLM's context directly.
+_additional_config = get_ascend_additional_config
 
 
 def _nested_config(extra: Mapping[str, object], name: str) -> Mapping[str, object]:
@@ -253,7 +260,27 @@ def get_ascend_config():
             "be enabled together; disabling shared-expert overlap."
         )
 
+    # rc1 gates sparse C8 on non-compressed SFA models. The currently
+    # migrated W8A8 path stores BF16/FP16 KV; reject C8 before selecting
+    # kernels or allocating an incompatible cache.
+    enable_sparse_c8 = False
+    if bool(extra.get("enable_sparse_c8", False)):
+        from ...dsa_compat import model_uses_sfa_sparse
+
+        enable_sparse_c8 = model_uses_sfa_sparse(
+            getattr(vllm_config, "model_config", None)
+        )
+    if enable_sparse_c8:
+        raise NotImplementedError("FL Ascend SFA sparse-C8 cache is not migrated")
+
+    def is_sparse_c8_layer(layer_name):
+        # Matches rc1's first branch when sparse C8 is disabled.
+        return enable_sparse_c8
+
     return SimpleNamespace(
+        enable_sparse_c8=enable_sparse_c8,
+        c8_enable_reshape_optim=False,
+        is_sparse_c8_layer=is_sparse_c8_layer,
         enable_fused_mc2=enable_fused_mc2,
         enable_shared_expert_dp=enable_shared_expert_dp,
         multistream_overlap_shared_expert=multistream_overlap_shared_expert,

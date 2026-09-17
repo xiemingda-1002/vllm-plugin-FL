@@ -16,6 +16,7 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
+#include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
@@ -701,6 +702,56 @@ at::Tensor npu_hc_pre_inv_rms(const at::Tensor& x, double) {
   return at::empty_symint(shape, x.options().dtype(at::kFloat));
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+npu_sparse_flash_attention(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& sparse_indices, double scale_value,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
+    const c10::optional<at::Tensor>& query_rope,
+    const c10::optional<at::Tensor>& key_rope, int64_t sparse_block_size,
+    c10::string_view layout_query, c10::string_view layout_kv,
+    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens,
+    int64_t attention_mode, bool return_softmax_lse) {
+  constexpr int64_t kTndDims = 3;
+  constexpr int64_t kBsndDims = 4;
+  const std::string layout_query_str(layout_query);
+  TORCH_CHECK(layout_query_str == "BSND" || layout_query_str == "TND",
+              "The layout of query only support BSND and TND, but got ",
+              layout_query_str);
+  c10::SymDimVector output_size;
+  if (layout_query_str == "TND") {
+    TORCH_CHECK(query.dim() == kTndDims,
+                "When the layout of query is TND, the query dimension must be 3, but got ",
+                query.dim());
+    output_size = {query.sym_size(0), query.sym_size(1), query.sym_size(2)};
+  } else {
+    TORCH_CHECK(query.dim() == kBsndDims,
+                "When the layout of query is BSND, the query dimension must be 4, but got ",
+                query.dim());
+    output_size = {query.sym_size(0), query.sym_size(1), query.sym_size(2),
+                   query.sym_size(3)};
+  }
+  auto output = at::empty_symint(output_size, query.options());
+  c10::SymDimVector softmax_size = {c10::SymInt(0)};
+  if (return_softmax_lse) {
+    if (query.dim() == kTndDims) {
+      const auto kv_heads = std::string(layout_kv) == "PA_BSND"
+          ? key.sym_size(2) : key.sym_size(1);
+      softmax_size = {kv_heads, query.sym_size(0), query.sym_size(1) / kv_heads};
+    } else {
+      softmax_size = {query.sym_size(0), key.sym_size(2), query.sym_size(1),
+                      query.sym_size(2) / key.sym_size(2)};
+    }
+  }
+  auto softmax_max = at::empty_symint(
+      softmax_size, query.options().dtype(at::kFloat));
+  auto softmax_sum = at::empty_symint(
+      softmax_size, query.options().dtype(at::kFloat));
+  return {output, softmax_max, softmax_sum};
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_sinkhorn(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor& x, int64_t hc_mult, int64_t, double) {
@@ -1128,6 +1179,17 @@ TORCH_LIBRARY(_C_ascend, ops) {
   ops.def("compressor(Tensor x, Tensor wkv, Tensor wgate, Tensor(a!) state_cache, Tensor ape, Tensor norm_weight, Tensor rope_sin, Tensor rope_cos, Tensor? state_block_table, Tensor? cu_seqlens, Tensor? seqused, Tensor? start_pos, int rope_head_dim, int cmp_ratio, int coff, float norm_eps, int rotary_mode, int cache_mode) -> Tensor");
   ops.def("compressor_metadata(Tensor rope_cos, Tensor rope_sin, Tensor cu_seqlens, Tensor start_pos, Tensor kv_block_table, int kv_block_size, int slot_mapping_format, int compress_ratio, int num_compressed_tokens, int num_reqs_actual) -> (Tensor, Tensor, Tensor)");
   ops.def("npu_vllm_quant_lightning_indexer(Tensor query, Tensor key, Tensor weights, Tensor query_dequant_scale, Tensor key_dequant_scale, int query_quant_mode=0, int key_quant_mode=0, Tensor? actual_seq_lengths_query=None, Tensor? actual_seq_lengths_key=None, Tensor? block_table=None, Tensor? metadata=None, str layout_query=\"BSND\", str layout_key=\"BSND\", int sparse_count=2048, int sparse_mode=3, int pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, int cmp_ratio=1, bool return_value=False) -> (Tensor sparse_indices, Tensor sparse_values)");
+  ops.def(
+      "npu_sparse_flash_attention(Tensor query, Tensor key, Tensor value, "
+      "Tensor sparse_indices, float scale_value, *, "
+      "Tensor? block_table=None, Tensor? actual_seq_lengths_query=None, "
+      "Tensor? actual_seq_lengths_kv=None, Tensor? query_rope=None, "
+      "Tensor? key_rope=None, int sparse_block_size=1, "
+      "str layout_query='BSND', str layout_kv='BSND', "
+      "int sparse_mode=3, int pre_tokens=9223372036854775807, "
+      "int next_tokens=9223372036854775807, int attention_mode=2, "
+      "bool return_softmax_lse=False) -> "
+      "(Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)");
   ops.def("npu_sparse_attn_sharedkv(Tensor q, *, Tensor? ori_kv=None, Tensor? cmp_kv=None, Tensor? ori_sparse_indices=None, Tensor? cmp_sparse_indices=None, Tensor? ori_block_table=None, Tensor? cmp_block_table=None, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, Tensor? sinks=None, Tensor? metadata=None, float softmax_scale=0, int cmp_ratio=0, int ori_mask_mode=4, int cmp_mask_mode=3, int ori_win_left=128, int ori_win_right=0, str layout_q=\"BSND\", str layout_kv=\"PA_ND\", bool return_softmax_lse=False) -> (Tensor out, Tensor softmax_lse)");
   ops.def("npu_sparse_attn_sharedkv_metadata(int num_heads_q, int num_heads_kv, int head_dim, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, int batch_size=0, int max_seqlen_q=0, int max_seqlen_kv=0, int ori_topk=0, int cmp_topk=0, int cmp_ratio=4, int ori_mask_mode=4, int cmp_mask_mode=3, int ori_win_left=128, int ori_win_right=0, str layout_q=\"BSND\", str layout_kv=\"PA_ND\", bool has_ori_kv=True, bool has_cmp_kv=True, str device=\"npu\") -> Tensor");
   ops.def("npu_vllm_quant_lightning_indexer_metadata(int num_heads_q, int num_heads_k, int head_dim, int query_quant_mode, int key_quant_mode, Tensor? actual_seq_lengths_query=None, Tensor? actual_seq_lengths_key=None, int batch_size=0, int max_seqlen_q=0, int max_seqlen_k=0, str layout_query=\"BSND\", str layout_key=\"BSND\", int sparse_count=2048, int sparse_mode=3, int pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, int cmp_ratio=1, str device=\"npu\") -> Tensor");
@@ -1160,6 +1222,8 @@ TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, ops) {
   ops.impl("compressor", &vllm_fl_native::compressor);
   ops.impl("compressor_metadata", &vllm_fl_native::compressor_metadata);
   ops.impl("npu_vllm_quant_lightning_indexer", &vllm_fl_native::lightning_indexer);
+  ops.impl("npu_sparse_flash_attention",
+           &vllm_ascend::npu_sparse_flash_attention);
   ops.impl("npu_sparse_attn_sharedkv", &vllm_fl_native::dsa_sparse_attn);
   ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_fl_native::sparse_attn_metadata);
   ops.impl("npu_vllm_quant_lightning_indexer_metadata", &vllm_fl_native::lightning_indexer_metadata);
@@ -1194,6 +1258,8 @@ TORCH_LIBRARY_IMPL(_C_ascend, Meta, ops) {
   ops.impl("compressor", &vllm_fl_native::meta::compressor);
   ops.impl("compressor_metadata", &vllm_fl_native::meta::compressor_metadata);
   ops.impl("npu_vllm_quant_lightning_indexer", &vllm_fl_native::meta::lightning_indexer);
+  ops.impl("npu_sparse_flash_attention",
+           &vllm_fl_native::meta::npu_sparse_flash_attention);
   ops.impl("npu_sparse_attn_sharedkv", &vllm_fl_native::meta::dsa_sparse_attn);
   ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_fl_native::meta::sparse_attn_metadata);
   ops.impl("npu_vllm_quant_lightning_indexer_metadata", &vllm_fl_native::meta::lightning_indexer_metadata);

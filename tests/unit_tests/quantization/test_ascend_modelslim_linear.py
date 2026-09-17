@@ -31,6 +31,7 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
         "vllm_fl.dispatch.backends.vendor",
         "vllm_fl.dispatch.backends.vendor.ascend",
         "vllm_fl.dispatch.backends.vendor.ascend.impl",
+        "vllm_fl.dispatch.backends.vendor.ascend.impl.moe",
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization",
         "vllm",
         "vllm.model_executor",
@@ -45,6 +46,10 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
     config = types.ModuleType("vllm.config")
     config.get_current_vllm_config = lambda: current
     monkeypatch.setitem(sys.modules, "vllm.config", config)
+
+    logger = types.ModuleType("vllm.logger")
+    logger.init_logger = lambda _name: types.SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "vllm.logger", logger)
 
     distributed = types.ModuleType("vllm.distributed")
     distributed.get_tensor_model_parallel_rank = lambda: 1
@@ -100,6 +105,20 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
         )
     )
     monkeypatch.setitem(sys.modules, dsa_compat.__name__, dsa_compat)
+
+    flashcomm = types.ModuleType("vllm_fl.ascend_flashcomm")
+    flashcomm.enable_flashcomm1 = lambda *_args, **_kwargs: False
+    flashcomm.shared_expert_dp_enabled_for_config = lambda *_args, **_kwargs: False
+    monkeypatch.setitem(sys.modules, flashcomm.__name__, flashcomm)
+
+    compat_spec = importlib.util.spec_from_file_location(
+        "vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat",
+        ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/compat.py",
+    )
+    assert compat_spec is not None and compat_spec.loader is not None
+    compat_module = importlib.util.module_from_spec(compat_spec)
+    monkeypatch.setitem(sys.modules, compat_module.__name__, compat_module)
+    compat_spec.loader.exec_module(compat_module)
 
     utils_spec = importlib.util.spec_from_file_location(
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.linear_utils",
@@ -214,6 +233,68 @@ def test_flashcomm2_and_unknown_scheme_fail_explicitly(linear_module):
         method.apply(RowLayer(), torch.empty(1, 1))
     with pytest.raises(NotImplementedError, match="W8A8_DYNAMIC"):
         module.create_linear_scheme("W4A8")
+
+
+def test_flashcomm2_config_lifecycle_and_precedence(linear_module, monkeypatch):
+    module, _, current, row_parallel, _ = linear_module
+    compat = sys.modules[
+        "vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat"
+    ]
+    worker = types.SimpleNamespace(additional_config={})
+    active = types.SimpleNamespace(
+        additional_config={"enable_flashcomm2_parallel_size": 0}
+    )
+    state = {"config": active}
+    monkeypatch.setattr(
+        sys.modules["vllm.config"],
+        "get_current_vllm_config",
+        lambda: state["config"],
+    )
+    monkeypatch.setenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", "2")
+
+    class RowLayer(row_parallel):
+        prefix = "model.layers.0.self_attn.o_proj"
+
+    try:
+        compat.init_ascend_config(worker)
+        # A live context is authoritative even when the worker/env request it.
+        assert module._flashcomm2_requested() is False
+
+        # Warmup after context exit uses the worker owner, then the environment.
+        state["config"] = None
+        monkeypatch.setattr(
+            sys.modules["vllm.config"],
+            "get_current_vllm_config",
+            lambda: (_ for _ in ()).throw(AssertionError("no current config")),
+        )
+        assert module._flashcomm2_requested() is True
+        with pytest.raises(NotImplementedError, match="FlashComm2"):
+            module.AscendLinearMethod(module.create_linear_scheme("W8A8")).apply(
+                RowLayer(), torch.empty(1, 1)
+            )
+
+        compat.clear_ascend_config()
+        assert module._flashcomm2_requested() is True
+    finally:
+        compat.clear_ascend_config()
+
+
+@pytest.mark.parametrize(
+    "additional_config, environment, message",
+    [
+        ({"enable_flashcomm2_parallel_size": "2"}, None, "must be an integer"),
+        ({}, "not-an-int", "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE must be an integer"),
+    ],
+)
+def test_flashcomm2_rejects_malformed_values(
+    linear_module, monkeypatch, additional_config, environment, message
+):
+    module, _, current, _, _ = linear_module
+    current.additional_config = additional_config
+    if environment is not None:
+        monkeypatch.setenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", environment)
+    with pytest.raises(ValueError, match=message):
+        module._flashcomm2_requested()
 
 
 def test_static_apply_uses_quant_bias_only_on_tp_rank_zero(

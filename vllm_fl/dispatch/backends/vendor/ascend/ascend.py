@@ -157,7 +157,10 @@ class AscendBackend(Backend):
             )
         if use_mla:
             if use_sparse:
-                raise NotImplementedError("MLA with sparse attention is not implemented for Ascend yet.")
+                return (
+                    "vllm_fl.dispatch.backends.vendor.ascend.attention.sfa_v1."
+                    "AscendSFABackend"
+                )
             return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendMLABackend"
         return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendAttentionBackend"
 

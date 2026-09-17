@@ -87,10 +87,21 @@ def test_npu_dsa_policy_skips_attention_task_lifecycle(monkeypatch) -> None:
     monkeypatch.setattr(attention.AscendAttentionBackendImpl, "update_graph_params",
                         lambda *args: calls.append("update"))
     runtime = GraphRuntimeController(
-        device_type="npu", vllm_config=object(), update_attention_tasks=False,
-        platform=SimpleNamespace(device_type="npu", torch_device_fn=SimpleNamespace(
-            current_stream=lambda: SimpleNamespace(synchronize=lambda: calls.append("sync")))))
-    context = SimpleNamespace(capturing=False, batch_descriptor=SimpleNamespace(num_tokens=2))
+        device_type="npu",
+        vllm_config=object(),
+        update_attention_tasks=False,
+        platform=SimpleNamespace(
+            device_type="npu",
+            torch_device_fn=SimpleNamespace(
+                current_stream=lambda: SimpleNamespace(
+                    synchronize=lambda: calls.append("sync")
+                )
+            ),
+        ),
+    )
+    context = SimpleNamespace(
+        capturing=False, batch_descriptor=SimpleNamespace(num_tokens=2)
+    )
 
     with runtime.capture_scope(context):
         assert context.capturing is True
@@ -120,8 +131,7 @@ def test_graph_params_are_per_shape_and_fail_closed_on_duplicate_capture() -> No
     assert get_graph_params().attn_params == {}
 
 
-def test_npu_replay_enqueues_graph_before_updating_attention_tasks(monkeypatch) -> None:
-    import vllm_fl.dispatch.backends.vendor.ascend.impl.attention as attention
+def test_npu_replay_enqueues_graph_before_updating_attention_tasks() -> None:
     from vllm_fl.compilation.graph_params import clear_graph_params
     from vllm_fl.compilation.graph_runtime import GraphRuntimeController
 
@@ -139,16 +149,19 @@ def test_npu_replay_enqueues_graph_before_updating_attention_tasks(monkeypatch) 
             Stream=lambda: calls.append("create-update-stream") or update_stream,
         ),
     )
-    monkeypatch.setattr(
-        attention.AscendAttentionBackendImpl,
-        "update_graph_params",
-        lambda stream, context, size, passed_config: calls.append(
-            ("update", stream, context, size, passed_config)
-        ),
-    )
+    class FakeImpl:
+        @staticmethod
+        def update_graph_params(stream, context, size, passed_config):
+            calls.append(
+                ("update", stream, context, size, passed_config)
+            )
+
     runtime = GraphRuntimeController(
-        device_type="npu", platform=platform, vllm_config=config
+        device_type="npu",
+        platform=platform,
+        vllm_config=config,
     )
+    runtime.set_attention_impls((FakeImpl,))
     context = SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=1))
 
     with runtime.replay_scope(context):
@@ -165,6 +178,155 @@ def test_npu_replay_enqueues_graph_before_updating_attention_tasks(monkeypatch) 
         "graph-replay",
         ("update", update_stream, context, 1, config),
     ]
+
+
+def test_npu_replay_dispatches_sfa_noop_through_active_backend() -> None:
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    calls: list[object] = []
+
+    class FakeSFAImpl:
+        @staticmethod
+        def update_graph_params(stream, context, size, passed_config):
+            calls.append(("sfa-update", stream, context, size, passed_config))
+
+    update_stream = object()
+    config = object()
+    runtime = GraphRuntimeController(
+        device_type="npu",
+        vllm_config=config,
+        platform=SimpleNamespace(
+            device_type="npu",
+            torch_device_fn=SimpleNamespace(
+                current_stream=lambda: SimpleNamespace(
+                    synchronize=lambda: calls.append("sync")
+                ),
+                Stream=lambda: update_stream,
+            ),
+        ),
+    )
+    runtime.set_attention_impls((FakeSFAImpl,))
+    context = SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=1))
+
+    with runtime.replay_scope(context):
+        calls.append("graph-replay")
+
+    assert calls == [
+        "sync",
+        "graph-replay",
+        ("sfa-update", update_stream, context, 1, config),
+    ]
+
+
+def test_npu_replay_accepts_cache_only_backend_set() -> None:
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    runtime = GraphRuntimeController(
+        device_type="npu",
+        vllm_config=object(),
+        platform=SimpleNamespace(
+            device_type="npu",
+            torch_device_fn=SimpleNamespace(
+                current_stream=lambda: SimpleNamespace(synchronize=lambda: None),
+                Stream=object,
+            ),
+        ),
+    )
+    runtime.set_attention_impls(())
+    context = SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=1))
+
+    with runtime.replay_scope(context):
+        pass
+    assert runtime._update_stream is None
+
+
+def test_attention_impl_resolver_skips_cache_only_and_deduplicates() -> None:
+    from vllm.v1.attention.backend import AttentionBackend
+
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    class CacheOnlyBackend(AttentionBackend):
+        pass
+
+    class ActiveImpl:
+        update_graph_params = staticmethod(lambda *args: None)
+
+    class ActiveBackend(AttentionBackend):
+        get_impl_cls = staticmethod(lambda: ActiveImpl)
+
+    attn_groups = [
+        [SimpleNamespace(backend=CacheOnlyBackend)],
+        [
+            SimpleNamespace(backend=ActiveBackend),
+            SimpleNamespace(backend=ActiveBackend),
+        ],
+    ]
+
+    assert GraphRuntimeController.resolve_attention_impls(attn_groups) == (
+        ActiveImpl,
+    )
+
+
+def test_attention_impl_resolver_accepts_no_concrete_backend() -> None:
+    from vllm.v1.attention.backend import AttentionBackend
+
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    class CacheOnlyBackend(AttentionBackend):
+        pass
+
+    attn_groups = [[SimpleNamespace(backend=CacheOnlyBackend)]]
+
+    assert GraphRuntimeController.resolve_attention_impls(attn_groups) == ()
+
+
+def test_attention_impl_resolver_preserves_unique_impl_order() -> None:
+    from vllm.v1.attention.backend import AttentionBackend
+
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    class FirstImpl:
+        update_graph_params = staticmethod(lambda *args: None)
+
+    class SecondImpl:
+        update_graph_params = staticmethod(lambda *args: None)
+
+    class FirstBackend(AttentionBackend):
+        get_impl_cls = staticmethod(lambda: FirstImpl)
+
+    class FirstAliasBackend(AttentionBackend):
+        get_impl_cls = staticmethod(lambda: FirstImpl)
+
+    class SecondBackend(AttentionBackend):
+        get_impl_cls = staticmethod(lambda: SecondImpl)
+
+    attn_groups = [[
+        SimpleNamespace(backend=FirstBackend),
+        SimpleNamespace(backend=SecondBackend),
+        SimpleNamespace(backend=FirstAliasBackend),
+    ]]
+
+    assert GraphRuntimeController.resolve_attention_impls(attn_groups) == (
+        FirstImpl,
+        SecondImpl,
+    )
+
+
+def test_attention_impl_resolver_fails_closed_for_invalid_concrete_impl() -> None:
+    from vllm.v1.attention.backend import AttentionBackend
+
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    class InvalidImpl:
+        pass
+
+    class InvalidBackend(AttentionBackend):
+        get_impl_cls = staticmethod(lambda: InvalidImpl)
+
+    attn_groups = [[SimpleNamespace(backend=InvalidBackend)]]
+
+    with pytest.raises(RuntimeError, match="InvalidBackend -> InvalidImpl"):
+        GraphRuntimeController.resolve_attention_impls(attn_groups)
 
 
 def test_npu_replay_requires_runner_config() -> None:

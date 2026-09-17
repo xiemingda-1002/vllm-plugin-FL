@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 
 def _assert_vllm_ascend_not_imported() -> None:
@@ -16,7 +17,23 @@ def _assert_vllm_ascend_not_imported() -> None:
     assert imported == []
 
 
-def test_model_runner_uses_vllm_024_gpu_runner_contract() -> None:
+def test_model_runner_uses_vllm_024_gpu_runner_contract(monkeypatch) -> None:
+    # This import contract is platform-independent, but model_runner imports
+    # FL's graph module whose class body requires a recognized device. Do not
+    # depend on another test having initialized a global platform first.
+    import vllm.platforms
+
+    class ImportContractPlatform(vllm.platforms.Platform):
+        _enum = vllm.platforms.PlatformEnum.OOT
+        device_name = "test"
+        device_type = "txda"
+        torch_device_fn = SimpleNamespace(Stream=object)
+
+    monkeypatch.setattr(
+        vllm.platforms,
+        "current_platform",
+        ImportContractPlatform(),
+    )
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm_fl.worker.model_runner import ModelRunnerFL
 
@@ -47,6 +64,7 @@ def test_model_runner_prewarms_only_vllm_compile_before_stock_compile() -> None:
 def test_fl_registration_uses_upstream_glm_without_legacy_bridge(
     monkeypatch,
 ) -> None:
+    import vllm.platforms
     import vllm_fl
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from vllm.model_executor.models.deepseek_v2 import GlmMoeDsaForCausalLM
@@ -60,6 +78,7 @@ def test_fl_registration_uses_upstream_glm_without_legacy_bridge(
 
     monkeypatch.setattr(legacy_glm, "apply_platform_patches", fail_if_called)
     monkeypatch.setattr(vllm_fl, "_patch_custom_ops", lambda: None)
+    monkeypatch.setattr(vllm_fl, "_patch_ascend_torch_accelerator", lambda: None)
     monkeypatch.setattr(vllm_fl, "_patch_flash_attn_import", lambda: None)
     monkeypatch.setattr(vllm_fl, "_patch_transformers_compat", lambda: None)
     monkeypatch.setattr(vllm_fl, "_get_op_config", lambda: None)
@@ -69,6 +88,11 @@ def test_fl_registration_uses_upstream_glm_without_legacy_bridge(
     monkeypatch.setattr(vllm_fl, "_register_gdn_packed_decode_patch", lambda: False)
     monkeypatch.setattr(moe_sum, "patch_vllm_moe_sum", lambda: None)
     monkeypatch.setattr(qwen3_5_text, "apply_qwen3_5_text_patches", lambda: None)
+    monkeypatch.setattr(
+        vllm.platforms,
+        "current_platform",
+        SimpleNamespace(vendor_name="ascend", device_type="npu"),
+    )
     legacy_config = _CONFIG_REGISTRY.get("glm_moe_dsa")
 
     assert vllm_fl.register() == "vllm_fl.platform.PlatformFL"
@@ -78,6 +102,11 @@ def test_fl_registration_uses_upstream_glm_without_legacy_bridge(
     assert isinstance(GlmMoeDsaForCausalLM, type)
     assert CONFIG_MAPPING["glm_moe_dsa"].__name__ == "GlmMoeDsaConfig"
     assert _CONFIG_REGISTRY.get("glm_moe_dsa") is legacy_config
+    native_glm_config = CONFIG_MAPPING["glm_moe_dsa"](
+        rope_parameters={"rope_type": "deepseek_yarn", "factor": 40}
+    )
+    assert native_glm_config.rope_parameters["rope_type"] == "deepseek_yarn"
+    assert native_glm_config.rope_parameters["factor"] == 40
     assert not getattr(legacy_glm, "_fl_patched", False)
     _assert_vllm_ascend_not_imported()
 

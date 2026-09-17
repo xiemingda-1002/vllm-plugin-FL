@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the current vLLM-Ascend 0.24.0rc1 native closure (Qwen plus
-# DeepSeek V4 DSA).  Catlass remains an external build-only dependency for
+# DeepSeek V4 DSA and GLM SFA). Catlass remains an external build-only dependency for
 # the pre-existing Qwen operators; no Catlass source is vendored into FL.
 
 set -euo pipefail
@@ -49,6 +49,7 @@ ops=(
   hc_pre_sinkhorn
   sparse_attn_sharedkv
   sparse_attn_sharedkv_metadata
+  sparse_flash_attention
   compressor
   compressor_metadata
   vllm_quant_lightning_indexer

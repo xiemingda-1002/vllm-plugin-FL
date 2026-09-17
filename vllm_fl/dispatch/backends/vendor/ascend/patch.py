@@ -22,12 +22,27 @@ def apply_ascend_patches():
     from .impl.linearnorm import split_qkv_rmsnorm_mrope  # noqa: F401
     from .impl.moe_custom_ops import ensure_ascend_moe_custom_ops_registered
     from .ops.dsa import ensure_dsa_forward_registered
+    from .patches.patch_glm52 import apply_glm52_shared_indexer_patch
+    from .patches.patch_glm52_weight_loader import (
+        apply_glm52_weight_loader_patch,
+    )
+    from .patches.patch_mla_prefill_backend import (
+        apply_ascend_mla_prefill_backend_patch,
+    )
     from vllm_fl.patches.deepseek_v4 import apply_deepseek_v4_patches
 
     ensure_graph_fusion_ops_registered()
     ensure_ascend_moe_custom_ops_registered()
     ensure_dsa_forward_registered()
     apply_deepseek_v4_patches()
+    # MLAAttention constructs this auxiliary object while loading every MLA
+    # model. Install the Ascend boundary before any model constructor runs.
+    apply_ascend_mla_prefill_backend_patch()
+    # GLM W8A8 checkpoints may carry an MTP-only rot.weight even when the
+    # target model runs without speculative decoding. Skip exactly that
+    # tensor before vLLM attempts target-model module resolution.
+    apply_glm52_weight_loader_patch()
+    apply_glm52_shared_indexer_patch()
     apply_deepseek_v4_kv_cache_patches()
     register_flashcomm_ops_and_layers()
 
@@ -160,12 +175,17 @@ def patch_op_cls():
         ensure_ascend_rms_norm_gated_registered,
     )
     from .impl.mm_encoder_attention import AscendMMEncoderAttention
+    from .ops.mla import (
+        AscendMultiHeadLatentAttention,
+        ensure_mla_forward_registered,
+    )
     from .impl.vocab_parallel_embedding import (
         AscendParallelLMHead,
         AscendVocabParallelEmbedding,
     )
 
     ensure_ascend_rms_norm_gated_registered()
+    ensure_mla_forward_registered()
 
     for name, op_cls in {
         "MMEncoderAttention": AscendMMEncoderAttention,
@@ -178,10 +198,13 @@ def patch_op_cls():
     for name, layer_cls in {
         "VocabParallelEmbedding": AscendVocabParallelEmbedding,
         "ParallelLMHead": AscendParallelLMHead,
+        # SFA uses the rc1 boundary; dense MLA delegates to its existing
+        # upstream wrapper. DeepSeek-V4 DSA has a separate execution chain.
+        "MultiHeadLatentAttentionWrapper": AscendMultiHeadLatentAttention,
     }.items():
         PluggableLayer.register_oot(_decorated_layer_cls=layer_cls, name=name)
     _op_classes_patched = True
-    logger.info("Registered required Ascend Qwen custom ops")
+    logger.info("Registered Ascend custom ops and pluggable layers")
 
 def refresh_block_size(vllm_config, block_size=128):
     """

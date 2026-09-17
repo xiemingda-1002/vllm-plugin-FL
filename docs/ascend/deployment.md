@@ -6,8 +6,47 @@
 
 选择分别匹配 A2/A3 的基础镜像。若默认 `ENTRYPOINT` 是 `vllm serve`，创建 shell 时显式使用
 `--entrypoint /bin/bash --workdir /run`。镜像可能将默认工作目录设为原生源码；即使卸载 wheel，
-源码仍可能被导入。因此自检和服务均在中立目录执行，并清除继承的 `PYTHONPATH`。启动前核对真实
-设备映射和 driver/firmware 挂载，不得假设不同机器有相同卡号或布局。
+源码仍可能被导入。因此自检和服务均在中立目录执行，并从继承的 `PYTHONPATH` 中移除源码仓路径，
+但保留镜像提供的 CANN SDK Python/OPP 路径；完全清空可能导致 worker 无法导入 `acl`。启动前核对
+真实设备映射和 driver/firmware 挂载，不得假设不同机器有相同卡号、布局或工具安装路径。
+
+## 容器启动与 NPU 工具门禁
+
+容器命令以对应模型、对应 vLLM-Ascend 版本的官方教程为基础。官方示例通常同时挂载
+Davinci 设备、`davinci_manager`、`devmm_svm`、`hisi_hdc`、DCMI、`hccn_tool`、driver
+动态库和版本信息以及 `npu-smi`。实际执行前逐项核对宿主路径：例如有的教程使用
+`/usr/local/bin/npu-smi`，而某些宿主实际安装在 `/usr/local/sbin/npu-smi`；应挂载真实文件，
+不能仅依赖 `--privileged`。
+
+以宿主实际路径 `/usr/local/sbin/npu-smi` 为例，容器参数至少包含：
+
+```bash
+--privileged --network host --ipc host \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi:ro \
+-v /usr/local/dcmi:/usr/local/dcmi:ro \
+-v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool:ro \
+-v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
+-v /etc/ascend_install.info:/etc/ascend_install.info:ro
+```
+
+还需按目标卡集合逐个增加 `--device /dev/davinci<N>`。若宿主某个官方示例路径不存在，先定位
+等价的实际安装路径并记录差异，不能把不存在的路径静默省略。模型启动前执行硬门禁：
+
+```bash
+command -v npu-smi
+npu-smi info
+test -e /dev/davinci_manager
+test -e /dev/devmm_svm
+test -e /dev/hisi_hdc
+```
+
+任一命令失败就停止启动并修正容器挂载。Run 证据应保存完整 `docker run` 命令、
+`docker inspect`、容器内门禁输出及设备映射。只有宿主执行 `npu-smi` 不足以通过该门禁；
+否则运行时 CPU binding、拓扑探测等逻辑可能退化或被跳过。
 
 基础镜像可能预装 `vllm-ascend`。安装 FL wheel 前先移除运行时插件，保留 CANN、torch、
 torch-npu 与 vLLM：
@@ -15,7 +54,8 @@ torch-npu 与 vLLM：
 ```bash
 mkdir -p /run/fl-validation
 cd /run/fl-validation
-unset PYTHONPATH
+# 仅保留基础镜像中已核对的 /usr/local/Ascend CANN SDK 路径，不能加入源码仓路径或空项。
+export PYTHONPATH=<CANN_SDK_PYTHON_AND_OPP_PATHS>
 python -m pip uninstall -y vllm-ascend
 python -c "import importlib.util; assert importlib.util.find_spec('vllm_ascend') is None"
 ```
@@ -53,7 +93,8 @@ VLLM_VENDOR=ascend pip install --no-build-isolation .
 
 ```bash
 cd /run/fl-validation
-unset PYTHONPATH
+# 与容器创建阶段相同：只保留已核对的 CANN SDK Python/OPP 路径。
+export PYTHONPATH=<CANN_SDK_PYTHON_AND_OPP_PATHS>
 python -c "import vllm_fl; print(vllm_fl.__file__)"
 python -m pip show -f vllm-plugin-FL
 python -c "from vllm_fl.ascend_custom_ops import enable_custom_op; print(enable_custom_op())"

@@ -20,6 +20,80 @@ from vllm.triton_utils import tl, triton
 from .triton_utils import get_vectorcore_num
 
 
+# MLA/SFA RoPE buffers mirror the lifecycle in vLLM-Ascend 0.24.0rc1:
+# rotary construction records the immutable lookup cache once, while the
+# model runner owns graph-stable staging buffers on its configured device.
+_cos_mla: torch.Tensor | None = None
+_sin_mla: torch.Tensor | None = None
+_cos_cache: torch.Tensor | None = None
+_sin_cache: torch.Tensor | None = None
+
+
+def set_cos_and_sin(
+    vllm_config,
+    max_num_reqs: int,
+    decode_token_per_req: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    del max_num_reqs, decode_token_per_req
+    global _cos_mla, _sin_mla
+    if _cos_mla is not None or _sin_mla is not None:
+        return
+    if not vllm_config.model_config.use_mla:
+        return
+    rope_dim = vllm_config.model_config.hf_text_config.qk_rope_head_dim
+    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    _cos_mla = torch.ones(
+        max_tokens, 1, 1, rope_dim, dtype=dtype, device=device
+    )
+    _sin_mla = torch.zeros(
+        max_tokens, 1, 1, rope_dim, dtype=dtype, device=device
+    )
+
+
+def record_cos_and_sin_cache_interleaved(
+    cos_sin_cache: torch.Tensor,
+) -> None:
+    global _cos_cache, _sin_cache
+    if _cos_cache is not None or _sin_cache is not None:
+        return
+    hidden_dim = cos_sin_cache.shape[-1] // 2
+    cos_cache, sin_cache = (
+        cos_sin_cache.view(-1, 2, hidden_dim)
+        .repeat(1, 1, 2)
+        .chunk(2, dim=1)
+    )
+    _cos_cache = cos_cache.squeeze(1)
+    _sin_cache = sin_cache.squeeze(1)
+
+
+def get_cos_and_sin_mla(
+    positions: torch.Tensor, use_cache: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _cos_cache is None or _sin_cache is None:
+        raise RuntimeError("Ascend MLA/SFA RoPE cache was not initialized")
+    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
+    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
+    if not use_cache:
+        return cos, sin
+    if _cos_mla is None or _sin_mla is None:
+        raise RuntimeError("Ascend MLA/SFA RoPE staging buffers were not initialized")
+    if (
+        _cos_mla.device != cos.device
+        or _cos_mla.dtype != cos.dtype
+        or _cos_mla.shape[-1] != cos.shape[-1]
+    ):
+        raise RuntimeError(
+            "Ascend MLA/SFA RoPE cache and runner staging buffers disagree "
+            "on device, dtype, or rotary dimension"
+        )
+    num_tokens = positions.size(0)
+    _cos_mla[:num_tokens].copy_(cos)
+    _sin_mla[:num_tokens].copy_(sin)
+    return _cos_mla[:num_tokens], _sin_mla[:num_tokens]
+
+
 @triton.jit
 def _triton_rope(
     q_ptr,

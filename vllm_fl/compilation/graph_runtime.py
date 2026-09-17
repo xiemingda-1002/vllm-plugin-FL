@@ -87,6 +87,7 @@ class GraphRuntimeController:
         self._breakable_graph_wrapper_type = breakable_graph_wrapper_type
         self._ubatch_wrapper_type = ubatch_wrapper_type
         self._update_attention_tasks = update_attention_tasks
+        self._attention_impls: tuple[type[Any], ...] | None = None
         self.phase = GraphPhase.IDLE
         self._update_stream: Any | None = None
 
@@ -205,18 +206,92 @@ class GraphRuntimeController:
                     "Ascend full-graph replay requires GraphRuntimeController "
                     "to own the active VllmConfig"
                 )
-            if self._update_stream is None:
-                self._update_stream = self.platform.torch_device_fn.Stream()
+            attention_impls = self._resolve_attention_impls()
+            if attention_impls:
+                if self._update_stream is None:
+                    self._update_stream = self.platform.torch_device_fn.Stream()
+                for attention_impl in attention_impls:
+                    attention_impl.update_graph_params(
+                        self._update_stream,
+                        forward_context,
+                        self._num_tokens(forward_context),
+                        self._vllm_config,
+                    )
+
+    def _resolve_attention_impls(self) -> tuple[type[Any], ...]:
+        """Resolve implementations owned by the active attention backends.
+
+        vLLM-Ascend dispatches replay-time graph parameter updates through the
+        selected backend.  This matters for backends such as SFA and DSA,
+        whose captured graph does not require the regular PA/FIA task update.
+        Keep a regular-attention fallback for standalone controller users that
+        predate backend injection; the FL model runner always injects the
+        active backend resolver.
+        """
+        if self._attention_impls is None:
             from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import (
                 AscendAttentionBackendImpl,
             )
 
-            AscendAttentionBackendImpl.update_graph_params(
-                self._update_stream,
-                forward_context,
-                self._num_tokens(forward_context),
-                self._vllm_config,
-            )
+            return (AscendAttentionBackendImpl,)
+
+        return self._attention_impls
+
+    def set_attention_impls(self, implementations: tuple[type[Any], ...]) -> None:
+        """Freeze attention graph updaters resolved during runner setup.
+
+        Backend factories may consult ``get_current_vllm_config()``, whose
+        context is intentionally unavailable during normal replay. Resolve
+        them after attention metadata initialization and retain only the
+        immutable implementation tuple for the hot replay path.
+        """
+        self._attention_impls = implementations
+
+    @staticmethod
+    def resolve_attention_impls(attn_groups: Any) -> tuple[type[Any], ...]:
+        """Resolve every graph updater from the initialized attention groups.
+
+        Some KV-cache-only groups expose an ``AttentionBackend`` solely so
+        vLLM can allocate and bind their cache.  They intentionally inherit
+        the abstract ``get_impl_cls`` and must not drive replay-time updates.
+        Resolve by backend capability rather than model name or group order,
+        and deduplicate by implementation class so shared backends update once.
+        A cache-only set legitimately has no replay-time update.
+        """
+        from vllm.v1.attention.backend import AttentionBackend
+
+        seen_backends: set[type[Any]] = set()
+        seen_impls: set[type[Any]] = set()
+        implementations: list[type[Any]] = []
+        for groups in attn_groups:
+            for group in groups:
+                backend = group.backend
+                if backend in seen_backends:
+                    continue
+                seen_backends.add(backend)
+                get_impl_cls = getattr(backend, "get_impl_cls", None)
+                if (
+                    get_impl_cls is None
+                    or get_impl_cls is AttentionBackend.get_impl_cls
+                ):
+                    continue
+                try:
+                    impl_cls = get_impl_cls()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Ascend attention backend declared a concrete graph "
+                        f"implementation but failed to resolve it: {backend.__name__}"
+                    ) from exc
+                if not callable(getattr(impl_cls, "update_graph_params", None)):
+                    raise RuntimeError(
+                        "Ascend attention backend graph implementation does not "
+                        f"provide update_graph_params(): {backend.__name__} -> "
+                        f"{impl_cls.__name__}"
+                    )
+                if impl_cls not in seen_impls:
+                    seen_impls.add(impl_cls)
+                    implementations.append(impl_cls)
+        return tuple(implementations)
 
     def wrap_model(
         self,
