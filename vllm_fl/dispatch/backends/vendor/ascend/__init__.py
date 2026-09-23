@@ -5,7 +5,7 @@ Ascend (Huawei) backend for vllm-plugin-FL dispatch.
 """
 
 from .ascend import AscendBackend
-from .patch import patch_mamba_config
+from vllm_fl.dispatch.backends.vendor.ascend.patch import patch_mamba_config
 
 patch_mamba_config()
 

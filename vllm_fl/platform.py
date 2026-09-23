@@ -5,7 +5,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from typing_extensions import ParamSpec
 
 import torch
@@ -42,6 +42,85 @@ from vllm_fl.utils import (
 )
 
 logger = init_logger(__name__)
+
+_ASCEND_COMPILER = "vllm_fl.compilation.compiler_interface.AscendCompiler"
+_ASCEND_PASS_MANAGER = (
+    "vllm_fl.compilation.graph_fusion_pass_manager.GraphFusionPassManager"
+)
+
+
+def _configure_ascend_cpu_binding(vllm_config: "VllmConfig") -> None:
+    """Apply the current vLLM-Ascend CPU-binding CLI/config contract."""
+    parallel_config = vllm_config.parallel_config
+    additional_config = vllm_config.additional_config
+    if additional_config is None:
+        additional_config = {}
+        vllm_config.additional_config = additional_config
+
+    # vLLM-Ascend enables its native CPU binding by default. Preserve an
+    # explicit false even when upstream --numa-bind was also supplied.
+    additional_config.setdefault("enable_cpu_binding", True)
+
+    # Upstream NUMA binding depends on GPU topology. Convert its general
+    # switch to the Ascend-native policy and discard unsupported manual maps.
+    if getattr(parallel_config, "numa_bind", False):
+        parallel_config.numa_bind = False
+        additional_config.setdefault("enable_cpu_binding", True)
+        logger.info(
+            "'--numa-bind' is not supported on Ascend NPU (GPU-to-NUMA "
+            "topology detection unavailable). Automatically converted to "
+            "--additional-config '{\"enable_cpu_binding\": true}' for "
+            "Ascend-native CPU-core binding."
+        )
+
+    if getattr(parallel_config, "numa_bind_nodes", None):
+        logger.info(
+            "'--numa-bind-nodes' is ignored on Ascend NPU. The Ascend-native "
+            "CPU binding automatically performs topo-affinity core allocation."
+        )
+        parallel_config.numa_bind_nodes = None
+
+    if getattr(parallel_config, "numa_bind_cpus", None):
+        logger.info(
+            "'--numa-bind-cpus' is ignored on Ascend NPU. The Ascend-native "
+            "CPU binding automatically performs topo-affinity core allocation."
+        )
+        parallel_config.numa_bind_cpus = None
+
+
+def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
+    """Apply the supported FL Ascend compilation configuration subset."""
+    from vllm.config import CUDAGraphMode, CompilationMode
+
+    compilation_config = vllm_config.compilation_config
+    if compilation_config.mode not in (
+        None,
+        CompilationMode.NONE,
+        CompilationMode.VLLM_COMPILE,
+    ):
+        raise NotImplementedError(
+            "FL AscendCompiler currently supports only VLLM_COMPILE"
+        )
+    additional_config = vllm_config.additional_config
+    if additional_config is None:
+        additional_config = {}
+        vllm_config.additional_config = additional_config
+    ascend_compilation_config = additional_config.setdefault(
+        "ascend_compilation_config", {}
+    )
+    if not isinstance(ascend_compilation_config, dict):
+        raise TypeError("additional_config.ascend_compilation_config must be a dict")
+    from vllm_fl.compilation.config import ascend_compilation_defaults
+
+    for name, default in ascend_compilation_defaults().items():
+        ascend_compilation_config.setdefault(name, default)
+
+    if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+        compilation_config.cudagraph_num_of_warmups = 1
+        compilation_config.use_inductor_graph_partition = False
+        compilation_config.splitting_ops = []
+        if os.environ.get("ASCEND_LAUNCH_BLOCKING", "0") == "1":
+            raise ValueError("ACL graph is incompatible with ASCEND_LAUNCH_BLOCKING=1")
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -104,6 +183,56 @@ class PlatformFL(Platform):
         and device_info.vendor_name not in ("iluvatar", "hygon")
     ) else device_info.device_type
     device_type = device_info.device_type
+    if vendor_name == "ascend" and device_type == "npu":
+        # Must precede VllmConfig construction: DeepSeek-V4 otherwise enables
+        # CUDA's breakable/PIECEWISE wrapper before FL selects its NPU route.
+        # Do not import the Ascend package here: its patches depend on the
+        # fully resolved current_platform and would create an import cycle.
+        import vllm.envs as _vllm_envs
+
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
+        _vllm_envs.VLLM_USE_BREAKABLE_CUDAGRAPH = False
+
+    @classmethod
+    def _get_default_max_cudagraph_capture_size(
+        cls, vllm_config: "VllmConfig"
+    ) -> int | None:
+        """Return the rc1 Ascend capture default without overriding user input."""
+        compilation_config = vllm_config.compilation_config
+        if compilation_config.max_cudagraph_capture_size is not None:
+            return None
+        if compilation_config.cudagraph_capture_sizes is not None:
+            return None
+
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+        if max_num_seqs is None:
+            return None
+
+        decode_query_len = 1
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config and speculative_config.num_speculative_tokens:
+            decode_query_len += speculative_config.num_speculative_tokens
+
+        return min(max_num_seqs * decode_query_len, 512)
+
+    @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
+        """Inject rc1's Ascend capture default before vLLM builds graph sizes."""
+        if cls.vendor_name != "ascend" or cls.device_type != "npu":
+            return super().apply_config_platform_defaults(vllm_config)
+
+        default_max_capture_size = cls._get_default_max_cudagraph_capture_size(
+            vllm_config
+        )
+        if default_max_capture_size is not None:
+            vllm_config.compilation_config.max_cudagraph_capture_size = (
+                default_max_capture_size
+            )
+
+    # Small standalone torch.compile helpers must not use Inductor on NPU.
+    # The model compilation path is selected separately by get_compile_backend.
+    simple_compile_backend = "eager" if device_type == "npu" else "inductor"
     dispatch_key = device_info.dispatch_key
     torch_device_fn = device_info.torch_device_fn
     ray_device_key: str = "GPU"
@@ -188,6 +317,15 @@ class PlatformFL(Platform):
         """Import device-specific kernels."""
         logger.info(f"current vendor_name is: {cls.vendor_name}")
 
+        if cls.device_type == "npu":
+            from vllm_fl.ascend_custom_ops import (
+                bootstrap_custom_op_env,
+                enable_custom_op,
+            )
+
+            bootstrap_custom_op_env()
+            enable_custom_op()
+
         if cls.vendor_name == "metax":
             try:
                 import mcoplib._C  # noqa: F401
@@ -219,6 +357,60 @@ class PlatformFL(Platform):
         import vllm.kernels  # noqa: F401
 
     @classmethod
+    def get_compile_backend(cls) -> str:
+        """Select the FL-owned compiler only for the Ascend backend."""
+        if cls.device_type == "npu":
+            return _ASCEND_COMPILER
+        return super().get_compile_backend()
+
+    @property
+    def pass_key(self) -> str:
+        """Use FL's graph-fusion registry only on Ascend."""
+        if self.device_type == "npu":
+            from vllm_fl.compilation.config import COMPILATION_PASS_KEY
+
+            return COMPILATION_PASS_KEY
+        return super().pass_key
+
+    @classmethod
+    def get_pass_manager_cls(cls) -> str:
+        """Select the FL-owned Ascend pass manager without changing GPUs."""
+        if cls.device_type == "npu":
+            return _ASCEND_PASS_MANAGER
+        return super().get_pass_manager_cls()
+
+    @classmethod
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        """Preserve model-derived hybrid cache geometry on Ascend."""
+        if cls.device_type != "npu":
+            return super().update_block_size_for_backend(vllm_config)
+
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+        using_kv_transfer_with_hybrid = (
+            not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            and vllm_config.kv_transfer_config
+        )
+        if (
+            not cache_config.enable_prefix_caching
+            and using_kv_transfer_with_hybrid
+            and cache_config.mamba_cache_mode == "align"
+        ):
+            if cache_config.mamba_block_size in (
+                None,
+                model_config.max_model_len,
+            ):
+                cache_config.mamba_block_size = cache_config.block_size
+            else:
+                assert (
+                    cache_config.mamba_block_size % cache_config.block_size
+                    == 0
+                ), (
+                    "mamba_block_size must be a multiple of block_size: "
+                    f"{cache_config.block_size}"
+                )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
@@ -241,9 +433,18 @@ class PlatformFL(Platform):
             else:
                 cache_config.block_size = 16
         if cls.device_type == "npu":
-            from vllm_fl.dispatch.backends.vendor.ascend.patch import refresh_block_size
+            from vllm_fl.configs.ascend_cache import refresh_block_size
 
             refresh_block_size(vllm_config)
+            if model_config is not None:
+                # vLLM-Ascend rc1 discovers ModelSlim after VllmConfig creation
+                # and rebuilds quant_config before model loading. Keep this
+                # checkpoint-specific discovery off every other vendor path.
+                from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
+                    maybe_auto_detect_quantization,
+                )
+
+                maybe_auto_detect_quantization(vllm_config)
 
         # TODO(lucas): handle this more gracefully
         # Note: model_config may be None during testing
@@ -255,6 +456,16 @@ class PlatformFL(Platform):
             model_config is not None
             and model_config.use_mla
             and cache_config.block_size is not None
+            # Ascend DSV4 owns its compressed/SWA cache geometry. The rc1
+            # refresh_block_size above accepts 32, 64 and 128; the generic
+            # FlagOS MLA alignment must not overwrite that selection.
+            and not (
+                cls.device_type == "npu"
+                and getattr(cls, "vendor_name", None) == "ascend"
+                and getattr(
+                    getattr(model_config, "hf_config", None), "model_type", None
+                ) == "deepseek_v4"
+            )
         ):
             if cache_config.block_size % 64 != 0:
                 cache_config.block_size = 64
@@ -266,6 +477,43 @@ class PlatformFL(Platform):
         compilation_config = vllm_config.compilation_config
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
+
+        if cls.device_type == "npu":
+            _configure_ascend_cpu_binding(vllm_config)
+            _configure_ascend_compilation(vllm_config)
+            from vllm_fl.ascend_flashcomm import (
+                validate_and_update_flashcomm1_config,
+            )
+
+            validate_and_update_flashcomm1_config(vllm_config)
+            from vllm_fl.configs.ascend import (
+                balance_scheduling_enabled,
+            )
+
+            if balance_scheduling_enabled(vllm_config):
+                kv_transfer_config = vllm_config.kv_transfer_config
+                kv_role = getattr(kv_transfer_config, "kv_role", None)
+                if kv_transfer_config is not None and kv_role != "kv_both":
+                    raise ValueError(
+                        "enable_balance_scheduling only supports PD-mixed mode "
+                        "(kv_role='kv_both' or no kv_transfer_config), and is not "
+                        "supported in PD-disaggregated mode "
+                        "(kv_role='kv_producer'/'kv_consumer')."
+                    )
+                # This runs during VllmConfig construction in both the API
+                # process and spawned engine cores, before Scheduler is
+                # resolved from SchedulerConfig.
+                from vllm_fl.scheduling.ascend_balance import (
+                    apply_balance_scheduling_patch,
+                )
+
+                apply_balance_scheduling_patch()
+            # vLLM-Ascend rc1 uses this value as a sentinel to keep upstream
+            # Qwen MoE sequence parallelism disabled when the Ascend compiler
+            # pass is disabled. The actual NPU communication path is selected
+            # independently in vllm_fl.ascend_forward_context.
+            if not getattr(compilation_config.pass_config, "enable_sp", False):
+                parallel_config.all2all_backend = "flashinfer_all2allv"
 
         if (
             cls.device_type == "musa"
@@ -335,6 +583,46 @@ class PlatformFL(Platform):
             parallel_config.disable_custom_all_reduce = True
 
     @classmethod
+    def set_additional_forward_context(
+        cls,
+        attn_metadata: dict[str, Any],
+        vllm_config: "VllmConfig",
+        dp_metadata: Any,
+        num_tokens: int = 0,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        cudagraph_runtime_mode: Any = None,
+        batch_descriptor: Any = None,
+        ubatch_slices: Any = None,
+    ) -> dict[str, Any]:
+        """Install Ascend MoE state without changing another vendor's path."""
+        if cls.device_type != "npu":
+            return super().set_additional_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=vllm_config,
+                dp_metadata=dp_metadata,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                ubatch_slices=ubatch_slices,
+            )
+
+        from vllm_fl.ascend_forward_context import (
+            build_additional_forward_context,
+        )
+
+        return build_additional_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=vllm_config,
+            dp_metadata=dp_metadata,
+            num_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+            ubatch_slices=ubatch_slices,
+        )
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum | None",
@@ -346,13 +634,32 @@ class PlatformFL(Platform):
 
         use_mla = attn_selector_config.use_mla
         use_sparse = attn_selector_config.use_sparse
+        # ``use_compress`` was added by the DeepSeek-V4 DSA path after the
+        # original selector configuration. Keep the getattr so this platform
+        # remains compatible with the matching upstream selector while also
+        # accepting the extended rc1 configuration.
+        use_compress = getattr(attn_selector_config, "use_compress", False)
 
-        backend_path = call_op("attention_backend", use_mla=use_mla, use_sparse=use_sparse)
+        if cls.device_type == "npu":
+            backend_path = call_op(
+                "attention_backend",
+                use_mla=use_mla,
+                use_sparse=use_sparse,
+                use_compress=use_compress,
+            )
+        else:
+            # Other vendor dispatch implementations predate use_compress;
+            # retain their call contract unchanged.
+            backend_path = call_op(
+                "attention_backend", use_mla=use_mla, use_sparse=use_sparse
+            )
 
         logger.info_once(
-            "Using attention backend via dispatch (use_mla=%s, use_sparse=%s): %s",
+            "Using attention backend via dispatch (use_mla=%s, use_sparse=%s, "
+            "use_compress=%s): %s",
             use_mla,
             use_sparse,
+            use_compress,
             backend_path,
             scope="local",
         )
@@ -361,6 +668,26 @@ class PlatformFL(Platform):
             % (use_mla, backend_path)
         )
         return backend_path
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        """Register Ascend KV-cache specs after upstream's built-in specs."""
+        if cls.device_type != "npu":
+            return super().register_custom_kv_cache_specs(vllm_config)
+
+        from vllm_fl.kv_cache.ascend.deepseek_v4_kv_cache import (
+            apply_deepseek_v4_kv_cache_patches,
+        )
+        from vllm_fl.kv_cache.ascend.kv_cache_interface import (
+            register_ascend_kv_cache_specs,
+        )
+
+        # This hook runs in EngineCore as well as workers. Install the cache
+        # planner/coordinator bindings here so the engine cannot create the
+        # upstream packed plan that the Ascend DSA runner intentionally
+        # rejects. Both operations are idempotent.
+        register_ascend_kv_cache_specs()
+        apply_deepseek_v4_kv_cache_patches()
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
@@ -410,6 +737,12 @@ class PlatformFL(Platform):
         if cls.dist_backend == "flagcx":
             logger.info("Using CommunicatorFL for communication.")
             return "vllm_fl.distributed.communicator.CommunicatorFL"  # noqa
+        elif cls.device_type == "npu":
+            logger.info("Using FL NPUCommunicator for HCCL communication.")
+            return (
+                "vllm_fl.distributed.device_communicators."
+                "npu_communicator.NPUCommunicator"
+            )
         else:
             logger.info("Using CudaCommunicator for communication.")
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
@@ -470,7 +803,10 @@ class PlatformFL(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        if cls.vendor_name == "hygon":
+        # Ascend follows vLLM-Ascend's platform default: use HCCL rather than
+        # vLLM's CUDA-oriented custom all-reduce path. Keep other vendors'
+        # existing selection unchanged.
+        if cls.vendor_name in ("hygon", "ascend"):
             return False
         if cls.dist_backend == "flagcx":
             return False
@@ -480,6 +816,11 @@ class PlatformFL(Platform):
     def pre_register_and_update(cls, parser=None) -> None:
         if cls.device_name == "npu":
             import vllm_fl.dispatch.backends.vendor.ascend
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
+                register_modelslim,
+            )
+
+            register_modelslim(parser)
         if cls.vendor_name == "iluvatar":
             # Patches are applied at module import time in iluvatar.py.
             # Also call chained-or patch here explicitly from the main process,

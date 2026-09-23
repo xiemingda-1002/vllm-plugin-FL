@@ -6,7 +6,7 @@ https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsap
 """
 
 from .activation import silu_and_mul_ascend
-from .attention import (
+from vllm_fl.attention.ascend.attention import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
@@ -15,7 +15,7 @@ from .attention import (
     AscendMLABackend,
     is_torch_npu_available,
 )
-from .attention_mask import AttentionMaskBuilder, get_attention_mask_builder
+from vllm_fl.attention.ascend.standard_mask import AttentionMaskBuilder, get_attention_mask_builder
 from .normalization import rms_norm_ascend
 from .rotary import rotary_embedding_ascend
 

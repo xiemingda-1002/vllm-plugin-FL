@@ -74,6 +74,15 @@ def register_builtins(registry: OpRegistry) -> None:
             vendor="ascend",
             priority=BackendPriority.VENDOR,
         ),
+        # MoE router: current-v0.24 A2/A3 native softmax top-k.
+        OpImpl(
+            op_name="topk_softmax",
+            impl_id="vendor.ascend",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(backend.topk_softmax, is_avail),
+            vendor="ascend",
+            priority=BackendPriority.VENDOR,
+        ),
     ]
 
     registry.register_many(impls)

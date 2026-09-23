@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import divide, get_tp_group
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -37,10 +37,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
-
-def maybe_pad_and_reduce(x: torch.Tensor,
-                               is_ep_comm: bool = False) -> torch.Tensor:
-    return tensor_model_parallel_all_reduce(x)
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     """
@@ -190,7 +186,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = maybe_pad_and_reduce(output_parallel)
+        output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
         return output
 
 

@@ -11,13 +11,11 @@
 import torch
 from vllm.triton_utils import tl, triton
 
-from ..triton_utils import get_vectorcore_num
+from vllm_fl.dispatch.backends.vendor.ascend.impl.triton_utils import get_vectorcore_num
 
 
-@triton.jit
-def l2norm_fwd_kernel2_loop(
-    X, Y, eps, M, N: tl.constexpr, MBLOCK: tl.constexpr, NUM_CHUNKS: tl.constexpr
-):
+@triton.jit(do_not_specialize=["eps", "M", "NUM_CHUNKS"])
+def l2norm_fwd_kernel2_loop(X, Y, eps, M, N: tl.constexpr, MBLOCK: tl.constexpr, NUM_CHUNKS):
     base_row = tl.program_id(0) * (NUM_CHUNKS * MBLOCK)
     rindex = tl.arange(0, N)[None, :]
 
@@ -33,9 +31,7 @@ def l2norm_fwd_kernel2_loop(
         tl.store(Y + (rindex + N * row_idx), xs * rsqrt, xmask)
 
 
-def l2norm_fwd(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None
-):
+def l2norm_fwd(x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None):
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
     # allocate output
@@ -49,7 +45,7 @@ def l2norm_fwd(
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
     if D > BD:
-        raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+        raise RuntimeError(f"l2norm_fwd: This layer doesn't support feature dim >= 64KB, got {D}.")
 
     MBLOCK = 69
     # M, N = x.shape
