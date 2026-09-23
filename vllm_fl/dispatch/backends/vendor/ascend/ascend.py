@@ -123,7 +123,12 @@ class AscendBackend(Backend):
             inplace=inplace,
         )
 
-    def attention_backend(self, use_mla: bool = False, use_sparse: bool = False) -> str:
+    def attention_backend(
+        self,
+        use_mla: bool = False,
+        use_sparse: bool = False,
+        use_compress: bool = False,
+    ) -> str:
         """
         Get the attention backend class path for Ascend NPU.
 
@@ -137,12 +142,43 @@ class AscendBackend(Backend):
         Args:
             use_mla: Whether to use Multi-head Latent Attention (MLA)
             use_sparse: Whether to use Deepseek Sparse Attention (DSA)
+            use_compress: Whether the DeepSeek-V4 compressed DSA cache is in use
 
         Returns:
             Fully qualified class path string
         """
+        # This is the current vLLM-Ascend non-MTP/non-DSA-CP selector
+        # semantic. DSA is distinguished from normal MLA by compression, not
+        # by a model-name special case.
+        if use_mla and not use_sparse and use_compress:
+            return (
+                "vllm_fl.attention.ascend.dsa_v1."
+                "AscendDSABackend"
+            )
         if use_mla:
             if use_sparse:
-                raise NotImplementedError("MLA with sparse attention is not implemented for Ascend yet.")
-            return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendMLABackend"
-        return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendAttentionBackend"
+                return (
+                    "vllm_fl.attention.ascend.sfa_v1."
+                    "AscendSFABackend"
+                )
+            return "vllm_fl.attention.ascend.attention.AscendMLABackend"
+        return "vllm_fl.attention.ascend.attention.AscendAttentionBackend"
+
+    def topk_softmax(
+        self,
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+        token_expert_indices: torch.Tensor,
+        gating_output: torch.Tensor,
+        renormalize: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fill vLLM's preallocated softmax top-k outputs on Ascend."""
+        from .impl.fused_moe import topk_softmax_ascend
+
+        return topk_softmax_ascend(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+        )

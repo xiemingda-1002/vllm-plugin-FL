@@ -53,16 +53,51 @@ def FusedMoEFL(*args, **kwargs) -> MoERunner:
     Registration: op_registry_oot maps FusedMoE -> FusedMoEFL so that all
     MoE layers in a model use the FL router transparently.
     """
-    # 1. Build the standard MoERunner via the upstream factory.
-    #    Use _OrigFusedMoE (captured at import time, before monkey-patching)
-    #    to avoid infinite recursion when custom_ops.py has already replaced
-    #    _fused_moe_pkg.FusedMoE with FusedMoEFL.
+    from vllm.platforms import current_platform
+
+    is_ascend = (
+        current_platform.vendor_name == "ascend"
+        and current_platform.device_type == "npu"
+    )
+
+    # vLLM-Ascend 0.24rc1 owns MoE prepare/dispatch/compute/combine/finalize in
+    # its runner.  Inject that runner while the upstream factory is building
+    # RoutedExperts; replacing only the quant method afterwards leaves the
+    # upstream AgRs lifecycle active and is not semantically equivalent.
+    if is_ascend and kwargs.get("runner_cls") is None:
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.fused_moe import (
+            AscendMoERunner,
+        )
+
+        kwargs["runner_cls"] = AscendMoERunner
+
+    if is_ascend:
+        # ``hash`` is consumed by the DeepSeek V4 layer before this factory.
+        # ``tid2eid`` is Ascend runner state, not an upstream factory
+        # argument.  Copy caller-owned runner_args before extending it so a
+        # shared config dict cannot be modified as a side effect.
+        kwargs.pop("hash", None)
+        tid2eid = kwargs.pop("tid2eid", None)
+        if tid2eid is not None:
+            runner_args = kwargs.get("runner_args")
+            runner_args = dict(runner_args) if runner_args is not None else {}
+            runner_args["tid2eid"] = tid2eid
+            kwargs["runner_args"] = runner_args
+
+    # Use the original factory captured before monkey-patching to avoid
+    # recursion.  Explicit caller-owned runner_cls remains authoritative.
     runner: MoERunner = _OrigFusedMoE(*args, **kwargs)
 
-    # 2. Replace only an upstream unquantized method with the FL version.
+    # 2. Replace only an upstream unquantized method with the vendor-specific
+    # implementation. Ascend-only routing args are normalized above while a
+    # caller's explicit runner_cls and existing runner_args remain authoritative.
     # Quantized methods own their weight/activation scaling metadata and must
     # remain attached to the runner.
-    if isinstance(runner._quant_method, UnquantizedFusedMoEMethod):
+    if is_ascend:
+        # AscendMoERunner installs its rc1 quant method during construction.
+        # An explicit custom runner owns its own method and is not rewritten.
+        pass
+    elif isinstance(runner._quant_method, UnquantizedFusedMoEMethod):
         fl_quant_method = UnquantizedFusedMoEMethodFL(runner.moe_config)
         runner._replace_quant_method(fl_quant_method)
     else:

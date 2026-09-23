@@ -1,0 +1,173 @@
+"""FL-owned rc1 DSA feature helpers and explicit migration boundaries."""
+from __future__ import annotations
+
+from functools import wraps
+
+import torch
+import torch_npu
+
+from vllm_fl.platforms.ascend.hardware import AscendDeviceType, get_ascend_device_type
+
+
+def get_ascend_config():
+    from vllm_fl.configs.ascend import get_ascend_config as _get_ascend_config
+
+    return _get_ascend_config()
+
+
+def enable_dsa_cp() -> bool:
+    try:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+    except AssertionError:
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    text_config = getattr(model_config, "hf_text_config", None)
+    if text_config is None or not hasattr(text_config, "index_topk"):
+        return False
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    dsa_cp_enabled = bool(additional_config.get("enable_dsa_cp", False))
+    if dsa_cp_enabled and not enable_sp():
+        raise ValueError(
+            "DSA CP requires SP to be enabled. Enable FlashComm1 to use "
+            "additional_config.enable_dsa_cp."
+        )
+    return dsa_cp_enabled and enable_sp()
+
+
+def enable_dsa_cp_with_o_proj_tp() -> bool:
+    """Match rc1's temporary full o_proj-weight requirement for DSA-CP."""
+    if not enable_dsa_cp():
+        return False
+    from vllm.config import get_current_vllm_config
+
+    kv_transfer_config = get_current_vllm_config().kv_transfer_config
+    return kv_transfer_config is None or kv_transfer_config.is_kv_producer
+
+
+def get_dsv4_compress_ratio(config, layer_idx: int) -> int:
+    compress_ratios = getattr(config, "compress_ratios", None)
+    if compress_ratios is None or layer_idx >= len(compress_ratios):
+        return 0
+    return compress_ratios[layer_idx]
+
+
+def model_uses_sfa_sparse(model_config) -> bool:
+    """Match rc1's distinction between SFA and compressed DSA models."""
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    return (
+        hf_text_config is not None
+        and hasattr(hf_text_config, "index_topk")
+        and not hasattr(hf_text_config, "compress_ratios")
+        and not hasattr(hf_config, "compress_ratios")
+    )
+
+
+def enable_sfa_dcp_replicated_indexer(vllm_config=None) -> bool:
+    """Use rc1's replicated-indexer path only for SFA decode CP."""
+    if vllm_config is None:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    return (
+        model_uses_sfa_sparse(vllm_config.model_config)
+        and parallel_config.decode_context_parallel_size > 1
+        and parallel_config.prefill_context_parallel_size == 1
+    )
+
+
+def round_up(x: int, align: int) -> int:
+    """Round ``x`` up to the next multiple of ``align`` (rc1 semantics)."""
+    return (x + align - 1) // align * align
+
+
+def extract_dsv4_layer_index(config, prefix: str) -> int:
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    layer_idx = extract_layer_index(prefix)
+    if ".mtp." in f".{prefix}." and layer_idx < config.num_hidden_layers:
+        return config.num_hidden_layers + layer_idx
+    return layer_idx
+
+
+def get_potential_max_tokens() -> int:
+    from vllm.config import get_current_vllm_config
+    return get_current_vllm_config().scheduler_config.max_num_batched_tokens
+
+
+def is_pd_decode_recompute_scheduler_enabled() -> bool:
+    try:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+    except AssertionError:
+        return False
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    is_decode_consumer = bool(
+        kv_config is not None
+        and getattr(kv_config, "is_kv_consumer", False)
+        and not getattr(kv_config, "is_kv_producer", False)
+    )
+    if is_decode_consumer and get_ascend_config().recompute_scheduler_enable:
+        raise NotImplementedError(
+            "FL Ascend PD decode recompute scheduling is not migrated"
+        )
+    return False
+
+
+def npu_stream_switch(*args, **kwargs):
+    from .impl.moe.compat import npu_stream_switch as _npu_stream_switch
+
+    return _npu_stream_switch(*args, **kwargs)
+
+
+def olora_tp_enable() -> bool:
+    enabled = get_ascend_config().finegrained_tp_config.olora_tensor_parallel_size > 1
+    if enabled:
+        raise NotImplementedError("FL Ascend OLoRA tensor parallelism is not migrated")
+    return False
+
+
+def oproj_tp_enable() -> bool:
+    enabled = get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 0
+    if enabled:
+        raise NotImplementedError("FL Ascend OProj tensor parallelism is not migrated")
+    return False
+
+
+def enable_sp() -> bool:
+    from vllm_fl.configs.ascend import enable_sp as _enable_sp
+
+    return _enable_sp()
+
+
+def is_310p() -> bool:
+    return get_ascend_device_type() is AscendDeviceType._310P
+
+
+def maybe_trans_nz(weight: torch.Tensor) -> torch.Tensor:
+    if weight.dtype == torch.float32 or weight.is_meta:
+        return weight
+    if is_310p():
+        return torch_npu.npu_format_cast(weight, 29)
+    nz_mode = get_ascend_config().weight_nz_mode
+    if not nz_mode:
+        return weight
+    if weight.dtype in {torch.bfloat16, torch.float16} and nz_mode != 2:
+        return weight
+    return torch_npu.npu_format_cast(weight, 29)
+
+
+def singleton(cls):
+    instances = {}
+
+    @wraps(cls)
+    def factory(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances[cls]
+
+    return factory

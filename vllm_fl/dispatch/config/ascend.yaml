@@ -44,6 +44,8 @@ op_backends:
     - vendor
     - flagos
     - reference
+  topk_softmax:
+    - vendor:ascend
 
 # FlagOS operator blacklist
 # These operators will NOT use FlagOS implementation even if FlagOS is enabled.
