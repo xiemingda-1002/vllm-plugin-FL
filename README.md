@@ -96,6 +96,24 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
     required by some graph/custom-op paths, especially when vLLM is installed
     with `VLLM_TARGET_DEVICE=empty`.
 
+    For Ascend A2 and A3, use the matching vLLM-Ascend base image and set
+    `VLLM_VENDOR=ascend`. The recommended images already provide the correct
+    `SOC_VERSION`, so both platforms use the same installation command:
+    ```sh
+    cd vllm-plugin-FL
+    VLLM_VENDOR=ascend pip install --no-build-isolation .
+    # or editable install
+    VLLM_VENDOR=ascend pip install --no-build-isolation -e .
+    ```
+
+    When using another build image, ensure it provides the matching
+    `SOC_VERSION`; otherwise the build defaults to A3 (`ascend910_93`).
+
+    Native build concurrency can be bounded with `MAX_JOBS` (outer tasks) and
+    the optional `TILINGKEY_PARALLEL_JOB` (per-operator compiler jobs). Their
+    concurrency can multiply; see the [Ascend build guide](docs/ascend/deployment.md#构建)
+    before enabling both on a shared host.
+
     If `VLLM_VENDOR` is not set, vllm-plugin-FL is installed as a Python-only
     plugin and the native extension is skipped.
 
@@ -160,6 +178,11 @@ If there are multiple plugins in the current environment, you can specify use vl
 
 ### Additional Steps for Ascend
 
+The vLLM 0.24 Ascend migration notes, tested matrix, limitations, and
+reproducible build/deployment procedure are available in
+[docs/ascend](./docs/ascend/overview.md). The matrix distinguishes A2 and A3;
+it is a correctness record, not a same-version native performance comparison.
+
 1. Install [FlagTree](https://github.com/flagos-ai/flagtree/)
 
     ```sh
@@ -175,9 +198,27 @@ If there are multiple plugins in the current environment, you can specify use vl
     export TRITON_ALL_BLOCKS_PARALLEL=1
     ```
 
-3. Enable eager execution
+3. Select the execution mode
 
-    Ascend requires eager execution. Add `enforce_eager=True` to the `LLM` constructor or pass `--enforce-eager` on the command line.
+    Use `enforce_eager=True` or `--enforce-eager` for an eager correctness
+    baseline. The vLLM 0.24 Ascend migration also supports the
+    `FULL_DECODE_ONLY` graph path; do not pass `--enforce-eager` when testing
+    graph capture and replay. Graph correctness must be checked for the actual
+    model, hardware, and parallel topology rather than inferred from startup.
+
+    The current Qwen MoE path is unquantized BF16/FP16 with AllGather.
+    Detecting an A3 device does not establish A3 model or distributed graph
+    acceptance. MC2, EPLB, mixed expert placement, shared-expert DP, and
+    quantized MoE are not part of this validated path. Shared-expert multistream
+    overlap is a separate option from shared-expert DP and is not enabled by
+    default. Static-kernel compilation and compiler-pass sequence parallelism
+    are not currently supported; FlashComm1 is a distinct runtime path.
+
+    Use the current vLLM-Ascend configuration structure, including nested
+    `eplb_config`, `ascend_compilation_config`, and `ascend_fusion_config`
+    dictionaries. Configuring an unsupported capability does not enable it.
+    Existing FL performance results do not constitute a same-version native
+    vLLM-Ascend performance comparison.
 
 
 ### Run a Task
