@@ -2,6 +2,8 @@
 
 import builtins
 import os
+import sys
+import types
 import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -21,6 +23,66 @@ def _vendor_env(**values):
 
 
 class TestFlagGemsTritonImportCompat(unittest.TestCase):
+    def test_auto_ascend_only_backend_skips_language_and_knobs(self):
+        real_import = builtins.__import__
+
+        for backend_container in (
+            {"ascend": object()},
+            types.SimpleNamespace(backends={"ascend": object()}),
+        ):
+            fake_triton = types.ModuleType("triton")
+            fake_triton.backends = backend_container
+            imports = []
+
+            def record_subimports(
+                name, globals=None, locals=None, fromlist=(), level=0
+            ):
+                if name.startswith("triton."):
+                    imports.append(name)
+                    raise AssertionError(f"unexpected Triton subimport: {name}")
+                return real_import(name, globals, locals, fromlist, level)
+
+            for use_flaggems in ("0", "1"):
+                with (
+                    self.subTest(
+                        USE_FLAGGEMS=use_flaggems,
+                        backend_container=type(backend_container).__name__,
+                    ),
+                    _vendor_env(USE_FLAGGEMS=use_flaggems),
+                    patch.dict(sys.modules, {"triton": fake_triton}),
+                    patch("builtins.__import__", side_effect=record_subimports),
+                ):
+                    vllm_fl._patch_flag_gems_triton_import_compat()
+            self.assertEqual(imports, [])
+            self.assertFalse(hasattr(fake_triton, "knobs"))
+
+    def test_explicit_kunlunxin_and_inconclusive_backends_keep_probe(self):
+        real_import = builtins.__import__
+
+        for values, backends in (
+            ({"GEMS_VENDOR": "kunlunxin"}, {"ascend": object()}),
+            ({}, {"ascend": object(), "cuda": object()}),
+            ({}, {}),
+        ):
+            fake_triton = types.ModuleType("triton")
+            fake_triton.backends = backends
+            imports = []
+
+            def record_language(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "triton.language":
+                    imports.append(name)
+                    raise ImportError("test stop after probe")
+                return real_import(name, globals, locals, fromlist, level)
+
+            with (
+                self.subTest(values=values, backends=tuple(backends)),
+                _vendor_env(**values),
+                patch.dict(sys.modules, {"triton": fake_triton}),
+                patch("builtins.__import__", side_effect=record_language),
+            ):
+                vllm_fl._patch_flag_gems_triton_import_compat()
+            self.assertEqual(imports, ["triton.language"])
+
     def test_ascend_skips_triton_import_regardless_of_flaggems_setting(self):
         real_import = builtins.__import__
 

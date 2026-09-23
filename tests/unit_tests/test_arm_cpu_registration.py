@@ -12,7 +12,9 @@ import vllm_fl
 def _fake_vllm_platforms(cpu_platform="vllm.platforms.cpu.CpuPlatform"):
     module = ModuleType("vllm.platforms")
     module.cpu_platform_plugin = Mock(return_value=cpu_platform)
-    module.current_platform = SimpleNamespace(device_type="cpu")
+    # Upstream CPU Platform does not declare vendor_name; its platform
+    # interface fallback resolves the missing attribute to None.
+    module.current_platform = SimpleNamespace(device_type="cpu", vendor_name=None)
     return module
 
 
@@ -74,7 +76,9 @@ class TestArmCpuRegistration(unittest.TestCase):
         custom_ops.assert_called_once_with()
         flash_attn.assert_called_once_with()
         transformers.assert_called_once_with()
-        platform_patches.assert_called_once_with()
+        # Platform registration no longer installs the legacy GLM patch; its
+        # compatible pieces are installed on their own current-runtime paths.
+        platform_patches.assert_not_called()
         get_op_config.assert_called_once_with()
 
     def test_arm64_gpu_model_registration_does_not_import_arm_cpu_hooks(self):
