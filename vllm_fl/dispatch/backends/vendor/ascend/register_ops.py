@@ -47,6 +47,15 @@ def register_builtins(registry: OpRegistry) -> None:
             vendor="ascend",
             priority=BackendPriority.VENDOR,
         ),
+        # Activation (GELU variant; MiniMax-M3 vision tower / projector)
+        OpImpl(
+            op_name="gelu_and_mul",
+            impl_id="vendor.ascend",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(backend.gelu_and_mul, is_avail),
+            vendor="ascend",
+            priority=BackendPriority.VENDOR,
+        ),
         # Normalization
         OpImpl(
             op_name="rms_norm",

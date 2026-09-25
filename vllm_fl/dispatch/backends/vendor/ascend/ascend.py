@@ -62,6 +62,24 @@ class AscendBackend(Backend):
 
         return silu_and_mul_ascend(obj, x)
 
+    def gelu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
+        """
+        GELU activation followed by element-wise multiplication.
+
+        Required by MiniMax-M3's vision tower / multimodal projector; without a
+        vendor implementation the op resolves to the PyTorch reference backend.
+
+        Args:
+            obj: The calling obj (``GeluAndMul``), carrying ``approximate``.
+            x: Input tensor of shape [..., 2*d]
+
+        Returns:
+            Output tensor of shape [..., d]
+        """
+        from .impl.activation import gelu_and_mul_ascend
+
+        return gelu_and_mul_ascend(obj, x)
+
     def rms_norm(
         self,
         obj,
