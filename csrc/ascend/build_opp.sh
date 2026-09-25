@@ -47,6 +47,7 @@ ops=(
   hc_post
   hc_pre_inv_rms
   hc_pre_sinkhorn
+  sparse_attention_score
   sparse_attn_sharedkv
   sparse_attn_sharedkv_metadata
   sparse_flash_attention
