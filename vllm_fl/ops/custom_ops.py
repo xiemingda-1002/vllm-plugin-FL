@@ -221,9 +221,17 @@ def _patch_fused_moe_factory() -> None:
         and current_platform.device_type == "npu"
     )
     if is_ascend:
+        # Scan EVERY already-imported ``vllm`` module, not just
+        # ``vllm.model_executor.models.*``. MiniMax-M3 lives under
+        # ``vllm.models.minimax_m3.nvidia.model`` and imports the factory at
+        # module scope, so a narrower prefix leaves it holding the upstream
+        # ``FusedMoE``: FL's MoE runner then never constructs, its
+        # ``setup_moe_comm_method()`` never registers a transport, and the first
+        # forward context dies with "MoE communication method MC2 is
+        # unregistered". Identity is checked against FL's captured upstream
+        # factory so an explicit caller-supplied factory is never clobbered.
         module_names = [
-            name for name in tuple(sys.modules)
-            if name.startswith("vllm.model_executor.models.")
+            name for name in tuple(sys.modules) if name.startswith("vllm.")
         ]
     for module_name in module_names:
         qwen_module = sys.modules.get(module_name)

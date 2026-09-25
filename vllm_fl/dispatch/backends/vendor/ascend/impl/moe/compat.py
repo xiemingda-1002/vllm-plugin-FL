@@ -125,9 +125,21 @@ def get_moe_num_logical_experts(
     global_redundant_expert_num: int = 0,
     num_shared_experts: int = 0,
 ) -> int:
-    if global_redundant_expert_num or num_shared_experts:
-        require_a2_bf16_allgather("EPLB or mixed shared-expert placement")
-    return num_experts
+    """Number of routed experts, excluding redundant and shared experts.
+
+    MiniMax-M3 declares one shared expert alongside its 128 routed experts, so
+    subtracting it is required for the routing math (``select_experts`` fills
+    the shared slot itself). This is plain arithmetic; it is not an EPLB or
+    mixed-placement execution path, so it must not be rejected by the
+    A2/ALLGATHER fail-closed gate below.
+    """
+    if global_redundant_expert_num:
+        require_a2_bf16_allgather("EPLB")
+    moe_config = getattr(_layer, "moe_config", None)
+    num_logical_experts = getattr(moe_config, "num_logical_experts", None)
+    if num_logical_experts is not None:
+        return int(num_logical_experts)
+    return int(num_experts - global_redundant_expert_num - num_shared_experts)
 
 
 class VllmEplbAdaptor:

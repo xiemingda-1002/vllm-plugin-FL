@@ -115,6 +115,29 @@ def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
     for name, default in ascend_compilation_defaults().items():
         ascend_compilation_config.setdefault(name, default)
 
+    # MiniMax-M3 must not run the QK-norm/RoPE Inductor fusion pass. The pass
+    # discovers candidates through ``get_layers_from_vllm_config(.., Attention)``
+    # while M3's sparse attention layers subclass ``AttentionLayerBase``, so the
+    # fusion it produces can never match them. Building its match pattern is not
+    # free, though: the pattern body calls ``torch.ops.vllm.npu_rotary_embedding``,
+    # whose real implementation is ATB's ``_npu_rotary_embedding``, and ATB's
+    # RopeOperation cannot be set up outside a real kernel launch -- it aborts the
+    # whole npugraph_ex compilation with "RopeOperation setup failed!" and leaves
+    # the model fully uncompiled (~55% slower decode). M3 already fuses
+    # QK-norm/RoPE/KV-insert explicitly via
+    # ``ops.fused_minimax_m3_qknorm_rope_kv_insert``, so skipping this pass loses
+    # nothing. An explicit user value still wins.
+    architectures = getattr(vllm_config.model_config, "architectures", None) or []
+    if any(str(a).startswith("MiniMaxM3") for a in architectures):
+        if ascend_compilation_config.get("fuse_qknorm_rope", True):
+            ascend_compilation_config["fuse_qknorm_rope"] = False
+            logger.info(
+                "MiniMax-M3: disabled the qknorm-rope Inductor fusion pass "
+                "(cannot match AttentionLayerBase layers, and its pattern "
+                "construction triggers an ATB RoPE setup failure that aborts "
+                "graph compilation)"
+            )
+
     if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
         compilation_config.cudagraph_num_of_warmups = 1
         compilation_config.use_inductor_graph_partition = False

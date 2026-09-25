@@ -40,6 +40,11 @@ op_backends:
     - flagos
     - vendor
     - reference
+  # gelu_and_mul: MiniMax-M3 vision tower/projector; vendor = torch_npu fused op
+  gelu_and_mul:
+    - vendor
+    - flagos
+    - reference
   rotary_embedding:
     - vendor
     - flagos

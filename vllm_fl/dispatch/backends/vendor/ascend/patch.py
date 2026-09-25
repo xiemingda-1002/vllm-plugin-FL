@@ -37,12 +37,18 @@ def apply_ascend_patches():
         apply_ascend_mla_prefill_backend_patch,
     )
     from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_deepseek_v4 import apply_deepseek_v4_patches
+    from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_minimax_m3 import (
+        apply_minimax_m3_patches,
+    )
 
     ensure_graph_fusion_ops_registered()
     apply_balance_scheduling_patch()
     ensure_ascend_moe_custom_ops_registered()
     ensure_dsa_forward_registered()
     apply_deepseek_v4_patches()
+    # MiniMax-M3: upstream M3 ships in vLLM 0.24; only Ascend behaviour is
+    # installed here (injections + architecture registration).
+    apply_minimax_m3_patches()
     # MLAAttention constructs this auxiliary object while loading every MLA
     # model. Install the Ascend boundary before any model constructor runs.
     apply_ascend_mla_prefill_backend_patch()
