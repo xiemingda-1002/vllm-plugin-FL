@@ -122,8 +122,14 @@ def _select_a2_moe_comm_method(
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = _ep_world_size(vllm_config)
     num_experts_per_device = num_experts // ep_world_size
+    # Guard on availability: a registry that lacks MC2 must not be handed it.
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.moe_comm_method import (
+        is_moe_comm_method_available,
+    )
+
     if (
-        mc2_tokens_capacity is not None
+        is_moe_comm_method_available(MoECommType.MC2)
+        and mc2_tokens_capacity is not None
         and num_experts_per_device <= 24
         and ep_world_size >= 16
         and num_tokens <= mc2_tokens_capacity

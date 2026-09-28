@@ -48,6 +48,16 @@ from .quant_type import QuantType
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 
+def is_moe_comm_method_available(moe_comm_type: MoECommType | None) -> bool:
+    """Whether a communication method is actually registered.
+
+    The selection heuristics run before any runner exists, so they must be able
+    to tell which methods this migration provides instead of choosing one that
+    later raises.
+    """
+    return moe_comm_type in _MoECommMethods
+
+
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
     method = _MoECommMethods.get(moe_comm_type)
     if moe_comm_type is not None and method is None:
@@ -59,14 +69,24 @@ def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | No
 
 
 def setup_moe_comm_method(moe_config):
+    """Register every transport this tree provides, unconditionally.
+
+    Gating the registry on ``moe_config.ep_size`` is unsafe: the MoE
+    communication method is *selected* while the platform builds the additional
+    forward context, which happens during the memory-profiling pass before any
+    layer module (and therefore ``ep_size``) exists. Registering only inside
+    ``ep_size > 1`` leaves the registry empty at selection time, so a
+    decode-shaped batch picks MC2 and then fails with "MC2 is unregistered".
+
+    MiniMax-M3 on A3 needs all three: with 128 experts over EP16 the vendor
+    runtime selects MC2 for decode and ALLTOALL for prefill, so an
+    ALLGATHER-only registry silently downgrades the whole forward to A2
+    behaviour.
+    """
     _MoECommMethods.clear()
-    if moe_config.ep_size > 1:
-        _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
-        _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
-        _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
-    else:
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+    _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+    _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
+    _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
 
 
 def set_gmmswigluquant_method():

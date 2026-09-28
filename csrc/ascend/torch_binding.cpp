@@ -18,6 +18,7 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
+#include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #ifdef VLLM_FL_ENABLE_MLAPO_DIRECT_KERNEL
@@ -1185,6 +1186,17 @@ TORCH_LIBRARY(_C_ascend, ops) {
           "*, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, "
           "int[]? chunk_indices=None, int? chunk_size=None, "
           "bool? transpose_state_layout=False) -> Tensor");
+  // MiniMax-M3 block-sparse GQA score+attend; same call contract as the
+  // vLLM-Ascend 0.24.0rc1 closure. selectIdx selects the top-k KV blocks.
+  ops.def(
+      "npu_sparse_attention_score(Tensor query, Tensor key, Tensor value, "
+      "Tensor selectIdx, Tensor blockTable, Tensor? selectNumIdx=None, "
+      "Tensor? qDequantScale=None, Tensor? kDequantScale=None, "
+      "Tensor? vDequantScale=None, Tensor? actualSeqLengths=None, "
+      "Tensor? actualSeqLengthsKv=None, str qInputLayout=\"TND\", "
+      "str kvInputLayout=\"TND\", int numKeyValueHeads=0, "
+      "float scaleValue=0.0, int blockSize=128, int topK=0, "
+      "int innerPrecise=4) -> Tensor");
   ops.def("moe_gating_top_k(Tensor x, int k, int k_group, int group_count, "
           "int group_select_mode, int renorm, int norm_type, bool out_flag, "
           "float routed_scaling_factor, float eps, Tensor? bias_opt=None) "
@@ -1250,6 +1262,8 @@ TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, ops) {
            &vllm_fl_native::chunk_gated_delta_rule_fwd_h);
   ops.impl("chunk_fwd_o", &vllm_fl_native::chunk_fwd_o);
   ops.impl("moe_gating_top_k", &vllm_fl_native::moe_gating_top_k);
+  ops.impl("npu_sparse_attention_score",
+           &vllm_fl_native::npu_sparse_attention_score);
   ops.impl("moe_gating_top_k_hash", &vllm_fl_native::moe_gating_top_k_hash);
   ops.impl("npu_dequant_swiglu_quant",
            &vllm_fl_native::npu_dequant_swiglu_quant);
@@ -1288,6 +1302,8 @@ TORCH_LIBRARY_IMPL(_C_ascend, Meta, ops) {
            &vllm_fl_native::meta::chunk_gated_delta_rule_fwd_h);
   ops.impl("chunk_fwd_o", &vllm_fl_native::meta::chunk_fwd_o);
   ops.impl("moe_gating_top_k", &vllm_fl_native::meta::moe_gating_top_k);
+  ops.impl("npu_sparse_attention_score",
+           &vllm_fl_native::meta::npu_sparse_attention_score);
   ops.impl("moe_gating_top_k_hash",
            &vllm_fl_native::meta::moe_gating_top_k_hash);
   ops.impl("npu_dequant_swiglu_quant",
