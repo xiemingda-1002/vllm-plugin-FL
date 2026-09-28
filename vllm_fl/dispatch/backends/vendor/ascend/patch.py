@@ -177,6 +177,7 @@ def patch_op_cls():
 
     from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.conv import AscendConv3dLayer
     from vllm_fl.dispatch.backends.vendor.ascend.impl.gdn import AscendGatedDeltaNetAttention
     from vllm_fl.dispatch.backends.vendor.ascend.impl.layernorm import (
         AscendGemmaRMSNorm,
@@ -198,6 +199,7 @@ def patch_op_cls():
     ensure_mla_forward_registered()
 
     for name, op_cls in {
+        "Conv3dLayer": AscendConv3dLayer,
         "MMEncoderAttention": AscendMMEncoderAttention,
         "GatedDeltaNetAttention": AscendGatedDeltaNetAttention,
         "RMSNorm": AscendRMSNorm,
