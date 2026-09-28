@@ -66,6 +66,22 @@ def test_ascend_config_imports_without_torch_or_ascend_package(monkeypatch) -> N
     assert module.get_ascend_additional_config() == {}
 
 
+@pytest.mark.parametrize("from_environment", [False, True])
+def test_minimax_m3_rejects_fused_mc2(monkeypatch, from_environment) -> None:
+    module = _load_isolated_ascend_config(monkeypatch)
+    if from_environment:
+        monkeypatch.setenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "1")
+    module.init_ascend_config(
+        types.SimpleNamespace(
+            additional_config={} if from_environment else {"enable_fused_mc2": 1},
+            model_config=types.SimpleNamespace(architectures=["MiniMaxM3SparseForCausalLM"]),
+        )
+    )
+
+    with pytest.raises(ValueError, match="MiniMax M3 does not support enable_fused_mc2=1"):
+        module.get_ascend_config()
+
+
 @pytest.mark.parametrize("additional_config", [{}, {"recompute_scheduler_enable": False}])
 def test_ascend_recompute_scheduler_defaults_to_disabled(
     monkeypatch, additional_config

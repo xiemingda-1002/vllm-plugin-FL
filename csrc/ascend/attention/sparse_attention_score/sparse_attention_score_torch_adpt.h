@@ -32,6 +32,8 @@ constexpr int64_t SELECT_IDX_DIM_NUM = 3;
 constexpr int64_t SELECT_NUM_IDX_DIM_NUM = 2;
 constexpr int64_t BLOCK_TABLE_DIM_NUM = 2;
 constexpr int64_t DEQUANT_SCALE_DIM_NUM = 4;
+constexpr int64_t MIN_TOP_K = 1;
+constexpr int64_t MAX_TOP_K = 16;
 
 void CheckFp8Tensor(const at::Tensor &tensor, const char *name)
 {
@@ -82,9 +84,15 @@ void CheckParams(const at::Tensor &query, const at::Tensor &key, const at::Tenso
         CheckDequantScaleTensor(qDequantScale.value(), "q_dequant_scale");
         CheckDequantScaleTensor(kDequantScale.value(), "k_dequant_scale");
         CheckDequantScaleTensor(vDequantScale.value(), "v_dequant_scale");
+        TORCH_CHECK(selectNumIdx.has_value() && selectNumIdx.value().defined(),
+                    "select_num_idx must be provided for float8_e4m3fn input.");
         TORCH_CHECK(innerPrecise == 4,
                     "inner_precise must be 4 (LOW_HIGH_MIXED) for float8_e4m3fn, got ", innerPrecise);
     }
+    TORCH_CHECK(query.scalar_type() == key.scalar_type() && query.scalar_type() == value.scalar_type(),
+                "query, key, and value must have the same dtype.");
+    TORCH_CHECK(query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16 || isFp8,
+                "query/key/value dtype must be float16, bfloat16, or float8_e4m3fn.");
     CheckTndTensor(query, "query");
     CheckBlockedKvTensor(key, "key");
     CheckBlockedKvTensor(value, "value");
@@ -109,14 +117,21 @@ void CheckParams(const at::Tensor &query, const at::Tensor &key, const at::Tenso
     TORCH_CHECK(query.size(DIM_D) == key.size(DIM_KV_HEAD_SIZE) &&
                     query.size(DIM_D) == value.size(DIM_KV_HEAD_SIZE),
                 "query/key/value D dim must be equal.");
-    TORCH_CHECK(blockSize > 0, "block_size must be positive.");
-    TORCH_CHECK(topK > 0, "top_k must be positive.");
+    TORCH_CHECK(query.size(DIM_D) == 128, "npu_sparse_attention_score only supports head_dim=128.");
+    TORCH_CHECK(blockSize == 128, "npu_sparse_attention_score only supports block_size=128.");
+    TORCH_CHECK(topK >= MIN_TOP_K && topK <= MAX_TOP_K,
+                "top_k must be in [", MIN_TOP_K, ", ", MAX_TOP_K, "], but got ", topK, ".");
+    TORCH_CHECK(selectIdx.size(DIM_D) == topK,
+                "select_idx dim2 must equal top_k, but got ", selectIdx.size(DIM_D), " and ", topK, ".");
 
     if (selectNumIdx.has_value() && selectNumIdx.value().defined()) {
         const at::Tensor &snIdx = selectNumIdx.value();
         TORCH_CHECK(snIdx.dim() == SELECT_NUM_IDX_DIM_NUM,
                     "select_num_idx must be [KVHead, maxQSeqlen].");
         TORCH_CHECK(snIdx.scalar_type() == at::kInt, "select_num_idx dtype must be int32.");
+        TORCH_CHECK(snIdx.size(DIM_T) == selectIdx.size(DIM_T) &&
+                        snIdx.size(DIM_N) == selectIdx.size(DIM_N),
+                    "select_num_idx dimensions must equal select_idx dimensions 0 and 1.");
     }
 
     TORCH_CHECK(actualSeqLengths.has_value() && actualSeqLengths.value().defined(),

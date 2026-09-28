@@ -250,6 +250,18 @@ def get_ascend_config():
             "additional_config.enable_fused_mc2 must be 0 or 1, "
             f"got {enable_fused_mc2!r}"
         )
+    if enable_fused_mc2 == 1 and any(
+        architecture.startswith("MiniMaxM3")
+        for architecture in (
+            getattr(getattr(vllm_config, "model_config", None), "architectures", None)
+            or ()
+        )
+    ):
+        raise ValueError(
+            "MiniMax M3 does not support enable_fused_mc2=1. Please set "
+            "additional_config.enable_fused_mc2 to 0 or unset "
+            "VLLM_ASCEND_ENABLE_FUSED_MC2."
+        )
     _reject_unsupported(
         bool(extra.get("mix_placement", False)), "mixed shared-expert placement"
     )

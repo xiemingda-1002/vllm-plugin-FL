@@ -45,6 +45,11 @@ constexpr int BLOCKED_KV_DIM_D = 3;
 constexpr int SELECT_IDX_DIM_KV_HEAD = 0;
 constexpr int SELECT_IDX_DIM_SEQ = 1;
 constexpr int SELECT_IDX_DIM_TOPK = 2;
+constexpr int SELECT_IDX_DIM_NUM = 3;
+
+constexpr int SELECT_NUM_IDX_DIM_KV_HEAD = 0;
+constexpr int SELECT_NUM_IDX_DIM_SEQ = 1;
+constexpr int SELECT_NUM_IDX_DIM_NUM = 2;
 
 constexpr int BLOCK_TABLE_DIM_BATCH = 0;
 constexpr int BLOCK_TABLE_DIM_MAX_BLOCKS = 1;
@@ -56,6 +61,8 @@ constexpr int ATTR_TOP_K_INDEX = 3;
 constexpr int ATTR_INNER_PRECISE_INDEX = 4;
 
 constexpr uint32_t SOC_VER_950_CODE = 4;
+constexpr int64_t MIN_TOP_K = 1;
+constexpr int64_t MAX_TOP_K = 16;
 
 namespace optiling {
 
@@ -103,6 +110,10 @@ ge::graphStatus SASATiling::ParseAttrs(gert::TilingContext *context)
 
     const int64_t *topKPtr = attrs->GetInt(ATTR_TOP_K_INDEX);
     if (topKPtr != nullptr) {
+        OP_CHECK_IF(*topKPtr < MIN_TOP_K || *topKPtr > MAX_TOP_K,
+            OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+            "topK must be in [%ld, %ld], but got %ld.", MIN_TOP_K, MAX_TOP_K, *topKPtr),
+            return ge::GRAPH_FAILED);
         topK_ = static_cast<uint32_t>(*topKPtr);
     }
 
@@ -124,6 +135,11 @@ ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
     numHeads_ = static_cast<uint32_t>(queryShape->GetStorageShape().GetDim(TND_DIM_N));
     embeddingSize_ = static_cast<uint32_t>(queryShape->GetStorageShape().GetDim(TND_DIM_D));
 
+    auto queryDesc = context->GetInputDesc(QUERY_INDEX);
+    if (queryDesc != nullptr) {
+        dataType_ = queryDesc->GetDataType();
+    }
+
     const gert::StorageShape *keyShape = context->GetInputShape(KEY_INDEX);
     OP_CHECK_IF(keyShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
         "Key shape is nullptr."), return ge::GRAPH_FAILED);
@@ -142,14 +158,39 @@ ge::graphStatus SASATiling::ParseInputTensors(gert::TilingContext *context)
     const gert::StorageShape *selectIdxShape = context->GetInputShape(SELECT_IDX_INDEX);
     OP_CHECK_IF(selectIdxShape == nullptr, OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
         "SelectIdx shape is nullptr."), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(selectIdxShape->GetStorageShape().GetDimNum() != SELECT_IDX_DIM_NUM,
+        OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+        "SelectIdx must be 3D [KVHead, maxQSeqlen, TopK], but got %zu dimensions.",
+        selectIdxShape->GetStorageShape().GetDimNum()), return ge::GRAPH_FAILED);
+
+    const int64_t selectIdxTopK = selectIdxShape->GetStorageShape().GetDim(SELECT_IDX_DIM_TOPK);
+    OP_CHECK_IF(selectIdxTopK < MIN_TOP_K || selectIdxTopK > MAX_TOP_K,
+        OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+        "SelectIdx dim2 (TopK) must be in [%ld, %ld], but got %ld.",
+        MIN_TOP_K, MAX_TOP_K, selectIdxTopK), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(static_cast<int64_t>(topK_) != selectIdxTopK,
+        OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+        "topK attribute (%u) must equal SelectIdx dim2 (%ld).", topK_, selectIdxTopK),
+        return ge::GRAPH_FAILED);
 
     kvHeads_ = static_cast<uint32_t>(selectIdxShape->GetStorageShape().GetDim(SELECT_IDX_DIM_KV_HEAD));
     maxQSeqlen_ = static_cast<uint32_t>(selectIdxShape->GetStorageShape().GetDim(SELECT_IDX_DIM_SEQ));
-    topK_ = static_cast<uint32_t>(selectIdxShape->GetStorageShape().GetDim(SELECT_IDX_DIM_TOPK));
 
-    auto queryDesc = context->GetInputDesc(QUERY_INDEX);
-    if (queryDesc != nullptr) {
-        dataType_ = queryDesc->GetDataType();
+    const gert::StorageShape *selectNumIdxShape = context->GetInputShape(SELECT_NUM_IDX_INDEX);
+    OP_CHECK_IF(dataType_ == ge::DT_FLOAT8_E4M3FN && selectNumIdxShape == nullptr,
+        OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+        "SelectNumIdx must be provided for float8_e4m3fn input."), return ge::GRAPH_FAILED);
+    if (selectNumIdxShape != nullptr) {
+        OP_CHECK_IF(selectNumIdxShape->GetStorageShape().GetDimNum() != SELECT_NUM_IDX_DIM_NUM,
+            OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+            "SelectNumIdx must be 2D [KVHead, maxQSeqlen], but got %zu dimensions.",
+            selectNumIdxShape->GetStorageShape().GetDimNum()), return ge::GRAPH_FAILED);
+        OP_CHECK_IF(selectNumIdxShape->GetStorageShape().GetDim(SELECT_NUM_IDX_DIM_KV_HEAD) !=
+                        selectIdxShape->GetStorageShape().GetDim(SELECT_IDX_DIM_KV_HEAD) ||
+                        selectNumIdxShape->GetStorageShape().GetDim(SELECT_NUM_IDX_DIM_SEQ) !=
+                        selectIdxShape->GetStorageShape().GetDim(SELECT_IDX_DIM_SEQ),
+            OPS_REPORT_VECTOR_INNER_ERR("SparseAttentionScore",
+            "SelectNumIdx dimensions must equal SelectIdx dimensions 0 and 1."), return ge::GRAPH_FAILED);
     }
 
     if (scaleValue_ < 1e-9f && scaleValue_ > -1e-9f && embeddingSize_ > 0) {

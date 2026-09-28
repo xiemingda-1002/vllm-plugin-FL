@@ -49,7 +49,10 @@ def test_a2_qwen_dp2_tp2_ep4_uses_allgather(monkeypatch) -> None:
 
 
 def test_a2_mc2_threshold_matches_rc1(monkeypatch) -> None:
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.moe import moe_comm_method
+
     monkeypatch.setattr(afc, "_mc2_tokens_capacity", 128)
+    monkeypatch.setattr(moe_comm_method, "is_moe_comm_method_available", lambda _: True)
     config = _config(ep_size=16, num_experts=128)
 
     assert afc.select_moe_comm_method(128, config) is afc.MoECommType.MC2

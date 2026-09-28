@@ -233,7 +233,10 @@ def test_qwen_moe_factory_is_patched_before_qwen_module_import() -> None:
     assert factory_line < ascend_line
 
     source = _text("vllm_fl/ops/custom_ops.py")
-    assert 'name.startswith("vllm.model_executor.models.")' in source
+    # MiniMax-M3 also imports FusedMoE under vllm.models.*; repair only aliases
+    # still bound to the captured upstream factory across both model layouts.
+    assert 'name.startswith("vllm.")' in source
+    assert 'qwen_module.__dict__.get("FusedMoE") is _OrigFusedMoE' in source
     assert "qwen_module = sys.modules.get(module_name)" in source
     assert "qwen_module.FusedMoE = FusedMoEFL" in source
 
