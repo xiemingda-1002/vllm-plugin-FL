@@ -17,6 +17,7 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 from vllm.v1.sample.sampler import Sampler
 
@@ -147,6 +148,40 @@ class AscendSampler(Sampler):
             use_fp64_gumbel=use_fp64_gumbel,
         )
         self.async_exponential_event = torch.npu.Event()
+
+    @staticmethod
+    def apply_penalties(
+        logits: torch.Tensor,
+        sampling_metadata: Any,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        """Apply the rc1 Triton penalties, or retain the upstream fallback.
+
+        The Triton path is deliberately selected here rather than at module
+        import time: non-Ascend workers continue to use :class:`Sampler`, and
+        Ascend installations without Triton retain upstream semantics.
+        """
+        if not HAS_TRITON:
+            logger.warning_once(
+                "[sample/sampler] Triton not available; falling back to "
+                "vLLM's penalty implementation."
+            )
+            return Sampler.apply_penalties(
+                logits, sampling_metadata, output_token_ids
+            )
+        if sampling_metadata.no_penalties:
+            return logits
+        assert sampling_metadata.prompt_token_ids is not None
+        from vllm_fl.sample.penalties import apply_all_penalties
+
+        return apply_all_penalties(
+            logits,
+            sampling_metadata.prompt_token_ids,
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+            output_token_ids,
+        )
 
     def do_async_exponential(
         self,

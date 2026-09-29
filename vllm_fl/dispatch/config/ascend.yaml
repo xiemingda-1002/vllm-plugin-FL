@@ -77,6 +77,8 @@ flagos_blacklist:
   - fill_scalar_
   - sum_dim
   - exponential_
+  # Native exponential_ also calls log_; FlagGems 5.3.4 can produce NaN noise.
+  - log_
   - mm
   - resolve_neg
   - resolve_conj
