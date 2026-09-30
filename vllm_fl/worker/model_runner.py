@@ -61,6 +61,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -121,6 +122,7 @@ def _accelerator_synchronize() -> None:
         torch_musa.synchronize()
     else:
         torch.accelerator.synchronize()
+
 
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
@@ -277,6 +279,33 @@ _MUSA_MAX_LIVE_GRAPHS = 2000
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def reduce_sample_processors_are_inactive(processors: Any) -> bool:
+    """Allow only known vLLM builtin processors in their no-op state.
+
+    Do not use structural/``hasattr`` matching: a custom processor can expose
+    the same field names while indexing global vocabulary columns.
+    """
+    from vllm.v1.sample.logits_processor.builtin import (
+        LogitBiasLogitsProcessor,
+        MinPLogitsProcessor,
+        MinTokensLogitsProcessor,
+    )
+
+    for processor in getattr(processors, "all", ()):
+        if type(processor) is MinPLogitsProcessor:
+            if processor.min_p_count:
+                return False
+        elif type(processor) is LogitBiasLogitsProcessor:
+            if processor.biases:
+                return False
+        elif type(processor) is MinTokensLogitsProcessor:
+            if processor.min_toks:
+                return False
+        else:
+            return False
+    return True
 
 
 def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
@@ -639,14 +668,22 @@ class ModelRunnerFL(GPUModelRunner):
         # Sampler. Keep the vendor import lazy so non-Ascend installations
         # retain the upstream sampler and do not import torch-npu.
         sampler_cls = Sampler
+        sampler_kwargs: dict[str, Any] = {
+            "logprobs_mode": self.model_config.logprobs_mode,
+            "use_fp64_gumbel": self.model_config.use_fp64_gumbel,
+        }
         if current_platform.device_type == "npu":
             from vllm_fl.sample.sampler import AscendSampler
 
             sampler_cls = AscendSampler
-        self.sampler = sampler_cls(
-            logprobs_mode=self.model_config.logprobs_mode,
-            use_fp64_gumbel=self.model_config.use_fp64_gumbel,
-        )
+            additional_config = self.vllm_config.additional_config or {}
+            sampler_kwargs["enable_async_exponential"] = bool(
+                additional_config.get("enable_async_exponential", False)
+            )
+            sampler_kwargs["enable_reduce_sample"] = bool(
+                additional_config.get("enable_reduce_sample", False)
+            )
+        self.sampler = sampler_cls(**sampler_kwargs)
         self.need_accepted_tokens = False
         self.sampling_done_event: Any | None = None
 
@@ -4102,6 +4139,7 @@ class ModelRunnerFL(GPUModelRunner):
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
+            logits = self._prepare_ascend_reduce_sample(logits, sampling_metadata)
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -4121,6 +4159,72 @@ class ModelRunnerFL(GPUModelRunner):
             sampling_metadata,
         )
         return sampler_output
+
+    def _prepare_ascend_reduce_sample(self, logits, sampling_metadata):
+        """Choose candidate sampling only for a safe, finite-top-k batch.
+
+        The logits processor leaves TP shards local once the vendor flag is
+        set.  Requests asking upstream to index the full vocabulary must first
+        restore full logits; this is intentionally a *per-call* decision and
+        does not change the worker configuration.
+        """
+        if current_platform.device_type != "npu" or not hasattr(
+            self.sampler, "prepare_sampling"
+        ):
+            return logits
+        configured = bool(getattr(self.sampler, "enable_reduce_sample", False))
+        if not configured or logits is None:
+            return logits
+        tp_group = get_tp_group()
+        local_vocab = logits.shape[-1]
+        processors = getattr(sampling_metadata, "logitsprocs", None)
+        has_processors = not reduce_sample_processors_are_inactive(processors)
+        full_vocab_required = (
+            sampling_metadata.max_num_logprobs is not None
+            or bool(sampling_metadata.logprob_token_ids)
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or bool(sampling_metadata.bad_words_token_ids)
+            or (not sampling_metadata.no_penalties and not HAS_TRITON)
+            or (
+                getattr(sampling_metadata, "thinking_budget_state_holder", None)
+                is not None
+                and sampling_metadata.thinking_budget_state_holder.has_tracked_requests()
+            )
+            or has_processors
+            or envs.VLLM_BATCH_INVARIANT
+            or local_vocab * tp_group.world_size != self.input_batch.vocab_size
+        )
+        all_greedy = bool(sampling_metadata.all_greedy)
+        max_top_k: int | None = None
+        if not all_greedy:
+            top_k_cpu = self.input_batch.top_k_cpu[: self.input_batch.num_reqs]
+            eligible = top_k_cpu[(top_k_cpu > 0) & (top_k_cpu < local_vocab)]
+            # top-p-only or any full-vocab row needs all local logits; gather
+            # before the upstream sampler rather than returning candidate IDs.
+            if eligible.size == 0 or eligible.size != top_k_cpu.size:
+                full_vocab_required = True
+            else:
+                max_top_k = int(eligible.max())
+        effective = not full_vocab_required
+        if not effective:
+            logits = self._restore_full_ascend_logits(logits)
+        self.sampler.prepare_sampling(max_top_k, enabled=effective)
+        return logits
+
+    def _restore_full_ascend_logits(self, logits):
+        if logits is None:
+            return logits
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return logits
+        local_vocab = logits.shape[-1]
+        if local_vocab * tp_group.world_size == self.input_batch.vocab_size:
+            return tp_group.all_gather(logits, dim=-1)
+        # The logits processor already gathered unsupported/non-uniform
+        # layouts.  A different width here is not a valid shard contract.
+        if local_vocab == self.input_batch.vocab_size:
+            return logits
+        raise RuntimeError("reduce-sample cannot restore a non-uniform TP vocabulary")
 
     def _bookkeeping_sync(
         self,
@@ -5032,9 +5136,7 @@ class ModelRunnerFL(GPUModelRunner):
             self.calculate_kv_scales = False
 
         if current_platform.device_type == "npu":
-            from vllm_fl.sample.sampler import async_exponential_enabled
-
-            if async_exponential_enabled():
+            if self.sampler.enable_async_exponential:
                 self.sampler.do_async_exponential(
                     batch_size=logits_indices.shape[0],
                     vocab_size=self.model_config.get_vocab_size(),
@@ -6314,6 +6416,14 @@ class ModelRunnerFL(GPUModelRunner):
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
+            # Prompt logprobs gather arbitrary global target IDs and ranks.
+            # This bypasses _sample, so restore local reduce-sample shards
+            # explicitly before calling the upstream full-vocab helpers.
+            if (
+                current_platform.device_type == "npu"
+                and bool(getattr(self.sampler, "enable_reduce_sample", False))
+            ):
+                logits = self._restore_full_ascend_logits(logits)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want

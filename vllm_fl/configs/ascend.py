@@ -124,6 +124,21 @@ def get_ascend_config():
     """Return the rc1 MoE config view and fail closed for unmigrated opt-ins."""
     vllm_config = _current_vllm_config_or_none()
     extra = _additional_config()
+    enable_reduce_sample = bool(extra.get("enable_reduce_sample", False))
+    # This migration covers only ordinary, non-LoRA sampling.  Validate at
+    # the Ascend configuration boundary, before the logits processor can keep
+    # vocabulary shards local.  Default-off leaves existing paths unchanged.
+    if (
+        enable_reduce_sample
+        and getattr(vllm_config, "speculative_config", None) is not None
+    ):
+        raise NotImplementedError(
+            "FL Ascend reduce-sample does not support speculative decoding"
+        )
+    if enable_reduce_sample and getattr(vllm_config, "lora_config", None) is not None:
+        raise NotImplementedError(
+            "FL Ascend reduce-sample does not support LoRA"
+        )
     # rc1 ignores this shared option on PD producers, rejects it outside
     # disaggregated PD, and activates a special scheduler on PD consumers.
     # FL has not migrated that consumer-side scheduler/KV chain.
@@ -336,6 +351,9 @@ def get_ascend_config():
         return enable_sparse_c8
 
     return SimpleNamespace(
+        # Reduce-sample is a vendor-only, experimental TP optimization.  Keep
+        # it opt-in: a normal vLLM configuration must retain full-vocab logits.
+        enable_reduce_sample=enable_reduce_sample,
         enable_balance_scheduling=balance_scheduling_enabled(vllm_config),
         enable_sparse_c8=enable_sparse_c8,
         c8_enable_reshape_optim=False,

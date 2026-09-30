@@ -197,6 +197,7 @@ def patch_op_cls():
         ensure_mla_forward_registered,
     )
     from vllm_fl.dispatch.backends.vendor.ascend.impl.vocab_parallel_embedding import (
+        AscendLogitsProcessor,
         AscendParallelLMHead,
         AscendVocabParallelEmbedding,
     )
@@ -216,6 +217,7 @@ def patch_op_cls():
     for name, layer_cls in {
         "VocabParallelEmbedding": AscendVocabParallelEmbedding,
         "ParallelLMHead": AscendParallelLMHead,
+        "LogitsProcessor": AscendLogitsProcessor,
         # SFA uses the rc1 boundary; dense MLA delegates to its existing
         # upstream wrapper. DeepSeek-V4 DSA has a separate execution chain.
         "MultiHeadLatentAttentionWrapper": AscendMultiHeadLatentAttention,

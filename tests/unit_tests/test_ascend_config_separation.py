@@ -138,6 +138,48 @@ def test_ascend_recompute_scheduler_invalid_role_matches_rc1(
         module.get_ascend_config()
 
 
+@pytest.mark.parametrize("unsupported", ["speculative_config", "lora_config"])
+def test_reduce_sample_rejects_untested_speculative_and_lora_opt_ins(
+    monkeypatch, unsupported
+) -> None:
+    module = _load_isolated_ascend_config(monkeypatch)
+    owner = types.SimpleNamespace(
+        additional_config={"enable_reduce_sample": True},
+        model_config=types.SimpleNamespace(),
+        speculative_config=None,
+        lora_config=None,
+    )
+    setattr(owner, unsupported, object())
+    module.init_ascend_config(owner)
+
+    with pytest.raises(NotImplementedError, match="reduce-sample does not support"):
+        module.get_ascend_config()
+
+
+def test_reduce_sample_default_off_preserves_speculative_and_lora_configs(
+    monkeypatch,
+) -> None:
+    module = _load_isolated_ascend_config(monkeypatch)
+    module.init_ascend_config(
+        types.SimpleNamespace(
+            additional_config={}, model_config=types.SimpleNamespace(),
+            speculative_config=object(), lora_config=object(),
+        )
+    )
+    assert module.get_ascend_config().enable_reduce_sample is False
+
+
+def test_reduce_sample_ordinary_opt_in_is_accepted(monkeypatch) -> None:
+    module = _load_isolated_ascend_config(monkeypatch)
+    module.init_ascend_config(
+        types.SimpleNamespace(
+            additional_config={"enable_reduce_sample": True},
+            model_config=types.SimpleNamespace(),
+        )
+    )
+    assert module.get_ascend_config().enable_reduce_sample is True
+
+
 def test_moe_compat_caches_shared_expert_stream_with_a_stub(monkeypatch) -> None:
     """The stream is MoE execution state, not configuration state."""
     source = (

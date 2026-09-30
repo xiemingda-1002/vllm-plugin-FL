@@ -58,11 +58,12 @@ def apply_penalties_triton(
     logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
     output_tokens_tensor: torch.Tensor, presence_penalties: torch.Tensor,
     frequency_penalties: torch.Tensor, repetition_penalties: torch.Tensor,
+    tp_rank: int = 0,
 ) -> torch.Tensor:
     """Apply penalties to logits in place. Same interface as vLLM."""
     num_seqs, vocab_size = logits.shape
-    _, prompt_mask = get_token_bin_counts_and_mask_triton(prompt_tokens_tensor, vocab_size, num_seqs)
-    output_bin_counts, output_mask = get_token_bin_counts_and_mask_triton(output_tokens_tensor, vocab_size, num_seqs)
+    _, prompt_mask = get_token_bin_counts_and_mask_triton(prompt_tokens_tensor, vocab_size, num_seqs, tp_rank)
+    output_bin_counts, output_mask = get_token_bin_counts_and_mask_triton(output_tokens_tensor, vocab_size, num_seqs, tp_rank)
     _apply_all_penalties_triton(logits, prompt_mask, output_mask, output_bin_counts,
                                 repetition_penalties, frequency_penalties, presence_penalties)
     return logits

@@ -63,7 +63,10 @@ def _compiled_sampler_apply_penalties(has_triton: bool):
         "Sampler": SimpleNamespace(apply_penalties=upstream),
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(SAMPLER), "exec"), namespace)
-    return namespace["apply_penalties"], fallback
+    sampler = SimpleNamespace(
+        topk_topp_sampler=SimpleNamespace(enable_reduce_sample=False)
+    )
+    return lambda *args: namespace["apply_penalties"](sampler, *args), fallback
 
 
 def test_penalty_override_executes_no_penalty_identity_and_no_triton_fallback() -> None:
@@ -107,10 +110,10 @@ def test_penalty_wrapper_converts_minus_one_sentinels_for_empty_outputs() -> Non
 def test_penalty_contract_preserves_padding_and_full_vocab_bincount() -> None:
     converter = _function_source(PENALTIES, "apply_all_penalties")
     bincount = BINCOUNT.read_text()
-    assert "output_tokens_t == -1, vocab_size" in converter
+    assert "output_tokens_t == -1, padding_token_id" in converter
     assert "pad=vocab_size" in PENALTIES.read_text()
     assert "tp_rank" in bincount
-    assert "        0," in bincount  # FL has no rc1 reduce-sample mode.
+    assert "tp_rank is None" in bincount
     assert "get_vectorcore_num()" in bincount
     assert "ascend.impl.triton_utils" in bincount + KERNEL.read_text()
     assert "vllm_ascend" not in (PENALTIES.read_text() + bincount + KERNEL.read_text())

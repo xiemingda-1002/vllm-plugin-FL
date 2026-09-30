@@ -35,7 +35,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     pad_vocab_size,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.utils import set_weight_attrs
+from vllm_fl.configs.ascend import get_ascend_config
 
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
@@ -219,3 +221,32 @@ class AscendParallelLMHead(ParallelLMHead):
             })
         else:
             self.register_parameter("bias", None)
+
+
+class AscendLogitsProcessor(LogitsProcessor):
+    """Keep equal, unpadded LM-head TP shards local for reduce-sample.
+
+    Unequal shards (including an original-vocab padding tail) deliberately use
+    the upstream gather.  Candidate offsets are only correct for uniform
+    partitions, so silently treating padding as vocabulary is unsafe.
+    """
+
+    def _get_logits(self, hidden_states, lm_head, embedding_bias=None):
+        logits = lm_head.quant_method.apply(lm_head, hidden_states,
+                                            bias=embedding_bias)
+        reduce_sample = get_ascend_config().enable_reduce_sample
+        uniform = (
+            getattr(lm_head, "tp_size", 1) <= 1
+            or (getattr(lm_head, "num_org_embeddings_per_partition", 0)
+                * lm_head.tp_size == self.org_vocab_size)
+        )
+        # Added LoRA vocabulary and special LM-head layouts have a different
+        # global-ID mapping; retain upstream gather until they are sharded.
+        uniform = uniform and getattr(lm_head, "num_embeddings", self.org_vocab_size) == self.org_vocab_size
+        if not reduce_sample or not uniform:
+            logits = self._gather_logits(logits)
+            if logits is not None:
+                return logits[..., :self.org_vocab_size]
+            return logits
+        # There is no padding in a uniform shard by construction.
+        return logits[..., :lm_head.num_org_embeddings_per_partition]

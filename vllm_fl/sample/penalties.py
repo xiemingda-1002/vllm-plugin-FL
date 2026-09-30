@@ -32,13 +32,21 @@ def apply_all_penalties(
     frequency_penalties: torch.Tensor,
     repetition_penalties: torch.Tensor,
     output_token_ids: list[list[int]],
+    reduce_sample: bool = False,
 ) -> torch.Tensor:
     """Apply penalties to logits via Triton-Ascend."""
     _, vocab_size = logits.shape
-    output_tokens_t = _convert_to_tensors(
-        output_token_ids, vocab_size, logits.device
-    )
-    output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)
+    tp_rank = 0
+    padding_token_id = vocab_size
+    if reduce_sample:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_rank = get_tp_group().rank_in_group
+        # A local ``vocab_size`` is a valid global token on higher shards.
+        # Use this shard's exclusive global end as the padding sentinel.
+        padding_token_id = (tp_rank + 1) * vocab_size
+    output_tokens_t = _convert_to_tensors(output_token_ids, padding_token_id, logits.device)
+    output_tokens_t.masked_fill_(output_tokens_t == -1, padding_token_id)
     return apply_penalties_triton(
         logits,
         prompt_token_ids,
@@ -46,4 +54,5 @@ def apply_all_penalties(
         presence_penalties,
         frequency_penalties,
         repetition_penalties,
+        tp_rank,
     )

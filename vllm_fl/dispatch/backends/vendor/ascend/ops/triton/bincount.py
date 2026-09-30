@@ -58,14 +58,10 @@ def token_bin_counts_and_mask_kernel(
 
 
 def get_token_bin_counts_and_mask_triton(
-    tokens: torch.Tensor, vocab_size: int, num_seqs: int | None = None
+    tokens: torch.Tensor, vocab_size: int, num_seqs: int | None = None,
+    tp_rank: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return int32 counts and a presence mask for full-vocabulary logits.
-
-    FL's current sampler does not expose rc1 reduce-sample/sharded-vocabulary
-    mode, therefore ``tp_rank`` remains zero (the established full-vocab
-    contract) while the kernel retains the generic parameter.
-    """
+    """Return local-vocabulary counts, offset by active TP rank if sharded."""
     n_rows, n_cols = tokens.shape
     if num_seqs is not None and num_seqs > 0:
         assert n_rows == num_seqs, (
@@ -82,6 +78,10 @@ def get_token_bin_counts_and_mask_triton(
         tokens = tokens.contiguous()
     seq_block = 256
     total_blocks = n_rows * triton.cdiv(n_cols, seq_block)
+    # Callers that operate on a full vocabulary retain rank zero by default.
+    # The reduce-sample penalty wrapper passes its per-call active TP rank.
+    if tp_rank is None:
+        tp_rank = 0
     token_bin_counts_and_mask_kernel[(min(get_vectorcore_num(), total_blocks),)](
         tokens,
         tokens.stride(0),
@@ -90,7 +90,7 @@ def get_token_bin_counts_and_mask_triton(
         n_cols,
         vocab_size,
         bin_counts,
-        0,
+        tp_rank,
         bin_counts.stride(0),
         bin_counts.stride(1),
         total_blocks,

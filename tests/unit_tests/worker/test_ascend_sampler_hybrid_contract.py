@@ -36,7 +36,9 @@ def test_sampler_is_injected_only_for_ascend() -> None:
     )
     constructor = init.index("self.sampler = sampler_cls")
     assert upstream_default < ascend_guard < ascend_import < constructor
-    assert "use_fp64_gumbel=self.model_config.use_fp64_gumbel" in init
+    assert '"use_fp64_gumbel": self.model_config.use_fp64_gumbel' in init
+    assert 'additional_config = self.vllm_config.additional_config or {}' in init
+    assert 'sampler_kwargs["enable_async_exponential"]' in init
 
 
 def test_sampler_module_keeps_torch_npu_import_lazy() -> None:
@@ -81,7 +83,7 @@ def test_async_exponential_is_launched_before_model_forward() -> None:
     launch = execute.index("self.sampler.do_async_exponential")
     forward_marker = execute.index("# Run the model.")
     assert launch < forward_marker
-    assert "async_exponential_enabled()" in execute
+    assert "self.sampler.enable_async_exponential" in execute
     assert "self.input_batch.sampling_metadata.generators" in execute
 
 
@@ -123,3 +125,56 @@ def test_batch_invariant_mode_retains_upstream_sampling() -> None:
     )
     assert "if envs.VLLM_BATCH_INVARIANT:" in forward
     assert "return super().forward_native(logits, generators, k, p)" in forward
+
+
+def test_async_exponential_config_survives_current_config_context_exit() -> None:
+    """The sampler owns the initialized flag; runtime code does not re-read context."""
+    assert "get_current_vllm_config" not in SAMPLER_SOURCE
+
+    enabled = next(
+        node
+        for node in SAMPLER_TREE.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "async_exponential_enabled"
+    )
+    namespace = {"envs": type("Envs", (), {"VLLM_BATCH_INVARIANT": False})}
+    exec(compile(ast.Module(body=[enabled], type_ignores=[]), str(SAMPLER_PATH), "exec"), namespace)
+
+    config = {"enable_async_exponential": True}
+    # ModelRunner reads this at initialization. There is intentionally no
+    # current-vLLM-config context when producer or consumer later runs.
+    initialized = namespace["async_exponential_enabled"](
+        config["enable_async_exponential"]
+    )
+    assert initialized
+    consumer = next(
+        node
+        for node in SAMPLER_TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendTopKTopPSampler"
+    )
+    consumer_forward = next(
+        node
+        for node in consumer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "forward_native"
+    )
+    assert "self.enable_async_exponential" in ast.unparse(consumer_forward)
+
+
+def test_async_exponential_defaults_false_and_batch_invariant_disables() -> None:
+    enabled = next(
+        node
+        for node in SAMPLER_TREE.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "async_exponential_enabled"
+    )
+    namespace = {"envs": type("Envs", (), {"VLLM_BATCH_INVARIANT": False})}
+    exec(compile(ast.Module(body=[enabled], type_ignores=[]), str(SAMPLER_PATH), "exec"), namespace)
+    gate = namespace["async_exponential_enabled"]
+    assert not gate()
+    namespace["envs"].VLLM_BATCH_INVARIANT = True
+    assert not gate(True)
+
+    topk_init = _method_source(
+        SAMPLER_TREE, SAMPLER_SOURCE, "AscendTopKTopPSampler", "__init__"
+    )
+    assert "self.enable_async_exponential = False" in topk_init
