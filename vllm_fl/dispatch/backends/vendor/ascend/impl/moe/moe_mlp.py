@@ -34,6 +34,9 @@ from .compat import (
     dispose_tensor,
     enable_custom_op,
 )
+from .grouped_matmul_swiglu_quant_weight_nz_tensor_list import grouped_matmul_swiglu_quant_weight_nz_tensor_list
+from .dequant_swiglu_quant import dequant_swiglu_quant
+from .grouped_matmul_swiglu_quant_v2 import grouped_matmul_swiglu_quant_v2
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation=None):
@@ -172,7 +175,7 @@ def quant_apply_mlp(
     if w1_scale_bias is None and w1_offset is None and is_mc2 and not is_gelu_activation:
         if _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation) and not use_mxfp_quant:
             # gmm1: gate_up_proj & act_fn: swiglu
-            hidden_states, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz_tensor_list(
+            hidden_states, swiglu_out_scale, _ = grouped_matmul_swiglu_quant_weight_nz_tensor_list(
                 x=hidden_states,
                 weight=w1,
                 weight_scale=w1_scale,
@@ -258,7 +261,7 @@ def quant_apply_mlp(
                         "glu_bias": swiglu_beta,
                     }
                 )
-            hidden_states, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(**dequant_swiglu_kwargs)
+            hidden_states, swiglu_out_scale = dequant_swiglu_quant(**dequant_swiglu_kwargs)
         before_gmm2_evt = torch.npu.current_stream().record_event()
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
@@ -340,7 +343,7 @@ def quant_apply_mlp(
             and not is_gelu_activation
             and not is_swigluoai_uninterleave
         ):
-            hidden_states, swiglu_out_scale = torch.ops._C_ascend.grouped_matmul_swiglu_quant_v2(
+            hidden_states, swiglu_out_scale = grouped_matmul_swiglu_quant_v2(
                 x=hidden_states,
                 weight=w1,
                 weight_scale=w1_scale if isinstance(w1_scale, list) else [w1_scale],
@@ -357,7 +360,7 @@ def quant_apply_mlp(
             and not is_gelu_activation
         ):
             # gmm1: gate_up_proj & act_fn: swiglu
-            hidden_states, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz_tensor_list(
+            hidden_states, swiglu_out_scale, _ = grouped_matmul_swiglu_quant_weight_nz_tensor_list(
                 x=hidden_states,
                 weight=w1,
                 weight_scale=w1_scale,

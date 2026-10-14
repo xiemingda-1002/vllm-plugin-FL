@@ -41,7 +41,7 @@ Composed from our own operators (torch_npu fused + CANN), not FlagGems:
   Qwen on this platform);
 * RoPE -> ``torch.ops.npu.npu_rotary_mul`` in ``"half"`` (NeoX) mode, applied
   to the leading ``rotary_dim`` lanes only;
-* cache insertion -> ``torch.ops._C_ascend.npu_scatter_nd_update_v2``, which is
+* cache insertion -> ``scatter_nd_update_v2``, which is
   this repository's own CANN operator.
 
 .. warning::
@@ -54,6 +54,7 @@ Composed from our own operators (torch_npu fused + CANN), not FlagGems:
 from __future__ import annotations
 
 import torch
+from .scatter_nd_update_v2 import scatter_nd_update_v2
 
 
 def _gemma_rms_norm_last_dim(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -161,8 +162,8 @@ def _insert_kv(
     # [N, K] where K is the coordinate rank. Passing a 1-D tensor of N slots
     # would be read as a *single* N-dimensional coordinate (verified on
     # hardware), so the row id must be given as [N, 1].
-    torch.ops._C_ascend.npu_scatter_nd_update_v2(flat, k_rows.unsqueeze(-1), k)
-    torch.ops._C_ascend.npu_scatter_nd_update_v2(flat, v_rows.unsqueeze(-1), v)
+    scatter_nd_update_v2(flat, k_rows.unsqueeze(-1), k)
+    scatter_nd_update_v2(flat, v_rows.unsqueeze(-1), v)
 
 
 def _insert_index_k(
@@ -182,7 +183,7 @@ def _insert_index_k(
     # See `_insert_kv`: the backing storage must be written, not a copy.
     flat = index_cache.view(-1, head_dim)
     # See `_insert_kv`: coordinates must be [N, 1], not [N].
-    torch.ops._C_ascend.npu_scatter_nd_update_v2(
+    scatter_nd_update_v2(
         flat, slot_mapping.to(torch.int32).unsqueeze(-1), index_k.reshape(-1, head_dim)
     )
 

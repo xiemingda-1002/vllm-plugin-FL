@@ -44,6 +44,7 @@ from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from .quant_type import QuantType
+from .dispatch_ffn_combine import dispatch_ffn_combine
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
@@ -336,7 +337,7 @@ class FusedMC2CommImpl(MoECommMethod):
             ), "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
 
             out = torch.empty_like(fused_experts_input.hidden_states)
-            torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
+            dispatch_ffn_combine(  # type: ignore
                 x=fused_experts_input.hidden_states,
                 weight1=fused_experts_input.weights.w1,
                 weight2=fused_experts_input.weights.w2,

@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.utils import replace_parameter
+from .moe_init_routing_custom import moe_init_routing_custom
 
 
 _WEIGHTS_PROCESSED_ATTR = "_fl_ascend_gmm_weights_processed"
@@ -141,7 +142,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         num_tokens = x.shape[:-1].numel()
         sorted_x, expanded_row_idx, expert_tokens, _ = (
-            torch.ops._C_ascend.npu_moe_init_routing_custom(
+            moe_init_routing_custom(
                 x,
                 topk_ids.to(torch.int32),
                 active_num=num_tokens * topk_ids.shape[-1],

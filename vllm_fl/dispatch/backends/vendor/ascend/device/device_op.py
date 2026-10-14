@@ -34,6 +34,17 @@ from vllm_fl.dispatch.backends.vendor.ascend.ops.triton.fla.solve_tril import so
 from vllm_fl.dispatch.backends.vendor.ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.quant_type import QuantType
 from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import AscendDeviceType, get_ascend_device_type
+from vllm_fl.dispatch.backends.vendor.ascend.impl.moe_init_routing_custom import moe_init_routing_custom
+from vllm_fl.dispatch.backends.vendor.ascend.impl.grouped_matmul_swiglu_quant_weight_nz_tensor_list import grouped_matmul_swiglu_quant_weight_nz_tensor_list
+from vllm_fl.dispatch.backends.vendor.ascend.impl.mla_preprocess import mla_preprocess
+from vllm_fl.dispatch.backends.vendor.ascend.impl.lightning_indexer import lightning_indexer
+from vllm_fl.dispatch.backends.vendor.ascend.impl.lightning_indexer_quant import lightning_indexer_quant
+from vllm_fl.dispatch.backends.vendor.ascend.impl.sparse_flash_attention import sparse_flash_attention
+from vllm_fl.dispatch.backends.vendor.ascend.impl.scatter_nd_update_v2 import scatter_nd_update_v2
+from vllm_fl.dispatch.backends.vendor.ascend.impl.gemma_rms_norm import gemma_rms_norm
+from vllm_fl.dispatch.backends.vendor.ascend.impl.swiglu_group_quant import swiglu_group_quant
+from vllm_fl.dispatch.backends.vendor.ascend.impl.kv_compress_epilog import kv_compress_epilog
+from vllm_fl.dispatch.backends.vendor.ascend.impl.indexer_compress_epilog_v2 import indexer_compress_epilog_v2
 
 DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1
 DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
@@ -113,7 +124,7 @@ class BaseDeviceAdaptor:
         quant_mode: int = -1,
         act_quant_type: torch.dtype | None = None,
     ):
-        return torch.ops._C_ascend.npu_moe_init_routing_custom(
+        return moe_init_routing_custom(
             hidden_states,
             topk_ids,
             scale=scale,
@@ -222,7 +233,7 @@ class BaseDeviceAdaptor:
         if use_mxfp_quant:
             raise RuntimeError("MXFP MoE quantization is only supported on Ascend A5.")
 
-        return torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz(
+        return grouped_matmul_swiglu_quant_weight_nz_tensor_list(
             x=x,
             weight=weight,
             weight_scale=weight_scale,
@@ -346,7 +357,7 @@ class BaseDeviceAdaptor:
                 device=hidden_states.device,
             )
 
-            torch.ops._C_ascend.mla_preprocess(
+            mla_preprocess(
                 hidden_states,
                 atten_obj.wd_qkv,
                 atten_obj.deq_scale_qkv,
@@ -417,7 +428,7 @@ class BaseDeviceAdaptor:
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        torch.ops._C_ascend.mla_preprocess(
+        mla_preprocess(
             hidden_states,
             sfa_impl.wd_qkv,
             sfa_impl.deq_scale_qkv,
@@ -589,7 +600,7 @@ class BaseDeviceAdaptor:
     ) -> torch.Tensor:
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
-        # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
+        # TODO: lightning_indexer needs to be removed.
         packed_kv_cache = getattr(sfa_impl, "use_sparse_c8_sfa", False)
         indexer_cache_idx = 1 if packed_kv_cache else 2
         indexer_scale_cache_idx = 2 if packed_kv_cache else 3
@@ -599,7 +610,7 @@ class BaseDeviceAdaptor:
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
+            topk_indices = lightning_indexer_quant(
                 query=q_li.view(q_li_shape_ori),
                 key=kv_cache[indexer_cache_idx],
                 weights=weights,
@@ -629,7 +640,7 @@ class BaseDeviceAdaptor:
                 sparse_mode=3,
             )
         else:
-            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
+            topk_indices, _ = lightning_indexer(
                 query=q_li,
                 key=kv_cache[indexer_cache_idx],
                 weights=weights,
@@ -679,7 +690,7 @@ class BaseDeviceAdaptor:
             )
 
         key_rope = kv_cache[1]
-        attn_output, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
+        attn_output, _, _ = sparse_flash_attention(
             query=ql_nope,
             key=kv,
             value=kv,
@@ -794,7 +805,7 @@ class BaseDeviceAdaptor:
     @staticmethod
     def dsa_kv_compress_scatter(cache, x, slot_mapping):
         """Scatter KV into cache. Non-A5: simple scatter of pre-quantized tensor."""
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, slot_mapping, x)
+        scatter_nd_update_v2(cache, slot_mapping, x)
 
     # ===== Indexer Quant + Scatter =====
 
@@ -820,8 +831,8 @@ class BaseDeviceAdaptor:
             kv_scale_out = kv_scale_out.unsqueeze(-1).to(torch.float16)
             if kv_scale_out.ndim < 4:
                 kv_scale_out = kv_scale_out.unsqueeze(-1)
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
-            torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_out)
+            scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
+            scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_out)
 
         return q, q_scale, kv_out, kv_scale_out
 
@@ -834,7 +845,7 @@ class BaseDeviceAdaptor:
             return None, None
         kv_out, kv_scale = torch_npu.npu_dynamic_quant(kv, dst_type=torch.int8)
         kv_scale = kv_scale.unsqueeze(-1)
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
+        scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_out)
         return kv_out, kv_scale
 
     @staticmethod
@@ -844,7 +855,7 @@ class BaseDeviceAdaptor:
         kv_scale = kv_scale.to(torch.float16)
         if kv_scale.ndim < 4:
             kv_scale = kv_scale.unsqueeze(-1)
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale)
+        scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale)
 
     @staticmethod
     def warmup_indexer_quant_scatter(hidden_states, slot_mapping):
@@ -857,8 +868,8 @@ class BaseDeviceAdaptor:
         dummy_shape = (1, 1, 1, kv_dummy.shape[-1])
         indexer_k_cache = torch.zeros(dummy_shape, dtype=kv_dummy.dtype, device=hidden_states.device)
         indexer_scale_cache = torch.zeros(dummy_shape, dtype=torch.float16, device=hidden_states.device)
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_dummy)
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_dummy)
+        scatter_nd_update_v2(indexer_k_cache, slot_mapping, kv_dummy)
+        scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale_dummy)
 
     # ===== Lightning Indexer Dtype Prep =====
 
@@ -1014,12 +1025,12 @@ class BaseDeviceAdaptor:
 
     @staticmethod
     def npu_gemma_rms_norm(x, weight, variance_epsilon):
-        x, _ = torch.ops._C_ascend.npu_gemma_rms_norm(x, weight, variance_epsilon)
+        x, _ = gemma_rms_norm(x, weight, variance_epsilon)
         return x
 
     @staticmethod
     def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
-        return torch.ops._C_ascend.npu_fused_gdn_gating(A_log, a, b, dt_bias.to(A_log.dtype))
+        return fused_gdn_gating_patch(A_log, a, b, dt_bias.to(A_log.dtype))
 
     @staticmethod
     def split_qkv_rmsnorm_rope(
@@ -1287,7 +1298,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 output_dtype=torch.bfloat16,
             )[0]
             # DSV4 need swiglu_limit input
-            out, out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+            out, out_scale, _ = swiglu_group_quant(
                 hidden_states,
                 topk_weight=None,
                 group_index=None,
@@ -1539,7 +1550,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         """Scatter KV into cache with fused quantization+compression.
         A5: kv_compress_epilog handles quant/compress/scatter internally.
         Input x is unquantized bf16; cache shape is [..., head_dim]."""
-        torch.ops._C_ascend.kv_compress_epilog(
+        kv_compress_epilog(
             kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),
             x=x.view(-1, x.shape[-1]),
             slot_mapping=slot_mapping,
@@ -1568,7 +1579,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         kv_out = kv
         kv_scale_out = None
         if kv is not None:
-            torch.ops._C_ascend.indexer_compress_epilog_v2(
+            indexer_compress_epilog_v2(
                 indexer_compress_cache=indexer_full_cache.view(torch.uint8),
                 x=kv,
                 slot_mapping=slot_mapping,
@@ -1584,7 +1595,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         Returns (kv, None) to signal Part3 is a no-op."""
         if kv is None:
             return None, None
-        torch.ops._C_ascend.indexer_compress_epilog_v2(
+        indexer_compress_epilog_v2(
             indexer_compress_cache=indexer_full_cache.view(torch.uint8),
             x=kv,
             slot_mapping=slot_mapping,
@@ -1604,7 +1615,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         A5: fused indexer_compress_epilog_v2 with dummy cache tensor."""
         dummy_cache_shape = (1, 1, 1, hidden_states.shape[-1])
         indexer_full_cache_dummy = torch.zeros(dummy_cache_shape, dtype=torch.uint8, device=hidden_states.device)
-        torch.ops._C_ascend.indexer_compress_epilog_v2(
+        indexer_compress_epilog_v2(
             indexer_compress_cache=indexer_full_cache_dummy,
             x=hidden_states,
             slot_mapping=slot_mapping,

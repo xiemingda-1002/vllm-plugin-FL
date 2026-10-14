@@ -34,6 +34,8 @@ from .fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from .fla.utils import clear_ssm_states
 from vllm_fl.attention.ascend.gdn_attn_builder import AscendGDNAttentionBackend
 from .mamba import extract_last_width
+from .causal_conv1d import causal_conv1d_fn
+from .recurrent_gated_delta_rule import recurrent_gated_delta_rule
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -196,7 +198,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
             output_spec = torch.empty_like(mixed_qkv_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
+            causal_conv1d_fn(
                 output_spec,
                 mixed_qkv_spec,
                 conv_weights_T,
@@ -243,7 +245,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                             pcp_rank - 1, ...
                         ].transpose(-1, -2)
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    causal_conv1d_fn(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,
                         conv_weights_T,
@@ -266,7 +268,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    causal_conv1d_fn(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,
                         conv_weights_T,
@@ -287,7 +289,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             non_spec_causal_conv1d_meta = attn_metadata.non_spec_decode_metadata.causal_conv1d
             non_spec_query_start_loc_device = non_spec_causal_conv1d_meta.query_start_loc
             output_non_spec = torch.empty_like(mixed_qkv_non_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
+            causal_conv1d_fn(
                 output_non_spec,
                 mixed_qkv_non_spec,
                 conv_weights_T,
@@ -341,7 +343,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             # The custom op extends dtype support (e.g. float32 state) and is
             # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
-            core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_spec = recurrent_gated_delta_rule(
                 query=query_spec.squeeze(0),
                 key=key_spec.squeeze(0),
                 value=value_spec.squeeze(0),
@@ -365,7 +367,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_decode = l2norm_fwd(query_decode)
             key_decode = l2norm_fwd(key_decode)
-            core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_decode = recurrent_gated_delta_rule(
                 query=query_decode.squeeze(0),
                 key=key_decode.squeeze(0),
                 value=value_decode.squeeze(0),
@@ -423,7 +425,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_non_spec = l2norm_fwd(key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
-            core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_non_spec = recurrent_gated_delta_rule(
                 query=query_non_spec.squeeze(0),
                 key=key_non_spec.squeeze(0),
                 value=value_non_spec.squeeze(0),

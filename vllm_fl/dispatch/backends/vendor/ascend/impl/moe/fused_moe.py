@@ -49,6 +49,8 @@ from .compat import (
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
+from .dequant_swiglu_quant import dequant_swiglu_quant
+from .swiglu_group_quant import swiglu_group_quant
 
 _WEIGHTS_PROCESSED_ATTR = "_fl_ascend_gmm_weights_processed"
 
@@ -717,7 +719,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 # Execute activation concurrently with gmm2.
 
                 maybe_wait_event(fused_moe_evts.before_gmm2)
-                quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
+                quantized_x, swiglu_out_scale = dequant_swiglu_quant(
                     x=hidden_states,
                     weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
                     activation_scale=pertoken_scale,
@@ -756,7 +758,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 hidden_states = self._shared_experts.gate_up_proj((quantized_x, pertoken_scale))[0]
                 # Execute activation concurrently with gmm2.
                 maybe_wait_event(fused_moe_evts.before_gmm2)
-                quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
+                quantized_x, swiglu_out_scale, _ = swiglu_group_quant(
                     hidden_states,
                     topk_weight=None,
                     group_index=None,

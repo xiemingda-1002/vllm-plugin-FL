@@ -23,6 +23,7 @@ from vllm.distributed import get_tp_group
 from vllm_fl.ascend_forward_context import MoECommType, _EXTRA_CTX
 from vllm_fl.dispatch.backends.vendor.ascend.impl.device_operator import DeviceOperator
 from .compat import split_tensor_along_first_dim
+from .moe_gating_top_k_hash import moe_gating_top_k_hash
 
 
 def select_experts(
@@ -263,7 +264,7 @@ def _select_experts_with_fusion_ops(
         else:
             input_ids = None
             tid2eid_ones = None
-        topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
+        topk_weights, topk_ids, _ = moe_gating_top_k_hash(
             x=router_logits,
             k=top_k,
             bias=e_score_correction_bias,

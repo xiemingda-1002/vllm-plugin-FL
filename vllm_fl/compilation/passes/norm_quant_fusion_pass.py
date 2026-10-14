@@ -28,6 +28,7 @@ from vllm_fl.dispatch.backends.vendor.ascend.device.mxfp_compat import (
     is_rms_norm_dynamic_mx_quant_fusion_available,
 )
 from vllm_fl.ascend_custom_ops import enable_custom_op
+from vllm_fl.dispatch.backends.vendor.ascend.impl.add_rms_norm_bias import add_rms_norm_bias
 
 
 class AddRMSNormQuantPattern(BasePattern):
@@ -58,7 +59,7 @@ class AddRMSNormQuantPattern(BasePattern):
             """
             Pattern for AddRMSNormQuant fusion.
             """
-            output = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            output = add_rms_norm_bias(
                 rms_norm_input, residual, rms_norm_weight, None, self.eps
             )
             out0 = output[0]
@@ -120,7 +121,7 @@ class AddRMSNormQuantPatternWithBias(BasePattern):
             """
             Pattern for AddRMSNormQuant fusion.
             """
-            output = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            output = add_rms_norm_bias(
                 rms_norm_input, residual, rms_norm_weight, bias, self.eps
             )
             out0 = output[0]
@@ -181,7 +182,7 @@ class AddRMSNormQuantSPPattern(BasePattern):
             """
             Pattern for AddRMSNormQuant fusion.
             """
-            output = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            output = add_rms_norm_bias(
                 rms_norm_input, residual, rms_norm_weight, None, self.eps
             )
             out0 = output[0]
@@ -245,7 +246,7 @@ class AddRMSNormQuantSPPatternWithBias(BasePattern):
             """
             Pattern for AddRMSNormQuant fusion.
             """
-            output = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            output = add_rms_norm_bias(
                 rms_norm_input, residual, rms_norm_weight, bias, self.eps
             )
             out0 = output[0]
@@ -347,7 +348,7 @@ class AddRMSNormDynamicQuantPatternWithBias(BasePattern):
             """
             Pattern for AddRMSNormQuant fusion.
             """
-            output = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            output = add_rms_norm_bias(
                 rms_norm_input, residual, rms_norm_weight, bias, self.eps
             )
             out0 = output[0]
@@ -446,7 +447,7 @@ class AddRMSNormDynamicQuantSPPatternWithBias(BasePattern):
             """
             Pattern for AddRMSNormQuant fusion.
             """
-            output = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            output = add_rms_norm_bias(
                 rms_norm_input, residual, rms_norm_weight, bias, self.eps
             )
             out0 = output[0]

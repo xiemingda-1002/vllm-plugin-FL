@@ -42,6 +42,7 @@ from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
     maybe_trans_nz, round_up,
 )
 from vllm_fl.worker.npu_input_batch import NPUInputBatch
+from vllm_fl.dispatch.backends.vendor.ascend.impl.store_kv_block import store_kv_block
 
 # P0 deliberately excludes CP/DCP and MTP. Keep their selector hooks lazy so
 # a single-card eager GLM5.2 import never introduces those execution chains.
@@ -1836,7 +1837,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dsa_k_scale_cache_idx = 3
 
             if get_ascend_config().c8_enable_reshape_optim:
-                torch.ops._C_ascend.store_kv_block(
+                store_kv_block(
                     k_li,
                     kv_cache[dsa_k_cache_idx],
                     attn_metadata.group_len,
@@ -1854,7 +1855,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert len(kv_cache) == (3 if self.use_sparse_c8_sfa else 4)
                 if k_li_scale is not None:
                     if get_ascend_config().c8_enable_reshape_optim:
-                        torch.ops._C_ascend.store_kv_block(
+                        store_kv_block(
                             k_li_scale,
                             kv_cache[dsa_k_scale_cache_idx],
                             attn_metadata.group_len,

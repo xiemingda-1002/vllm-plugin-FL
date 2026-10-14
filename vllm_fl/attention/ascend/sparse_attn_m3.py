@@ -39,6 +39,7 @@ import logging
 import os
 
 import torch
+from vllm_fl.dispatch.backends.vendor.ascend.impl.sparse_attention_score import sparse_attention_score
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def _sparse_attn_ascend(
     operator requires to match the cache's block dimension.
     """
     key, value = _split_main_kv_cache(kv_cache)
-    result = torch.ops._C_ascend.npu_sparse_attention_score(
+    result = sparse_attention_score(
         q,
         key,
         value,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import torch
+from .fused_gdn_gating import fused_gdn_gating_patch
+from .moe_init_routing_custom import moe_init_routing_custom
 
 
 class DeviceOperator:
@@ -115,7 +117,7 @@ class DeviceOperator:
         b: torch.Tensor,
         dt_bias: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops._C_ascend.npu_fused_gdn_gating(
+        return fused_gdn_gating_patch(
             A_log, a, b, dt_bias.to(A_log.dtype)
         )
 
@@ -166,7 +168,7 @@ class DeviceOperator:
         quant_mode: int = -1,
         act_quant_type: torch.dtype | None = None,
     ):
-        return torch.ops._C_ascend.npu_moe_init_routing_custom(
+        return moe_init_routing_custom(
             hidden_states,
             topk_ids,
             scale=scale,
