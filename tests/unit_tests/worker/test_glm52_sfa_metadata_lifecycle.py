@@ -50,17 +50,17 @@ def _call_keyword(method_name: str, call_attr: str, keyword: str) -> ast.expr:
 
 
 def _state_bridge():
-    method = _method("_set_dsa_common_attention_state")
+    method = _method("_set_ascend_common_attention_state")
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {"CommonAttentionMetadata": object, "Any": object}
     exec(compile(module, "glm52_sfa_state_bridge", "exec"), namespace)
-    return namespace["_set_dsa_common_attention_state"]
+    return namespace["_set_ascend_common_attention_state"]
 
 
 def test_sfa_uses_extended_metadata_without_becoming_compressed_dsa() -> None:
-    sfa = SimpleNamespace(use_compress=False, use_ascend_sfa=True)
-    generic = SimpleNamespace(use_compress=False, use_ascend_sfa=False)
+    sfa = SimpleNamespace(use_compress=False, use_ascend_sfa=True, use_ascend_attention=True)
+    generic = SimpleNamespace(use_compress=False, use_ascend_sfa=False, use_ascend_attention=False)
 
     # Execute the production bridge: a GLM SFA real phase and a graph dummy
     # phase both reach the Ascend extension, while a generic runner does not.

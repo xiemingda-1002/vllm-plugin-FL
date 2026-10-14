@@ -569,11 +569,13 @@ class ModelRunnerFL(GPUModelRunner):
             )
 
             self.use_ascend_sfa = model_uses_sfa_sparse(self.model_config)
-        if self.use_compress or getattr(self, "use_ascend_sfa", False):
-            # Updated for each real compressed-DSA batch. Dummy metadata must
-            # pass its own explicit phase and never consume this value. SFA
-            # uses the same phase enum, but remains outside use_compress.
-            self._dsa_attn_state = None
+        self.use_ascend_attention = (
+            getattr(current_platform, "vendor_name", None) == "ascend"
+        )
+        if self.use_ascend_attention:
+            # rc1 classifies every real Ascend batch from computed tokens.
+            # Dummy metadata supplies an independent phase below.
+            self._ascend_attn_state = None
         if self.use_compress:
             if self.speculative_config is not None:
                 raise NotImplementedError(
@@ -2195,8 +2197,8 @@ class ModelRunnerFL(GPUModelRunner):
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
-        if self.use_compress or getattr(self, "use_ascend_sfa", False):
-            # This is the rc1 phase lifecycle for Ascend DSA/SFA metadata. In particular,
+        if self.use_ascend_attention:
+            # This is rc1's phase lifecycle for all Ascend attention. In particular,
             # a normal one-token decode must not fall through to the metadata
             # extension's None/default prefill state.
             if not scheduler_output.scheduled_spec_decode_tokens:
@@ -2215,10 +2217,11 @@ class ModelRunnerFL(GPUModelRunner):
                     dtype=np.int32,
                 )
             from vllm_fl.attention.ascend.utils import (
-                classify_dsa_attention_state,
+                classify_ascend_attention_state,
             )
 
-            self._dsa_attn_state = classify_dsa_attention_state(
+            self._ascend_num_valid_tokens = num_valid_tokens.copy()
+            self._ascend_attn_state = classify_ascend_attention_state(
                 self.input_batch.num_computed_tokens_cpu[:num_reqs],
                 num_scheduled_tokens,
                 num_valid_tokens,
@@ -2561,20 +2564,78 @@ class ModelRunnerFL(GPUModelRunner):
             spec_decode_metadata,
         )
 
-    def _set_dsa_common_attention_state(
+    def _set_ascend_common_attention_state(
         self,
         common_attn_metadata: CommonAttentionMetadata,
-        dsa_attn_state: Any | None,
+        ascend_attn_state: Any | None,
     ) -> None:
-        """Attach the Ascend DSA/SFA phase without affecting other backends."""
-        if not (self.use_compress or getattr(self, "use_ascend_sfa", False)):
+        """Attach rc1's runner-owned phase without affecting other vendors."""
+        if not self.use_ascend_attention:
             return
-        if dsa_attn_state is None:
-            dsa_attn_state = self._dsa_attn_state
-        assert dsa_attn_state is not None, (
-            "Ascend DSA/SFA metadata requires an explicit attention state"
+        if ascend_attn_state is None:
+            ascend_attn_state = self._ascend_attn_state
+        assert ascend_attn_state is not None, (
+            "Ascend metadata requires an explicit attention state"
         )
-        common_attn_metadata.attn_state = dsa_attn_state
+        common_attn_metadata.attn_state = ascend_attn_state
+
+    def _set_ascend_ubatch_attention_state(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        parent_metadata: CommonAttentionMetadata,
+        ubatch_slice: Any,
+        num_reqs_actual: int,
+        dummy_attn_state: Any | None,
+    ) -> None:
+        """Restore vendor phase lost by upstream token-sliced metadata.
+
+        rc1 does not ubatch. FL's upstream slicer can split a single prompt,
+        so copying PrefillNoCache into its later slice would lose history.
+        Reuse rc1's classifier with the slice's query and computed lengths.
+        """
+        if not self.use_ascend_attention:
+            return
+        if dummy_attn_state is not None:
+            self._set_ascend_common_attention_state(
+                common_attn_metadata, dummy_attn_state
+            )
+            return
+        from vllm_fl.attention.ascend.utils import (
+            classify_ascend_attention_state,
+            get_ascend_dummy_attention_state,
+        )
+
+        first_req = ubatch_slice.request_slice.start
+        last_req = min(ubatch_slice.request_slice.stop, num_reqs_actual)
+        num_real_reqs = last_req - first_req
+        if num_real_reqs <= 0:
+            common_attn_metadata.attn_state = get_ascend_dummy_attention_state()
+            return
+        query_lens = np.diff(
+            common_attn_metadata.query_start_loc_cpu.numpy()
+        )[:num_real_reqs]
+        # Private CPU lengths are authoritative when available; async
+        # paths retain the runner's optimistic upper bound instead. This
+        # bridge does not enable any additional speculative capability.
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+        seq_lens = seq_lens_cpu.numpy()[:num_real_reqs]
+        # Valid tokens precede draft tokens within each original request.
+        # Intersect that valid prefix with this ubatch's token interval.
+        parent_starts = parent_metadata.query_start_loc_cpu.numpy()[first_req:last_req]
+        skipped = np.maximum(ubatch_slice.token_slice.start - parent_starts, 0)
+        valid_tokens = np.minimum(
+            np.maximum(self._ascend_num_valid_tokens[first_req:last_req] - skipped, 0),
+            query_lens,
+        )
+        common_attn_metadata.attn_state = classify_ascend_attention_state(
+            seq_lens - query_lens,
+            query_lens,
+            valid_tokens,
+            self.scheduler_config.enable_chunked_prefill,
+            self.speculative_config.method if self.speculative_config else None,
+        )
 
     def _build_attention_metadata(
         self,
@@ -2591,7 +2652,7 @@ class ModelRunnerFL(GPUModelRunner):
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
         block_table_rows_are_current: bool = False,
-        dsa_attn_state: Any | None = None,
+        ascend_attn_state: Any | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2701,7 +2762,7 @@ class ModelRunnerFL(GPUModelRunner):
                 req_doc_ranges[req_idx] = image_doc_ranges
 
         common_metadata_cls: type[CommonAttentionMetadata] = CommonAttentionMetadata
-        if self.use_compress or getattr(self, "use_ascend_sfa", False):
+        if self.use_ascend_attention:
             from vllm_fl.attention.ascend.utils import (
                 AscendCommonAttentionMetadata,
             )
@@ -2745,7 +2806,7 @@ class ModelRunnerFL(GPUModelRunner):
             if self.use_compress:
                 assert self._dsa_positions_cpu_buf is not None
                 cm_base.positions_cpu = self._dsa_positions_cpu_buf
-        self._set_dsa_common_attention_state(cm_base, dsa_attn_state)
+        self._set_ascend_common_attention_state(cm_base, ascend_attn_state)
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2879,9 +2940,9 @@ class ModelRunnerFL(GPUModelRunner):
                 # SFA's rc1 graph path has an explicit phase-aware builder;
                 # the generic CUDA-graph entry point neither exists on the
                 # SFA builder nor supplies the DecodeOnly contract.
-                assert dsa_attn_state is not None
+                assert ascend_attn_state is not None
                 attn_metadata_i = builder.build_for_graph_capture(
-                    common_attn_metadata, dsa_attn_state
+                    common_attn_metadata, ascend_attn_state
                 )
             elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
@@ -2963,6 +3024,9 @@ class ModelRunnerFL(GPUModelRunner):
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
                     for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
+                        self._set_ascend_ubatch_attention_state(
+                            _cm, cm, ubatch_slices[ubid], num_reqs, ascend_attn_state
+                        )
                         _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
 
                 else:
@@ -6831,14 +6895,19 @@ class ModelRunnerFL(GPUModelRunner):
                     assert self._dsa_positions_cpu_buf is not None
                     self._dsa_positions_cpu_buf.fill_(127)
 
-                dsa_dummy_attn_state = None
-                if self.use_compress or getattr(self, "use_ascend_sfa", False):
+                ascend_dummy_attn_state = None
+                if self.use_ascend_attention:
                     from vllm_fl.attention.ascend.utils import (
-                        get_dsa_dummy_attention_state,
+                        get_ascend_dummy_attention_state,
                     )
 
-                    dsa_dummy_attn_state = get_dsa_dummy_attention_state(
-                        create_mixed_batch
+                    ascend_dummy_attn_state = get_ascend_dummy_attention_state(
+                        create_mixed_batch,
+                        speculative_method=(
+                            self.speculative_config.method
+                            if self.speculative_config is not None else None
+                        ),
+                        use_mla=self.model_config.use_mla,
                     )
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
@@ -6866,7 +6935,7 @@ class ModelRunnerFL(GPUModelRunner):
                     # Dummy capture, eager warmup, and an idle DP dummy all
                     # use rc1's explicit decode metadata contract. Do not
                     # inherit an earlier real batch's phase.
-                    dsa_attn_state=dsa_dummy_attn_state,
+                    ascend_attn_state=ascend_dummy_attn_state,
                 )
 
             # Dummy forwards must not update real KV-cache slots. Ascend

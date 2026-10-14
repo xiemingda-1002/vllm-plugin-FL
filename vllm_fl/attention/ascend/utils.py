@@ -24,18 +24,18 @@ from vllm_fl.attention.ascend.attention import AscendAttentionState
 SFA_QSFA_TILE_SIZE = 128
 
 
-def classify_dsa_attention_state(
+def classify_ascend_attention_state(
     num_computed_tokens: Sequence[int],
     num_scheduled_tokens: Sequence[int],
     num_valid_tokens: Sequence[int],
     enable_chunked_prefill: bool,
     speculative_method: str | None,
 ) -> AscendAttentionState:
-    """Match rc1's DSA phase classification without runner-side state.
+    """Return rc1's stored/common-metadata phase for the current Ascend batch.
 
-    The compressed-DSA runner is the only current caller.  Keeping this
-    classifier vendor-local makes its cache/metadata phase contract testable
-    without changing the upstream model-runner path.
+    Mirrors ModelRunner._build_attn_state, including the non-MTP speculative
+    phase restoration before metadata is built. Initial one-token prompts
+    precede the one-token decode check because they have no computed KV.
     """
     if all(tokens == 0 for tokens in num_computed_tokens):
         return AscendAttentionState.PrefillNoCache
@@ -59,16 +59,24 @@ def classify_dsa_attention_state(
     return AscendAttentionState.PrefillCacheHit
 
 
-def get_dsa_dummy_attention_state(
+def get_ascend_dummy_attention_state(
     create_mixed_batch: bool = False,
+    speculative_method: str | None = None,
+    use_mla: bool = False,
 ) -> AscendAttentionState:
-    """Return rc1's explicit phase for DSA capture, warmup, and idle dummies."""
+    """Match rc1's explicit phase for capture, warmup, and idle dummies."""
     if create_mixed_batch:
         raise NotImplementedError(
-            "create_mixed_batch is used for warmup deepgemm; compressed DSA "
+            "create_mixed_batch is used for warmup deepgemm; Ascend "
             "does not support it"
         )
+    if speculative_method == "mtp":
+        return (
+            AscendAttentionState.SpecDecoding
+            if use_mla else AscendAttentionState.ChunkedPrefill
+        )
     return AscendAttentionState.DecodeOnly
+
 
 
 def get_sfa_qsfa_packed_head_dim(

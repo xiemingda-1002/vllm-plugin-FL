@@ -377,10 +377,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
 
-        # Determine attention state
-        attn_state = self._determine_attn_state(
-            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens
-        )
+        # rc1's runner owns the phase: batch composition alone cannot tell
+        # initial prefill from a later chunk or a prefix-cache hit.
+        attn_state = common_attn_metadata.attn_state
+        assert attn_state is not None, "Ascend metadata requires an attention state"
 
         # Create attention mask based on state
         attn_mask = self._make_attention_mask(attn_state)
@@ -432,24 +432,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=getattr(common_attn_metadata, 'causal', True),
             model_runner_type=self.model_config.runner_type,
         )
-
-    def _determine_attn_state(
-        self,
-        num_decodes: int,
-        num_prefills: int,
-        num_decode_tokens: int,
-        num_prefill_tokens: int,
-    ) -> AscendAttentionState:
-        """Determine attention state based on batch composition."""
-        if num_prefills == 0:
-            return AscendAttentionState.DecodeOnly
-        elif num_decodes == 0 and num_prefill_tokens > 0:
-            # Pure prefill - check if cache hit or no cache
-            # For simplicity, use ChunkedPrefill as default
-            return AscendAttentionState.PrefillNoCache
-        else:
-            # Mixed decode and prefill
-            return AscendAttentionState.ChunkedPrefill
 
     def _split_decodes_and_prefills(self, common_attn_metadata):
         """Split batch into decode and prefill requests."""

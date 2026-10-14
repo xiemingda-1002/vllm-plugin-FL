@@ -19,6 +19,7 @@ from vllm.v1.worker.utils import AttentionGroup, prepare_kernel_block_sizes
 
 from vllm_fl.attention.ascend.attention import (
     AscendAttentionBackend,
+    AscendAttentionState,
     AscendAttentionMetadataBuilder,
     AscendMetadata,
 )
@@ -100,6 +101,7 @@ def test_builder_prefers_live_private_lengths_and_pads_fia_dummy_request(
         seq_lens=torch.tensor([999], dtype=torch.int32),
         slot_mapping=torch.tensor([3, 4], dtype=torch.int64),
         causal=True,
+        attn_state=AscendAttentionState.DecodeOnly,
     )
 
     metadata = builder.build(0, common)

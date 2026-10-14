@@ -31,3 +31,35 @@ The producer's functional GPU tests follow the same enable policy. On other
 vendors, explicitly set `VLLM_FL_COMMON_ATTENTION_METADATA=1` to run those
 tests while validating the new kernel; the default suite retains the original
 producer's platform contract.
+
+## Ascend attention phases
+
+The Ascend runner determines the attention phase from the current batch's
+computed, scheduled, and valid token counts, following vLLM-Ascend 0.24.0rc1.
+`AscendCommonAttentionMetadata` carries that phase to the attention builders.
+Other vendors keep their existing metadata contract.
+
+A pure prefill batch can be either an initial prompt or a continuation with
+cached history. The ordinary Ascend builder must preserve the runner's phase
+instead of inferring `PrefillNoCache` from the absence of decode requests.
+Initial prompts, including a one-token prompt, use the current K/V tensors;
+chunked continuations and prefix-cache hits read the paged KV cache with
+cumulative sequence lengths. Disabling prefix caching does not remove the
+need to read earlier chunks of the same request.
+
+Capture, warmup, and idle dummy forwards supply an explicit phase so they never
+inherit a previous real batch's state. The upstream microbatch slicer drops
+vendor fields and can split a request across token ranges. FL therefore restores
+the Ascend phase from each real slice's query and computed lengths, using the
+same classifier; dummy slices retain their explicit dummy phase. This adapter
+does not establish new speculative-decoding or distributed execution support.
+
+The focused regression suite is:
+
+```bash
+pytest -q \
+  tests/unit_tests/dispatch/test_ascend_prefill_state_lifecycle.py \
+  tests/unit_tests/dispatch/test_ascend_attention_builder_contract.py \
+  tests/unit_tests/ascend/test_dsa_attention_state_lifecycle.py \
+  tests/unit_tests/worker/test_glm52_sfa_metadata_lifecycle.py
+```
