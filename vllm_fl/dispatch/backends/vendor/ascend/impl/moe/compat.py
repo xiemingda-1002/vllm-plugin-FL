@@ -62,7 +62,7 @@ def maybe_trans_nz(tensor: torch.Tensor) -> torch.Tensor:
     """Opt-in BF16 expert NZ weights; convert once during model loading.
 
     The previous shim ignored weight_nz_mode=2 for ordinary MoE. Keep that
-    behavior by default, and validate the measured A3 Qwen3-VL topology before
+    behavior by default, and constrain the A3 Qwen3-VL topology before
     enabling the native GMM weight layout. No quantization or routing changes.
     """
     extra = get_ascend_additional_config()
@@ -99,8 +99,12 @@ def maybe_trans_nz(tensor: torch.Tensor) -> torch.Tensor:
     import torch_npu
 
     result = torch_npu.npu_format_cast(tensor, ACL_FORMAT_FRACTAL_NZ)
-    if str(torch_npu.get_npu_format(result)) != "FRACTAL_NZ":
-        raise RuntimeError("BF16 expert NZ conversion did not produce FRACTAL_NZ")
+    result_format = torch_npu.get_npu_format(result)
+    if result_format != ACL_FORMAT_FRACTAL_NZ:
+        raise RuntimeError(
+            "BF16 expert NZ conversion did not produce FRACTAL_NZ: "
+            f"got format {result_format!r}"
+        )
     logger.info(
         "FL BF16 expert NZ enabled: shape=%s, dtype=%s",
         tuple(tensor.shape),

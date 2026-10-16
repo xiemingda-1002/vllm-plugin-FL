@@ -159,13 +159,14 @@ def _large_prefill_allgather_enabled(
     vllm_config: Any,
     ep_world_size: int,
     enable_fused_mc2: int,
+    is_prefill: bool,
 ) -> bool:
     """Use the existing EP AllGather path for large TP2 BF16 prefills only."""
     config = vllm_config.additional_config or {}
     enabled = config.get("fl_prefill_allgather", False)
     if not isinstance(enabled, bool):
         raise TypeError("fl_prefill_allgather must be a JSON boolean")
-    if not enabled or not 4096 <= num_tokens <= 32768 or num_tokens % 2:
+    if not enabled or not is_prefill or not 4096 <= num_tokens <= 32768 or num_tokens % 2:
         return False
 
     parallel = vllm_config.parallel_config
@@ -208,6 +209,8 @@ def select_moe_comm_method(
     num_tokens: int,
     vllm_config: Any,
     is_draft_model: bool = False,
+    *,
+    is_prefill: bool = False,
 ) -> MoECommType | None:
     """Select the supported vendor-scoped ordinary MoE communication path."""
     del is_draft_model
@@ -232,7 +235,7 @@ def select_moe_comm_method(
             num_tokens, mc2_tokens_capacity, enable_fused_mc2
         )
         if selected == MoECommType.ALLTOALL and _large_prefill_allgather_enabled(
-            num_tokens, vllm_config, ep_world_size, enable_fused_mc2
+            num_tokens, vllm_config, ep_world_size, enable_fused_mc2, is_prefill
         ):
             if not getattr(_large_prefill_allgather_enabled, "_reported", False):
                 import logging
@@ -280,7 +283,7 @@ def build_additional_forward_context(
     The arguments mirror ``Platform.set_additional_forward_context`` exactly;
     graph metadata remains owned by upstream vLLM.
     """
-    del cudagraph_runtime_mode, batch_descriptor, ubatch_slices
+    del batch_descriptor, ubatch_slices
 
     if num_tokens is None and attn_metadata:
         num_tokens = next(iter(attn_metadata.values())).num_actual_tokens
@@ -311,7 +314,20 @@ def build_additional_forward_context(
             dp_metadata.num_tokens_across_dp_cpu.max().item()
         )
 
-    moe_comm_type = select_moe_comm_method(max_tokens_across_dp, vllm_config)
+    # Restrict the probe to real prefill metadata. A padded FULL-decode
+    # capture/replay batch must retain the rc1 transport selection.
+    is_prefill = (
+        (vllm_config.additional_config or {}).get("fl_prefill_allgather") is True
+        and getattr(cudagraph_runtime_mode, "name", None) != "FULL"
+        and bool(attn_metadata)
+        and any(
+            getattr(metadata, "num_prefills", 0) > 0
+            for metadata in attn_metadata.values()
+        )
+    )
+    moe_comm_type = select_moe_comm_method(
+        max_tokens_across_dp, vllm_config, is_prefill=is_prefill
+    )
     moe_comm_method = None
     if moe_comm_type is not None:
         moe_comm_method = _get_moe_comm_method(moe_comm_type)
