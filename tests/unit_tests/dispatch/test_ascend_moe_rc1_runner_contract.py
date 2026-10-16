@@ -103,6 +103,7 @@ def test_actual_selector_resolves_registered_transport(
     scope = _registry_scope()
     config = SimpleNamespace(
         ep_size=ep_size,
+        additional_config={},
         parallel_config=SimpleNamespace(
             enable_expert_parallel=True, world_size_across_dp=ep_size,
             pipeline_parallel_size=1,
@@ -122,7 +123,8 @@ def test_actual_selector_resolves_registered_transport(
     context = (ROOT / "vllm_fl" / "ascend_forward_context.py").read_text(encoding="utf-8")
     _exec_source_definitions(
         context,
-        ["_ep_world_size", "_select_a2_moe_comm_method", "_select_a3_moe_comm_method", "select_moe_comm_method"],
+        ["_ep_world_size", "_select_a2_moe_comm_method", "_select_a3_moe_comm_method",
+         "_large_prefill_allgather_enabled", "select_moe_comm_method"],
         scope,
     )
     selected = scope["select_moe_comm_method"](num_tokens, config)
@@ -245,7 +247,8 @@ def test_runner_lifecycle_and_ordinary_comm_registry_are_complete() -> None:
     assert "if device_type is AscendDeviceType.A2:" in forward_context
     assert "return _select_a2_moe_comm_method" in forward_context
     assert "if device_type is AscendDeviceType.A3:" in forward_context
-    assert "return _select_a3_moe_comm_method" in forward_context
+    assert "selected = _select_a3_moe_comm_method" in forward_context
+    assert "return selected" in forward_context
 
 
 def test_rc1_weight_conversion_is_idempotent_and_loader_safe() -> None:
