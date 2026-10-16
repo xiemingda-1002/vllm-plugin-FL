@@ -180,10 +180,10 @@ def test_reduce_sample_ordinary_opt_in_is_accepted(monkeypatch) -> None:
     assert module.get_ascend_config().enable_reduce_sample is True
 
 
-def test_moe_compat_caches_shared_expert_stream_with_a_stub(monkeypatch) -> None:
+def test_moe_runtime_caches_shared_expert_stream_with_a_stub(monkeypatch) -> None:
     """The stream is MoE execution state, not configuration state."""
     source = (
-        _ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/compat.py"
+        _ROOT / "vllm_fl/distributed/ascend_moe_runtime.py"
     ).read_text()
     tree = ast.parse(source)
     selected = [
@@ -212,7 +212,7 @@ def test_moe_compat_caches_shared_expert_stream_with_a_stub(monkeypatch) -> None
 
     namespace = {"__builtins__": dict(vars(builtins), __import__=import_stub)}
     exec(
-        compile(ast.Module(body=selected, type_ignores=[]), "compat.py", "exec"),
+        compile(ast.Module(body=selected, type_ignores=[]), "ascend_moe_runtime.py", "exec"),
         namespace,
     )
     get_stream = namespace["shared_experts_calculation_stream"]
@@ -235,6 +235,7 @@ def test_all_configuration_functions_were_moved_from_moe_compat() -> None:
         "init_ascend_config", "clear_ascend_config", "_current_vllm_config_or_none",
         "get_ascend_additional_config", "balance_scheduling_enabled", "_nested_config",
         "_reject_unsupported", "get_ascend_config", "enable_sp", "enable_sp_by_pass",
+        "shared_expert_dp_enabled",
     }
     assert moved <= config_defs
     assert not moved & compat_defs
@@ -280,4 +281,15 @@ def test_moe_layout_constant_and_runtime_state_are_preserved() -> None:
         if isinstance(target, ast.Name)
     }
     assert values["ACL_FORMAT_FRACTAL_NZ"] == 29
-    assert values["_SHARED_EXPERTS_CALCULATION_STREAM"] is None
+    assert "_SHARED_EXPERTS_CALCULATION_STREAM" not in values
+    runtime_tree = ast.parse(
+        (_ROOT / "vllm_fl/distributed/ascend_moe_runtime.py").read_text()
+    )
+    runtime_values = {
+        target.id: ast.literal_eval(node.value)
+        for node in runtime_tree.body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert runtime_values["_SHARED_EXPERTS_CALCULATION_STREAM"] is None

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 
 import torch
 from vllm_fl.platforms.ascend.hardware import (
@@ -15,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 
 ACL_FORMAT_FRACTAL_NZ = 29
-_SHARED_EXPERTS_CALCULATION_STREAM = None
 
 from vllm_fl.configs.ascend import (
     _nested_config,
@@ -28,6 +26,11 @@ from vllm_fl.configs.ascend import (
     get_ascend_additional_config,
     get_ascend_config,
     init_ascend_config,
+    shared_expert_dp_enabled,
+)
+from vllm_fl.distributed.ascend_moe_runtime import (
+    npu_stream_switch,
+    shared_experts_calculation_stream,
 )
 
 
@@ -111,34 +114,6 @@ def maybe_trans_nz(tensor: torch.Tensor) -> torch.Tensor:
         tensor.dtype,
     )
     return result
-
-
-def npu_stream_switch(target_stream=None, *, enabled: bool = True):
-    if not enabled:
-        return nullcontext()
-    assert target_stream is not None
-    return torch.npu.stream(target_stream)
-
-
-def shared_expert_dp_enabled() -> bool:
-    config = get_ascend_config()
-    flashcomm1_enabled = enable_sp(
-        enable_shared_expert_dp=config.enable_shared_expert_dp
-    )
-    return bool(
-        config.enable_shared_expert_dp or flashcomm1_enabled or enable_sp_by_pass()
-    )
-
-
-def shared_experts_calculation_stream():
-    global _SHARED_EXPERTS_CALCULATION_STREAM
-    if _SHARED_EXPERTS_CALCULATION_STREAM is None:
-        # Keep torch_npu behind the Ascend-only call path so importing FL on a
-        # different vendor does not initialize the NPU runtime.
-        import torch_npu
-
-        _SHARED_EXPERTS_CALCULATION_STREAM = torch_npu.npu.Stream()
-    return _SHARED_EXPERTS_CALCULATION_STREAM
 
 
 def get_mc2_group():

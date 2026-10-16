@@ -473,7 +473,7 @@ class PlatformFL(Platform):
                 # vLLM-Ascend rc1 discovers ModelSlim after VllmConfig creation
                 # and rebuilds quant_config before model loading. Keep this
                 # checkpoint-specific discovery off every other vendor path.
-                from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
+                from vllm_fl.quantization.ascend import (
                     maybe_auto_detect_quantization,
                 )
 
@@ -859,7 +859,7 @@ class PlatformFL(Platform):
     def pre_register_and_update(cls, parser=None) -> None:
         if cls.device_name == "npu":
             import vllm_fl.dispatch.backends.vendor.ascend
-            from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization import (
+            from vllm_fl.quantization.ascend import (
                 register_modelslim,
             )
 

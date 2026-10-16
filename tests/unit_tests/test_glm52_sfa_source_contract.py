@@ -94,7 +94,7 @@ def test_glm52_shared_indexer_init_requires_checkpoint_metadata() -> None:
 
 
 def test_glm52_modelslim_attention_and_indexer_kv_guards_remain_explicit() -> None:
-    source = (ASCEND / "impl/quantization/config.py").read_text()
+    source = (ROOT / "vllm_fl/quantization/ascend/config.py").read_text()
     # The audited GLM-5.2 W8A8 checkpoint has no FA/indexer/C8 metadata.
     # Do not silently invent a quantized attention implementation for it.
     assert "FL ModelSlim quantized attention is not migrated" in source

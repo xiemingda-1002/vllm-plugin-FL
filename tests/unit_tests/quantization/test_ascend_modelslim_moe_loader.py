@@ -24,7 +24,7 @@ import torch
 
 ROOT = Path(__file__).parents[3]
 CONFIG_PATH = (
-    ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/quantization/config.py"
+    ROOT / "vllm_fl/quantization/ascend/config.py"
 )
 MOE_PATH = ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/quantization/moe.py"
 
@@ -183,13 +183,15 @@ def modelslim_moe(monkeypatch: pytest.MonkeyPatch):
         "vllm_fl.dispatch.backends.vendor",
         "vllm_fl.dispatch.backends.vendor.ascend",
         "vllm_fl.dispatch.backends.vendor.ascend.impl",
+        "vllm_fl.quantization",
+        "vllm_fl.quantization.ascend",
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization",
         "vllm_fl.dispatch.backends.vendor.ascend.impl.moe",
         "vllm_fl.configs",
     ):
         _package(monkeypatch, name)
     sys.modules[
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization"
+        "vllm_fl.quantization.ascend"
     ].ASCEND_QUANTIZATION_METHOD = "ascend"
 
     current = SimpleNamespace(
@@ -222,7 +224,12 @@ def modelslim_moe(monkeypatch: pytest.MonkeyPatch):
         "vllm.model_executor.layers.fused_moe.config",
         FusedMoEConfig=object,
     )
-    _module(monkeypatch, "vllm.model_executor.layers.linear", LinearBase=LinearBase)
+    _module(
+        monkeypatch, "vllm.model_executor.layers.linear",
+        LinearBase=LinearBase, LinearMethodBase=object, RowParallelLinear=type("RowParallelLinear", (), {}),
+    )
+    _module(monkeypatch, "vllm.distributed", get_tensor_model_parallel_rank=lambda: 0)
+    _module(monkeypatch, "vllm.model_executor.parameter", PerTensorScaleParameter=object)
     _module(
         monkeypatch,
         "vllm.model_executor.layers.quantization.base_config",
@@ -256,14 +263,13 @@ def modelslim_moe(monkeypatch: pytest.MonkeyPatch):
     )
     _module(
         monkeypatch,
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.utils",
+        "vllm_fl.quantization.ascend.utils",
         calc_split_factor=lambda value: value,
         get_model_file=lambda *args: None,
     )
     _module(
         monkeypatch,
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.linear",
-        AscendLinearMethod=object,
         create_linear_scheme=lambda _: object(),
     )
     _module(
@@ -308,7 +314,18 @@ def modelslim_moe(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, moe_name, moe)
     moe_spec.loader.exec_module(moe)
 
-    config_name = "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.config"
+    adapter_name = "vllm_fl.quantization.ascend.method_adapters"
+    adapter_spec = importlib.util.spec_from_file_location(
+        adapter_name, ROOT / "vllm_fl/quantization/ascend/method_adapters.py"
+    )
+    assert adapter_spec and adapter_spec.loader
+    adapters = importlib.util.module_from_spec(adapter_spec)
+    monkeypatch.setitem(sys.modules, adapter_name, adapters)
+    adapter_spec.loader.exec_module(adapters)
+    # Test fixture facade; production vendor schemes do not re-export adapters.
+    moe.AscendFusedMoEMethod = adapters.AscendFusedMoEMethod
+
+    config_name = "vllm_fl.quantization.ascend.config"
     config_spec = importlib.util.spec_from_file_location(config_name, CONFIG_PATH)
     assert config_spec and config_spec.loader
     config = importlib.util.module_from_spec(config_spec)

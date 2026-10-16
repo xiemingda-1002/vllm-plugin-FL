@@ -26,6 +26,7 @@ def test_dsa_and_moe_native_calls_have_schemas_or_explicit_conditional_scope():
         ASCEND / "impl/device_operator.py",
         *sorted((ASCEND / "impl/moe").glob("*.py")),
         *sorted((ASCEND / "impl/quantization").glob("*.py")),
+        *sorted((ROOT / "vllm_fl/quantization/ascend").glob("*.py")),
     ]
     calls = set()
     for source in sources:

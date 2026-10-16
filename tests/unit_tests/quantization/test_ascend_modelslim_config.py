@@ -18,11 +18,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).parents[3]
-CONFIG = ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/quantization/config.py"
+CONFIG = ROOT / "vllm_fl/quantization/ascend/config.py"
 QUANT_INIT = (
-    ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/quantization/__init__.py"
+    ROOT / "vllm_fl/quantization/ascend/__init__.py"
 )
-UTILS = ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/quantization/utils.py"
+UTILS = ROOT / "vllm_fl/quantization/ascend/utils.py"
 
 
 def _module(monkeypatch: pytest.MonkeyPatch, name: str, **attrs) -> ModuleType:
@@ -157,6 +157,8 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch):
         "vllm_fl.dispatch.backends.vendor",
         "vllm_fl.dispatch.backends.vendor.ascend",
         "vllm_fl.dispatch.backends.vendor.ascend.impl",
+        "vllm_fl.quantization",
+        "vllm_fl.quantization.ascend",
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization",
     ):
         package = _module(monkeypatch, name)
@@ -171,14 +173,13 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch):
     )
     _module(
         monkeypatch,
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.utils",
+        "vllm_fl.quantization.ascend.utils",
         calc_split_factor=lambda values: values,
         get_model_file=lambda *args, **kwargs: None,
     )
     _module(
         monkeypatch,
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.linear",
-        AscendLinearMethod=type("AscendLinearMethod", (), {}),
         create_linear_scheme=lambda _: object(),
     )
     class AscendFusedMoEMethod:
@@ -190,14 +191,19 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch):
     _module(
         monkeypatch,
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.moe",
-        AscendFusedMoEMethod=AscendFusedMoEMethod,
         create_moe_scheme=lambda quant_type: (
             object()
             if quant_type == "W8A8_DYNAMIC"
             else (_ for _ in ()).throw(NotImplementedError(quant_type))
         ),
     )
-    package = sys.modules["vllm_fl.dispatch.backends.vendor.ascend.impl.quantization"]
+    _module(
+        monkeypatch,
+        "vllm_fl.quantization.ascend.method_adapters",
+        AscendLinearMethod=type("AscendLinearMethod", (), {}),
+        AscendFusedMoEMethod=AscendFusedMoEMethod,
+    )
+    package = sys.modules["vllm_fl.quantization.ascend"]
     package.ASCEND_QUANTIZATION_METHOD = "ascend"
 
     forbidden = {"torch_npu", "flag_gems", "flaggems"}
@@ -211,7 +217,7 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr("builtins.__import__", guarded_import)
     spec = importlib.util.spec_from_file_location(
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.config", CONFIG
+        "vllm_fl.quantization.ascend.config", CONFIG
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -310,7 +316,7 @@ def test_descriptor_loading_missing_error_and_from_config_no_overwrite(
     descriptor = tmp_path / "quant_model_description.json"
     descriptor.write_text('{"layers.0.attn.wq.weight": "W8A8_DYNAMIC"}')
     utils = sys.modules[
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.utils"
+        "vllm_fl.quantization.ascend.utils"
     ]
     monkeypatch.setattr(utils, "get_model_file", lambda *args, **kwargs: descriptor)
     config = module.AscendModelSlimConfig()
@@ -353,7 +359,7 @@ def test_registration_is_idempotent_and_parser_choices_are_extended(monkeypatch)
         ),
     )
     del registry
-    package_name = "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization"
+    package_name = "vllm_fl.quantization.ascend"
     package = _module(monkeypatch, package_name)
     package.__path__ = []
     config = _module(
@@ -393,7 +399,7 @@ def test_autodetect_recreates_quant_config_and_preserves_explicit_choice(
             return "rebuilt"
 
     _module(monkeypatch, "vllm.config", VllmConfig=FakeVllmConfig)
-    package_name = "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization"
+    package_name = "vllm_fl.quantization.ascend"
     package = _module(
         monkeypatch,
         package_name,

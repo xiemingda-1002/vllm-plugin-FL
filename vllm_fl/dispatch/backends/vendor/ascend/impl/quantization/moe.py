@@ -29,13 +29,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-)
-from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.utils import set_weight_attrs
-
 from vllm_fl.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_fl.configs.ascend import get_ascend_config
 from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.experts_selector import (
@@ -84,126 +77,6 @@ class AscendMoEScheme:
     """Minimal shared interface for Ascend fused-MoE quantization schemes."""
 
     quant_type: QuantType = QuantType.NONE
-
-
-class AscendFusedMoEMethod(FusedMoEMethodBase):
-    """The rc1 adapter that delegates the layer lifecycle to an MoE scheme."""
-
-    def __init__(
-        self, scheme: AscendMoEScheme, moe_config: FusedMoEConfig, tid2eid=None
-    ) -> None:
-        super().__init__(moe_config)
-        self.quant_method = scheme
-        self.tid2eid = tid2eid
-
-    @property
-    def is_monolithic(self) -> bool:
-        return False
-
-    def maybe_make_prepare_finalize(self, routing_tables=None):
-        # Ascend owns its communication/forward implementation.
-        return None
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        weight_param = self.quant_method.get_weight(
-            num_experts, intermediate_size_per_partition, hidden_size, params_dtype
-        )
-        for param_key, param_value in weight_param.items():
-            param = torch.nn.Parameter(param_value, requires_grad=False)
-            layer.register_parameter(param_key, param)
-            set_weight_attrs(param, extra_weight_attrs)
-
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
-        )
-        per_group_param = [
-            "weight_scale_second",
-            "weight_offset_second",
-            "scale_bias",
-        ] + (
-            ["weight_scale", "weight_offset"]
-            if hasattr(self.quant_method, "group_size")
-            and self.quant_method.group_size > 0
-            else []
-        )
-        dynamic_quant_param = self.quant_method.get_dynamic_quant_param(
-            num_experts, intermediate_size_per_partition, hidden_size, params_dtype
-        )
-        for param_key, param_value in dynamic_quant_param.items():
-            param = torch.nn.Parameter(param_value, requires_grad=False)
-            layer.register_parameter(param_key, param)
-            set_weight_attrs(param, extra_weight_attrs)
-            if any(field in param_key for field in per_group_param):
-                param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        num_experts: int = -1,
-        expert_map: torch.Tensor | None = None,
-        topk_group: int | None = None,
-        num_expert_group: int | None = None,
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: torch.Tensor | None = None,
-        is_prefill: bool = True,
-        enable_force_load_balance: bool = False,
-        log2phy: torch.Tensor | None = None,
-        global_redundant_expert_num: int = 0,
-        pertoken_scale: torch.Tensor | None = None,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        mc2_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.quant_method.apply(
-            layer=layer,
-            x=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            renormalize=renormalize,
-            use_grouped_topk=use_grouped_topk,
-            num_experts=num_experts,
-            expert_map=expert_map,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            is_prefill=is_prefill,
-            enable_force_load_balance=enable_force_load_balance,
-            log2phy=log2phy,
-            global_redundant_expert_num=global_redundant_expert_num,
-            pertoken_scale=pertoken_scale,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            mc2_mask=mc2_mask,
-            tid2eid=self.tid2eid,
-        )
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.quant_method.process_weights_after_loading(layer)
-
-    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
-        return None
-
-    @property
-    def supports_eplb(self):
-        return getattr(self.quant_method, "supports_eplb", False)
 
 
 class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
@@ -431,7 +304,6 @@ def create_moe_scheme(quant_type: str) -> AscendMoEScheme:
 
 
 __all__ = [
-    "AscendFusedMoEMethod",
     "AscendMoEScheme",
     "AscendW8A8DynamicFusedMoEMethod",
     "create_moe_scheme",

@@ -33,6 +33,7 @@ def _load_compat():
         "vllm_fl.dispatch.backends.vendor",
         "vllm_fl.dispatch.backends.vendor.ascend",
         "vllm_fl.configs",
+        "vllm_fl.distributed",
     )
     modules = {name: _package(name) for name in package_names}
     vllm_logger = type(sys)("vllm.logger")
@@ -87,6 +88,13 @@ def _load_compat():
     assert config_spec is not None and config_spec.loader is not None
     config_module = importlib.util.module_from_spec(config_spec)
     modules["vllm_fl.configs.ascend"] = config_module
+    runtime_spec = importlib.util.spec_from_file_location(
+        "vllm_fl.distributed.ascend_moe_runtime",
+        ROOT / "vllm_fl" / "distributed" / "ascend_moe_runtime.py",
+    )
+    assert runtime_spec is not None and runtime_spec.loader is not None
+    runtime_module = importlib.util.module_from_spec(runtime_spec)
+    modules["vllm_fl.distributed.ascend_moe_runtime"] = runtime_module
     path = MOE / "compat.py"
     spec = importlib.util.spec_from_file_location("_fl_ascend_moe_compat_test", path)
     assert spec is not None and spec.loader is not None
@@ -95,6 +103,7 @@ def _load_compat():
     try:
         sys.modules.update(modules)
         config_spec.loader.exec_module(config_module)
+        runtime_spec.loader.exec_module(runtime_module)
         spec.loader.exec_module(module)
     finally:
         for name, previous in previous_modules.items():
@@ -119,6 +128,7 @@ def _load_compat():
     # is restored. Config function globals must never resolve through module
     # state leaked from an earlier test.
     module._config_owner = config_module
+    module._runtime_owner = runtime_module
     return module
 
 
@@ -148,7 +158,7 @@ def test_shared_expert_stream_is_created_lazily_once(monkeypatch) -> None:
         SimpleNamespace(npu=SimpleNamespace(Stream=stream_factory)),
     )
 
-    assert compat._SHARED_EXPERTS_CALCULATION_STREAM is None
+    assert compat._runtime_owner._SHARED_EXPERTS_CALCULATION_STREAM is None
     assert compat.shared_experts_calculation_stream() is stream
     assert compat.shared_experts_calculation_stream() is stream
     stream_factory.assert_called_once_with()
@@ -166,7 +176,7 @@ def test_stream_switch_uses_npu_context_when_enabled(monkeypatch) -> None:
     marker = object()
     stream_context = Mock(return_value=nullcontext(marker))
     monkeypatch.setattr(
-        compat,
+        compat._runtime_owner,
         "torch",
         SimpleNamespace(npu=SimpleNamespace(stream=stream_context)),
     )

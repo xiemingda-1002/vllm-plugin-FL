@@ -45,8 +45,10 @@ from .quant_type import QuantType
 from .compat import (
     ACL_FORMAT_FRACTAL_NZ,
     maybe_trans_nz,
+)
+from vllm_fl.configs.ascend import shared_expert_dp_enabled
+from vllm_fl.distributed.ascend_moe_runtime import (
     npu_stream_switch,
-    shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
 

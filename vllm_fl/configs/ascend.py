@@ -431,3 +431,13 @@ def enable_sp_by_pass() -> bool:
     compilation_config = getattr(vllm_config, "compilation_config", None)
     pass_config = getattr(compilation_config, "pass_config", None)
     return bool(getattr(pass_config, "enable_sp", False))
+
+
+def shared_expert_dp_enabled() -> bool:
+    config = get_ascend_config()
+    flashcomm1_enabled = enable_sp(
+        enable_shared_expert_dp=config.enable_shared_expert_dp
+    )
+    return bool(
+        config.enable_shared_expert_dp or flashcomm1_enabled or enable_sp_by_pass()
+    )

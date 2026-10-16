@@ -22,7 +22,7 @@ from vllm.distributed import get_tp_group
 
 from vllm_fl.ascend_forward_context import MoECommType, _EXTRA_CTX
 from vllm_fl.dispatch.backends.vendor.ascend.impl.device_operator import DeviceOperator
-from .compat import split_tensor_along_first_dim
+from vllm_fl.distributed.ascend_utils import split_tensor_along_first_dim
 
 
 def select_experts(

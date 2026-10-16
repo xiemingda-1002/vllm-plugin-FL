@@ -29,11 +29,6 @@ from typing import Any
 
 import torch
 
-from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
-from vllm.model_executor.parameter import PerTensorScaleParameter
-from vllm.model_executor.utils import set_weight_attrs
-
 from .linear_utils import maybe_trans_nz, register_quantize
 
 COMPRESSED_TENSORS_METHOD = "compressed-tensors"
@@ -91,32 +86,6 @@ def _dsa_cp_enabled() -> bool:
     from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import enable_dsa_cp
 
     return enable_dsa_cp()
-
-
-def _flashcomm2_requested() -> bool:
-    """Read rc1's FlashComm2 config precedence for the explicit reject gate."""
-    from vllm_fl.configs.ascend import (
-        get_ascend_additional_config,
-    )
-
-    additional_config = get_ascend_additional_config()
-    if "enable_flashcomm2_parallel_size" in additional_config:
-        parallel_size = additional_config["enable_flashcomm2_parallel_size"]
-    else:
-        import os
-
-        raw_parallel_size = os.getenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", "0")
-        try:
-            parallel_size = int(raw_parallel_size)
-        except ValueError as exc:
-            raise ValueError(
-                "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE must be an integer"
-            ) from exc
-    if isinstance(parallel_size, bool) or not isinstance(parallel_size, int):
-        raise ValueError(
-            "additional_config.enable_flashcomm2_parallel_size must be an integer"
-        )
-    return parallel_size > 0
 
 
 class AscendW8A8LinearMethod(AscendLinearScheme):
@@ -331,106 +300,6 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 
-class AscendLinearMethod(LinearMethodBase):
-    """rc1 adapter allocating ModelSlim linear parameter contracts."""
-
-    def __init__(self, scheme: AscendLinearScheme) -> None:
-        self.quant_method = scheme
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs: Any,
-    ) -> None:
-        output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        weight_dict = self.quant_method.get_weight(
-            input_size_per_partition, output_size_per_partition, params_dtype
-        )
-        packed_dim = weight_dict.pop("_packed_dim", None)
-        packed_factor = weight_dict.pop("_packed_factor", None)
-        for weight_name, weight_param in weight_dict.items():
-            param = torch.nn.Parameter(weight_param, requires_grad=False)
-            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
-            if packed_dim is not None and packed_factor is not None:
-                set_weight_attrs(
-                    param, {"packed_dim": packed_dim, "packed_factor": packed_factor}
-                )
-            layer.register_parameter(weight_name, param)
-            set_weight_attrs(param, extra_weight_attrs)
-
-        layer_type = "row" if isinstance(layer, RowParallelLinear) else "others"
-        pertensor_dict = self.quant_method.get_pertensor_param(
-            params_dtype, layer_type=layer_type
-        )
-        for name, value in pertensor_dict.items():
-            param = PerTensorScaleParameter(data=value, weight_loader=weight_loader)
-            param.ignore_warning = True
-            layer.register_parameter(name, param)
-            param.weight_loader = weight_loader
-
-        perchannel_dict = self.quant_method.get_perchannel_param(
-            output_size_per_partition, params_dtype
-        )
-        for name, value in perchannel_dict.items():
-            param = torch.nn.Parameter(value, requires_grad=False)
-            set_weight_attrs(param, {"output_dim": 0})
-            layer.register_parameter(name, param)
-            set_weight_attrs(param, extra_weight_attrs)
-
-        pergroup_dict = self.quant_method.get_pergroup_param(
-            input_size_per_partition,
-            output_size_per_partition,
-            params_dtype,
-            layer_type=layer_type,
-        )
-        scale_packed_dim = pergroup_dict.pop("_packed_dim", None)
-        scale_packed_factor = pergroup_dict.pop("_packed_factor", None)
-        for name, value in pergroup_dict.items():
-            param = torch.nn.Parameter(value, requires_grad=False)
-            set_weight_attrs(param, {"output_dim": 0})
-            layer.register_parameter(name, param)
-            set_weight_attrs(param, extra_weight_attrs)
-            if scale_packed_dim is not None and scale_packed_factor is not None:
-                set_weight_attrs(
-                    param,
-                    {
-                        "packed_dim": scale_packed_dim,
-                        "packed_factor": scale_packed_factor,
-                    },
-                )
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.quant_method.process_weights_after_loading(layer)
-
-    def get_computed_params(self) -> set[str]:
-        return {"weight_offset", "quant_bias", "deq_scale", "weight_scale"}
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if isinstance(layer, RowParallelLinear):
-            if (
-                "o_proj" in layer.prefix or "out_proj" in layer.prefix
-            ) and _flashcomm2_requested():
-                raise NotImplementedError(
-                    "FL Ascend ModelSlim linear does not yet migrate "
-                    "FlashComm2 tensor-parallel groups"
-                )
-            tp_rank = get_tensor_model_parallel_rank()
-        else:
-            tp_rank = 0
-        return self.quant_method.apply(layer, x, bias, tp_rank)
-
-
 def create_linear_scheme(quant_type: str) -> AscendLinearScheme:
     """Create exactly the two ModelSlim linear schemes in this bounded port."""
     normalized = quant_type.upper()
@@ -445,7 +314,6 @@ def create_linear_scheme(quant_type: str) -> AscendLinearScheme:
 
 
 __all__ = [
-    "AscendLinearMethod",
     "AscendLinearScheme",
     "AscendW8A8DynamicLinearMethod",
     "AscendW8A8LinearMethod",

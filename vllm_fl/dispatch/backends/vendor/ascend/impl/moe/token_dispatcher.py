@@ -31,7 +31,7 @@ from vllm.distributed.parallel_state import get_ep_group
 from .compat import get_ascend_config
 from vllm_fl.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_fl.dispatch.backends.vendor.ascend.impl.device_operator import DeviceOperator
-from .compat import get_mc2_group
+from vllm_fl.distributed.ascend_parallel_state import get_mc2_group
 from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,

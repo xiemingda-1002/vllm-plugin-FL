@@ -119,7 +119,9 @@ def is_pd_decode_recompute_scheduler_enabled() -> bool:
 
 
 def npu_stream_switch(*args, **kwargs):
-    from .impl.moe.compat import npu_stream_switch as _npu_stream_switch
+    from vllm_fl.distributed.ascend_moe_runtime import (
+        npu_stream_switch as _npu_stream_switch,
+    )
 
     return _npu_stream_switch(*args, **kwargs)
 

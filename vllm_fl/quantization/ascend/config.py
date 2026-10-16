@@ -510,11 +510,15 @@ def create_scheme_for_layer(
         raise ValueError(err_msg)
 
     if layer_type == "linear":
-        from .linear import create_linear_scheme
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.linear import (
+            create_linear_scheme,
+        )
 
         return create_linear_scheme(quant_type)
     if layer_type == "moe":
-        from .moe import create_moe_scheme
+        from vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.moe import (
+            create_moe_scheme,
+        )
 
         return create_moe_scheme(quant_type)
     raise NotImplementedError(
@@ -676,7 +680,7 @@ class AscendModelSlimConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str, tid2eid=None
     ) -> QuantizeMethodBase | None:
-        from .linear import AscendLinearMethod
+        from .method_adapters import AscendLinearMethod
 
         vllm_config = get_current_vllm_config()
         model_type = vllm_config.model_config.hf_config.model_type
@@ -741,7 +745,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                     "FusedMoE",
                 )
                 return AscendUnquantizedFusedMoEMethod(layer.moe_config)
-            from .moe import AscendFusedMoEMethod
+            from .method_adapters import AscendFusedMoEMethod
 
             scheme = create_scheme_for_layer(
                 self.quant_description, prefix, "moe", self.packed_modules_mapping

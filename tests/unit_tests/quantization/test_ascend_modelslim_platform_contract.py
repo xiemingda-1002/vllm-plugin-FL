@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 PLATFORM = Path(__file__).parents[3] / "vllm_fl" / "platform.py"
-PACKAGE = "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization"
+PACKAGE = "vllm_fl.quantization.ascend"
 
 
 def _method(name):
@@ -33,17 +33,25 @@ def _method(name):
 @pytest.mark.parametrize("device", ["npu", "cuda", "musa"])
 def test_registration_is_vendor_scoped(monkeypatch, device):
     register = Mock()
-    parts = PACKAGE.split(".")
-    parent = None
-    for i, name in enumerate(parts):
-        full_name = ".".join(parts[: i + 1])
-        module = ModuleType(full_name)
-        module.__path__ = []
-        monkeypatch.setitem(sys.modules, full_name, module)
-        if parent is not None:
-            setattr(parent, name, module)
-        parent = module
-    parent.register_modelslim = register
+    packages = {}
+    for package_name in (
+        PACKAGE,
+        "vllm_fl.dispatch.backends.vendor.ascend",
+    ):
+        parts = package_name.split(".")
+        parent = None
+        for i, name in enumerate(parts):
+            full_name = ".".join(parts[: i + 1])
+            if full_name not in packages:
+                module = ModuleType(full_name)
+                module.__path__ = []
+                packages[full_name] = module
+                monkeypatch.setitem(sys.modules, full_name, module)
+            module = packages[full_name]
+            if parent is not None:
+                setattr(parent, name, module)
+            parent = module
+    packages[PACKAGE].register_modelslim = register
     method = _method("pre_register_and_update")
     namespace = {}
     exec(

@@ -26,6 +26,8 @@ def _package(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
 def linear_module(monkeypatch: pytest.MonkeyPatch):
     for name in (
         "vllm_fl",
+        "vllm_fl.quantization",
+        "vllm_fl.quantization.ascend",
         "vllm_fl.dispatch",
         "vllm_fl.dispatch.backends",
         "vllm_fl.dispatch.backends.vendor",
@@ -67,6 +69,14 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
     layers_linear.LinearMethodBase = LinearMethodBase
     layers_linear.RowParallelLinear = RowParallelLinear
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.linear", layers_linear)
+
+    fused = types.ModuleType("vllm.model_executor.layers.fused_moe")
+    fused.FusedMoEMethodBase = object
+    fused.FusedMoeWeightScaleSupported = types.SimpleNamespace()
+    monkeypatch.setitem(sys.modules, fused.__name__, fused)
+    fused_config = types.ModuleType("vllm.model_executor.layers.fused_moe.config")
+    fused_config.FusedMoEConfig = object
+    monkeypatch.setitem(sys.modules, fused_config.__name__, fused_config)
 
     parameter = types.ModuleType("vllm.model_executor.parameter")
     parameter.PerTensorScaleParameter = lambda data, weight_loader: torch.nn.Parameter(
@@ -120,15 +130,6 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, ascend_config_module.__name__, ascend_config_module)
     ascend_config_spec.loader.exec_module(ascend_config_module)
 
-    compat_spec = importlib.util.spec_from_file_location(
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.moe.compat",
-        ROOT / "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/compat.py",
-    )
-    assert compat_spec is not None and compat_spec.loader is not None
-    compat_module = importlib.util.module_from_spec(compat_spec)
-    monkeypatch.setitem(sys.modules, compat_module.__name__, compat_module)
-    compat_spec.loader.exec_module(compat_module)
-
     utils_spec = importlib.util.spec_from_file_location(
         "vllm_fl.dispatch.backends.vendor.ascend.impl.quantization.linear_utils",
         ROOT
@@ -147,6 +148,17 @@ def linear_module(monkeypatch: pytest.MonkeyPatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, MODULE, module)
     spec.loader.exec_module(module)
+    adapter_name = "vllm_fl.quantization.ascend.method_adapters"
+    adapter_spec = importlib.util.spec_from_file_location(
+        adapter_name, ROOT / "vllm_fl/quantization/ascend/method_adapters.py"
+    )
+    assert adapter_spec and adapter_spec.loader
+    adapters = importlib.util.module_from_spec(adapter_spec)
+    monkeypatch.setitem(sys.modules, adapter_name, adapters)
+    adapter_spec.loader.exec_module(adapters)
+    # Test fixture facade; production vendor schemes do not re-export adapters.
+    module.AscendLinearMethod = adapters.AscendLinearMethod
+    module._flashcomm2_requested = adapters._flashcomm2_requested
     return module, utils_module, current, RowParallelLinear, registrations
 
 

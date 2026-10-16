@@ -15,7 +15,7 @@ from vllm.distributed.parallel_state import (
     init_model_parallel_group,
 )
 
-from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import get_ascend_config
+from vllm_fl.configs.ascend import get_ascend_config
 
 _MC2: GroupCoordinator | None = None
 _MLP_TP: GroupCoordinator | None = None

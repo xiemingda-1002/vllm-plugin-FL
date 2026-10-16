@@ -24,6 +24,8 @@ def _package(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
 def moe_module(monkeypatch: pytest.MonkeyPatch):
     for name in (
         "vllm_fl",
+        "vllm_fl.quantization",
+        "vllm_fl.quantization.ascend",
         "vllm_fl.dispatch",
         "vllm_fl.dispatch.backends",
         "vllm_fl.dispatch.backends.vendor",
@@ -44,6 +46,17 @@ def moe_module(monkeypatch: pytest.MonkeyPatch):
     config = types.ModuleType("vllm.config")
     config.get_current_vllm_config = lambda: current
     monkeypatch.setitem(sys.modules, "vllm.config", config)
+
+    distributed = types.ModuleType("vllm.distributed")
+    distributed.get_tensor_model_parallel_rank = lambda: 0
+    monkeypatch.setitem(sys.modules, distributed.__name__, distributed)
+    linear = types.ModuleType("vllm.model_executor.layers.linear")
+    linear.LinearMethodBase = object
+    linear.RowParallelLinear = type("RowParallelLinear", (), {})
+    monkeypatch.setitem(sys.modules, linear.__name__, linear)
+    parameter = types.ModuleType("vllm.model_executor.parameter")
+    parameter.PerTensorScaleParameter = object
+    monkeypatch.setitem(sys.modules, parameter.__name__, parameter)
 
     fused = types.ModuleType("vllm.model_executor.layers.fused_moe")
 
@@ -109,6 +122,16 @@ def moe_module(monkeypatch: pytest.MonkeyPatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, MODULE, module)
     spec.loader.exec_module(module)
+    adapter_name = "vllm_fl.quantization.ascend.method_adapters"
+    adapter_spec = importlib.util.spec_from_file_location(
+        adapter_name, ROOT / "vllm_fl/quantization/ascend/method_adapters.py"
+    )
+    assert adapter_spec and adapter_spec.loader
+    adapters = importlib.util.module_from_spec(adapter_spec)
+    monkeypatch.setitem(sys.modules, adapter_name, adapters)
+    adapter_spec.loader.exec_module(adapters)
+    # Test fixture facade; production vendor schemes do not re-export adapters.
+    module.AscendFusedMoEMethod = adapters.AscendFusedMoEMethod
     return module, current, forward
 
 

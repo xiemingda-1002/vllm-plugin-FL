@@ -20,7 +20,7 @@ from vllm_fl.ascend_forward_context import _EXTRA_CTX
 
 from .device_operator import DeviceOperator
 from ..dsa_compat import enable_dsa_cp
-from .moe.compat import shared_expert_dp_enabled
+from vllm_fl.configs.ascend import shared_expert_dp_enabled
 
 
 def flashcomm1_configured() -> bool:
