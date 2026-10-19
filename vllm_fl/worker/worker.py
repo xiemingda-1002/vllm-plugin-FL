@@ -71,7 +71,6 @@ import vllm_fl.envs as fl_envs
 from vllm_fl.ascend_flashcomm import (
     enable_flashcomm1,
 )
-from vllm_fl.compilation import graph_kind
 from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.ops.custom_ops import register_oot_ops
 from vllm_fl.utils import get_flag_gems_whitelist_blacklist
@@ -558,38 +557,16 @@ class WorkerFL(WorkerBase):
             # allocated. Account for their pool before sizing the cache;
             # otherwise high-concurrency batches can leave no room for
             # runtime activations and fail with OOM.
-            #
-            # T61: the estimate is *only* computed behind ``is_cuda()`` here, so
-            # on Ascend the whole graph-memory reservation never ran -- that is
-            # why T58's doubling in ``profile_cudagraph_memory`` had no effect on
-            # the KV pool (T60 measured 416,640 tokens, the single-set value).
-            # The dual-graph mode needs the reservation on NPU too, so it is
-            # wired through the same call behind an explicit opt-in switch (the
-            # NPU branch of ``profile_cudagraph_memory`` has never been
-            # exercised, and T60 showed 22 identical graphs fit without the
-            # reservation).
             cudagraph_memory_estimate = 0
-            want_cudagraph_estimate = (
-                current_platform.is_cuda()
-                or getattr(current_platform, "vendor_name", None) == "kunlunxin"
-                or (
-                    graph_kind.dual_graph_enabled()
-                    and graph_kind.kv_reserve_enabled()
-                )
-            )
             if (
-                want_cudagraph_estimate
+                (
+                    current_platform.is_cuda()
+                    or getattr(current_platform, "vendor_name", None) == "kunlunxin"
+                )
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
-                if graph_kind.dual_graph_enabled():
-                    print(
-                        "[DUAL_GRAPH] graph-memory reservation armed: estimate "
-                        f"{cudagraph_memory_estimate / GiB_bytes:.2f} GiB "
-                        "(already doubled for the short+long sets)",
-                        flush=True,
-                    )
 
         profile_result.torch_peak_increase = (
             profile_torch_peak - profile_result.before_profile.torch_peak
@@ -601,13 +578,7 @@ class WorkerFL(WorkerBase):
         )
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
-            if (
-                envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-                or (
-                    graph_kind.dual_graph_enabled()
-                    and graph_kind.kv_reserve_enabled()
-                )
-            )
+            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             else 0
         )
 

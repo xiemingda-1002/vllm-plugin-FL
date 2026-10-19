@@ -7903,17 +7903,6 @@ class ModelRunnerFL(GPUModelRunner):
             + max(shared_memory_estimate.values(), default=0)
             + sum(per_graph_estimate.values())
         )
-        if graph_kind.dual_graph_enabled():
-            # T58: the short set duplicates every captured decode shape, and both
-            # sets stay live, so the pool footprint roughly doubles. The estimate
-            # gates the KV-cache budget *before* capture, so it must reserve for
-            # both sets; under-reserving would fail during capture, not later.
-            decoder_estimate *= 2
-            logger.info(
-                "Dual-graph: decode-graph memory estimate doubled to %.2f GiB "
-                "(long + short sets)",
-                decoder_estimate / (1 << 30),
-            )
         # Encoder graphs use a manager-local pool at runtime, separate from the
         # decoder pool, so add their estimate instead of overlaying it.
         total_estimate = decoder_estimate + encoder_memory_estimate

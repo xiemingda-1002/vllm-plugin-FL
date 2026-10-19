@@ -139,22 +139,6 @@ def retrace_enabled() -> bool:
     return os.environ.get(RETRACE_SWITCH, "1").strip() != "0"
 
 
-#: ``VLLM_FL_M3_DUAL_GRAPH_KV_RESERVE=1`` arms the KV-budget reservation for the
-#: duplicated graph set. Off by default, and the switch *is* connected to the
-#: real budget point (``vllm_fl/worker/worker.py`` ``determine_available_memory``)
-#: -- unlike T58's doubling, which sat behind a CUDA-only call gate and therefore
-#: never ran on this stack (T60: KV pool 416,640 tokens, the single-set value).
-#: T60 also showed 22 graphs fit without the reservation, so arming it is a
-#: margin decision, not a correctness one: it costs two extra capture shapes at
-#: start-up and shrinks the pool by the graph memory.
-KV_RESERVE_SWITCH = "VLLM_FL_M3_DUAL_GRAPH_KV_RESERVE"
-
-
-def kv_reserve_enabled() -> bool:
-    """Whether the NPU KV budget reserves memory for both graph sets."""
-    return _env_flag(KV_RESERVE_SWITCH)
-
-
 def short_covered_sizes() -> frozenset[int]:
     """Padded batch sizes for which a short graph was captured."""
     return _short_sizes
