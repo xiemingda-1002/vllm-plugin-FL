@@ -159,7 +159,11 @@ def get_ascend_config():
             "recompute_scheduler_enable is ignored on PD-disaggregated P nodes; "
             "configure it only on D nodes"
         )
-    compilation = _nested_config(extra, "ascend_compilation_config")
+    from vllm_fl.compilation.config import validate_ascend_compilation_options
+
+    compilation = validate_ascend_compilation_options(
+        _nested_config(extra, "ascend_compilation_config")
+    )
     fusion = _nested_config(extra, "ascend_fusion_config")
     eplb = _nested_config(extra, "eplb_config")
     finegrained_tp = _nested_config(extra, "finegrained_tp_config")
@@ -286,9 +290,6 @@ def get_ascend_config():
     )
     _reject_unsupported(eplb_requested, "EPLB")
     _reject_unsupported(
-        bool(compilation.get("enable_static_kernel", False)), "static kernel generation"
-    )
-    _reject_unsupported(
         bool(fusion.get("fusion_ops_gmmswigluquant", False)),
         "gmmswigluquant fusion",
     )
@@ -374,14 +375,7 @@ def get_ascend_config():
         finegrained_tp_config=SimpleNamespace(
             **requested_finegrained,
         ),
-        ascend_compilation_config=SimpleNamespace(
-            enable_npugraph_ex=compilation.get("enable_npugraph_ex", True),
-            enable_static_kernel=False,
-            fuse_norm_quant=compilation.get("fuse_norm_quant", True),
-            fuse_qknorm_rope=compilation.get("fuse_qknorm_rope", True),
-            fuse_allreduce_rms=compilation.get("fuse_allreduce_rms", False),
-            fuse_muls_add=compilation.get("fuse_muls_add", True),
-        ),
+        ascend_compilation_config=SimpleNamespace(**compilation),
         # FL's current AllGather MoE never enables this quantized fusion.
         ascend_fusion_config=SimpleNamespace(fusion_ops_gmmswigluquant=False),
         eplb_config=SimpleNamespace(

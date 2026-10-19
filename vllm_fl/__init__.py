@@ -197,8 +197,8 @@ def _patch_ascend_torch_accelerator() -> None:
     from vllm.platforms import current_platform
 
     if (
-        current_platform.vendor_name == "ascend"
-        and current_platform.device_type == "npu"
+        current_platform.device_type == "npu"
+        and getattr(current_platform, "vendor_name", None) == "ascend"
     ):
         from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_torch_accelerator import (
             patch_torch_accelerator,

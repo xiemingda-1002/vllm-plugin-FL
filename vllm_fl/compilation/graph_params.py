@@ -77,6 +77,10 @@ def weak_ref_workspace(num_tokens: int) -> None:
     workspace = params.workspaces[num_tokens]
     if workspace is None:
         return
-    from vllm_fl.compilation.graph import weak_ref_tensors
+    try:
+        from vllm.utils.torch_utils import weak_ref_tensors
 
-    params.workspaces[num_tokens] = weak_ref_tensors(workspace)
+        weak_workspace = weak_ref_tensors(workspace)
+    except Exception:
+        weak_workspace = workspace
+    params.workspaces[num_tokens] = weak_workspace

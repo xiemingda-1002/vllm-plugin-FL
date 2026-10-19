@@ -267,6 +267,7 @@ def test_moe_compat_uses_rc1_nested_defaults(monkeypatch) -> None:
     assert config.eplb_config.algorithm_execution_interval == 50
     assert config.eplb_config.eplb_policy_type == 2
     assert config.eplb_config.expert_map_record_path is None
+    assert config.ascend_compilation_config.enable_npugraph_ex is False
     assert config.ascend_compilation_config.enable_static_kernel is False
     assert config.ascend_fusion_config.fusion_ops_gmmswigluquant is False
 
@@ -283,7 +284,7 @@ def test_moe_compat_uses_rc1_nested_defaults(monkeypatch) -> None:
         ({"enable_mc2_hierarchy_comm": True}, "MC2 hierarchy communication"),
         (
             {"ascend_compilation_config": {"enable_static_kernel": True}},
-            "static kernel generation",
+            "enable_static_kernel=True",
         ),
         (
             {"ascend_fusion_config": {"fusion_ops_gmmswigluquant": True}},
@@ -455,6 +456,7 @@ def test_shared_expert_dp_defaults_false_without_current_config(monkeypatch) -> 
 def test_all2all_prepare_finalize_honors_shared_expert_dp_skip(monkeypatch) -> None:
     """Exercise the existing prepare/finalize flag, without a device group."""
     import torch
+
     from vllm_fl.dispatch.backends.vendor.ascend.impl.moe import prepare_finalize
 
     method = object.__new__(prepare_finalize.PrepareAndFinalizeWithAll2All)
@@ -518,9 +520,7 @@ def test_invalid_eplb_values_follow_rc1_validation(monkeypatch, settings, error)
 )
 def test_malformed_nested_configuration_is_not_ignored(monkeypatch, name):
     compat = _load_compat()
-    monkeypatch.setattr(
-        _config_owner(compat), "_additional_config", lambda: {name: []}
-    )
+    monkeypatch.setattr(_config_owner(compat), "_additional_config", lambda: {name: []})
     with pytest.raises(TypeError, match="must be a mapping"):
         compat.get_ascend_config()
 
@@ -699,18 +699,13 @@ def test_worker_ascend_config_import_is_vendor_guarded_in_constructor_ast():
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
-        has_ascend_guard = (
-            isinstance(node.test, ast.Compare)
-            and any(
-                isinstance(comparator, ast.Constant)
-                and comparator.value == "ascend"
-                for comparator in node.test.comparators
-            )
+        has_ascend_guard = isinstance(node.test, ast.Compare) and any(
+            isinstance(comparator, ast.Constant) and comparator.value == "ascend"
+            for comparator in node.test.comparators
         )
         imports_config = any(
             isinstance(child, ast.ImportFrom)
-            and child.module
-            == "vllm_fl.configs.ascend"
+            and child.module == "vllm_fl.configs.ascend"
             and any(alias.name == "init_ascend_config" for alias in child.names)
             for child in ast.walk(node)
         )
@@ -729,13 +724,14 @@ def test_worker_ascend_config_import_is_vendor_guarded_in_constructor_ast():
     # devices or the rest of WorkerFL. Non-Ascend must not even import config.
     import builtins
 
-    branch = compile(ast.Module(body=guarded_imports, type_ignores=[]),
-                     str(worker_path), "exec")
+    branch = compile(
+        ast.Module(body=guarded_imports, type_ignores=[]), str(worker_path), "exec"
+    )
     for vendor in ("cuda", "musa", None, "ascend"):
         calls = []
         owner = object()
 
-        def guarded_import(name, *args, **kwargs):
+        def guarded_import(name, *args, calls=calls, **kwargs):
             calls.append(("import", name))
             return SimpleNamespace(
                 init_ascend_config=lambda config: calls.append(("init", config))

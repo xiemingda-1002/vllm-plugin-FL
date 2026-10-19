@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from torch._inductor.pattern_matcher import Match
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -24,6 +25,9 @@ def extra_stream_scope_check(match: Match) -> bool:
                 logger.debug("Fusion rejected across streams: %s", non_default_streams)
                 return False
     if has_default and non_default_streams:
-        logger.debug("Fusion rejected across default/non-default streams: %s", non_default_streams)
+        logger.debug(
+            "Fusion rejected across default/non-default streams: %s",
+            non_default_streams,
+        )
         return False
     return True

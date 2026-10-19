@@ -1,8 +1,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
 import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +18,8 @@ def _platform_config(*, mode=CompilationMode.VLLM_COMPILE):
         attention_config=None,
         compilation_config=SimpleNamespace(
             mode=mode,
+            backend="inductor",
+            use_inductor=True,
             compile_sizes=[],
             pass_config=SimpleNamespace(enable_sp=False),
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
@@ -63,7 +64,7 @@ def test_platform_selects_fl_compiler_only_for_npu(monkeypatch) -> None:
     monkeypatch.setattr(PlatformFL, "device_type", "npu")
     assert (
         PlatformFL.get_compile_backend()
-        == "vllm_fl.compilation.compiler_interface.AscendCompiler"
+        == "vllm_fl.compilation.fx_backend.FXFusionAdaptor"
     )
 
     monkeypatch.setattr(PlatformFL, "device_type", "cuda")
@@ -176,9 +177,7 @@ def test_ascend_backend_preserves_model_derived_hybrid_block_size(
             mamba_block_size=4096,
         ),
         model_config=SimpleNamespace(max_model_len=4096),
-        scheduler_config=SimpleNamespace(
-            disable_hybrid_kv_cache_manager=False
-        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         kv_transfer_config=None,
     )
 
@@ -200,9 +199,7 @@ def test_ascend_backend_aligns_mamba_block_for_kv_transfer(monkeypatch) -> None:
             mamba_block_size=4096,
         ),
         model_config=SimpleNamespace(max_model_len=4096),
-        scheduler_config=SimpleNamespace(
-            disable_hybrid_kv_cache_manager=False
-        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         kv_transfer_config=SimpleNamespace(),
     )
 
@@ -222,7 +219,7 @@ def test_full_decode_only_uses_supported_ascend_config(monkeypatch) -> None:
     compilation_config = config.compilation_config
 
     assert config.additional_config["ascend_compilation_config"] == {
-        "enable_npugraph_ex": True,
+        "enable_npugraph_ex": False,
         "enable_static_kernel": False,
         "fuse_norm_quant": True,
         "fuse_qknorm_rope": True,
@@ -230,9 +227,139 @@ def test_full_decode_only_uses_supported_ascend_config(monkeypatch) -> None:
         "fuse_muls_add": True,
     }
     assert compilation_config.cudagraph_num_of_warmups == 1
+    assert compilation_config.backend == "fl_fx_fusion"
+    assert compilation_config.use_inductor is False
     assert compilation_config.use_inductor_graph_partition is False
     assert compilation_config.splitting_ops == []
     assert config.parallel_config.all2all_backend == "flashinfer_all2allv"
+
+
+def test_all_fusions_disabled_selects_native_eager_backend(monkeypatch) -> None:
+    from vllm_fl.platform import PlatformFL
+
+    _stub_refresh_block_size(monkeypatch)
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _platform_config()
+    config.additional_config["ascend_compilation_config"] = {
+        "fuse_norm_quant": False,
+        "fuse_qknorm_rope": False,
+        "fuse_muls_add": False,
+    }
+
+    PlatformFL.check_and_update_config(config)
+
+    assert config.compilation_config.backend == "eager"
+    assert config.compilation_config.use_inductor is False
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+
+
+@pytest.mark.parametrize("initial_mode", [None, CompilationMode.NONE])
+def test_no_graph_request_does_not_force_compilation_mode(
+    monkeypatch, initial_mode
+) -> None:
+    from vllm_fl.platform import PlatformFL
+
+    _stub_refresh_block_size(monkeypatch)
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _platform_config(mode=initial_mode)
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    PlatformFL.check_and_update_config(config)
+
+    assert config.compilation_config.mode is initial_mode
+
+
+def test_full_decode_graph_enables_vllm_compile_when_initial_mode_none(
+    monkeypatch,
+) -> None:
+    from vllm_fl.platform import PlatformFL
+
+    _stub_refresh_block_size(monkeypatch)
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _platform_config(mode=CompilationMode.NONE)
+
+    PlatformFL.check_and_update_config(config)
+
+    assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+
+
+def test_enforce_eager_disables_compilation_and_graph(monkeypatch) -> None:
+    from vllm_fl.platform import _configure_ascend_compilation
+
+    config = _platform_config()
+    config.model_config = SimpleNamespace(enforce_eager=True, architectures=[])
+
+    _configure_ascend_compilation(config)
+
+    assert config.compilation_config.mode == CompilationMode.NONE
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+
+def test_minimax_retains_qknorm_exclusion_with_thin_backend() -> None:
+    from vllm_fl.platform import _configure_ascend_compilation
+
+    config = _platform_config()
+    config.model_config = SimpleNamespace(
+        enforce_eager=False, architectures=["MiniMaxM3SparseForCausalLM"]
+    )
+
+    _configure_ascend_compilation(config)
+
+    assert (
+        config.additional_config["ascend_compilation_config"]["fuse_qknorm_rope"]
+        is False
+    )
+    assert config.compilation_config.backend == "fl_fx_fusion"
+
+
+@pytest.mark.parametrize(
+    "option", ["enable_npugraph_ex", "enable_static_kernel", "fuse_allreduce_rms"]
+)
+def test_retired_compiler_options_fail_during_platform_configuration(
+    monkeypatch, option
+) -> None:
+    from vllm_fl.platform import PlatformFL
+
+    _stub_refresh_block_size(monkeypatch)
+    monkeypatch.setattr(PlatformFL, "device_type", "npu")
+    config = _platform_config()
+    config.additional_config["ascend_compilation_config"] = {option: True}
+
+    with pytest.raises(NotImplementedError, match=f"{option}=True"):
+        PlatformFL.check_and_update_config(config)
+
+
+@pytest.mark.parametrize(
+    ("raw", "error", "message"),
+    [
+        ([], TypeError, "must be a dict"),
+        ({"unknown": True}, ValueError, "Unsupported FL Ascend compiler options"),
+        ({"enable_npugraph_ex": 1}, TypeError, "enable_npugraph_ex must be a bool"),
+        ({"fuse_norm_quant": "false"}, TypeError, "fuse_norm_quant must be a bool"),
+        ({"fuse_qknorm_rope": None}, TypeError, "fuse_qknorm_rope must be a bool"),
+        ({"fuse_muls_add": 0}, TypeError, "fuse_muls_add must be a bool"),
+    ],
+)
+def test_compilation_options_are_strictly_validated(raw, error, message) -> None:
+    from vllm_fl.compilation.config import validate_ascend_compilation_options
+
+    with pytest.raises(error, match=message):
+        validate_ascend_compilation_options(raw)
+
+
+def test_compilation_option_defaults_are_isolated_and_preserve_false_overrides() -> (
+    None
+):
+    from vllm_fl.compilation.config import validate_ascend_compilation_options
+
+    raw = {"fuse_muls_add": False}
+    options = validate_ascend_compilation_options(raw)
+    assert raw == {"fuse_muls_add": False}
+    assert options["fuse_muls_add"] is False
+    assert validate_ascend_compilation_options({})["fuse_muls_add"] is True
+    assert options["enable_npugraph_ex"] is False
+    assert options["enable_static_kernel"] is False
+    assert options["fuse_allreduce_rms"] is False
 
 
 def test_ascend_sp_pass_preserves_all2all_backend(monkeypatch) -> None:
@@ -259,6 +386,9 @@ def test_non_ascend_does_not_install_moe_backend_sentinel(monkeypatch) -> None:
     PlatformFL.check_and_update_config(config)
 
     assert config.parallel_config.all2all_backend == "allgather_reducescatter"
+    assert config.compilation_config.backend == "inductor"
+    assert config.compilation_config.use_inductor is True
+    assert "ascend_compilation_config" not in config.additional_config
 
 
 def test_forward_context_hook_is_ascend_only(monkeypatch) -> None:
@@ -266,11 +396,14 @@ def test_forward_context_hook_is_ascend_only(monkeypatch) -> None:
 
     monkeypatch.setattr(PlatformFL, "device_type", "cuda")
 
-    assert PlatformFL.set_additional_forward_context(
-        attn_metadata={},
-        vllm_config=None,
-        dp_metadata=None,
-    ) == {}
+    assert (
+        PlatformFL.set_additional_forward_context(
+            attn_metadata={},
+            vllm_config=None,
+            dp_metadata=None,
+        )
+        == {}
+    )
 
 
 def test_ascend_forward_context_hook_delegates_lazily(monkeypatch) -> None:
@@ -285,11 +418,14 @@ def test_ascend_forward_context_hook_delegates_lazily(monkeypatch) -> None:
         lambda **kwargs: expected,
     )
 
-    assert PlatformFL.set_additional_forward_context(
-        attn_metadata={},
-        vllm_config=None,
-        dp_metadata=None,
-    ) is expected
+    assert (
+        PlatformFL.set_additional_forward_context(
+            attn_metadata={},
+            vllm_config=None,
+            dp_metadata=None,
+        )
+        is expected
+    )
 
 
 def test_ascend_attention_selector_uses_compress_for_dsa(monkeypatch) -> None:
@@ -302,20 +438,24 @@ def test_ascend_attention_selector_uses_compress_for_dsa(monkeypatch) -> None:
         lambda _name, **kwargs: AscendBackend().attention_backend(**kwargs),
     )
 
-    dsa_config = SimpleNamespace(
-        use_mla=True, use_sparse=False, use_compress=True
-    )
+    dsa_config = SimpleNamespace(use_mla=True, use_sparse=False, use_compress=True)
     assert PlatformFL.get_attn_backend_cls(None, dsa_config) == (
         "vllm_fl.attention.ascend.dsa_v1.AscendDSABackend"
     )
 
     # Existing MHA and MLA selector branches retain their original paths.
-    assert PlatformFL.get_attn_backend_cls(
-        None, SimpleNamespace(use_mla=False, use_sparse=False)
-    ) == "vllm_fl.attention.ascend.attention.AscendAttentionBackend"
-    assert PlatformFL.get_attn_backend_cls(
-        None, SimpleNamespace(use_mla=True, use_sparse=False, use_compress=False)
-    ) == "vllm_fl.attention.ascend.attention.AscendMLABackend"
+    assert (
+        PlatformFL.get_attn_backend_cls(
+            None, SimpleNamespace(use_mla=False, use_sparse=False)
+        )
+        == "vllm_fl.attention.ascend.attention.AscendAttentionBackend"
+    )
+    assert (
+        PlatformFL.get_attn_backend_cls(
+            None, SimpleNamespace(use_mla=True, use_sparse=False, use_compress=False)
+        )
+        == "vllm_fl.attention.ascend.attention.AscendMLABackend"
+    )
 
 
 def test_non_npu_attention_selector_keeps_existing_dispatch_contract(
@@ -332,9 +472,12 @@ def test_non_npu_attention_selector_keeps_existing_dispatch_contract(
 
     monkeypatch.setattr("vllm_fl.dispatch.call_op", capture_call)
 
-    assert PlatformFL.get_attn_backend_cls(
-        None, SimpleNamespace(use_mla=False, use_sparse=False, use_compress=True)
-    ) == "fallback.backend"
+    assert (
+        PlatformFL.get_attn_backend_cls(
+            None, SimpleNamespace(use_mla=False, use_sparse=False, use_compress=True)
+        )
+        == "fallback.backend"
+    )
     assert captured == {
         "name": "attention_backend",
         "use_mla": False,

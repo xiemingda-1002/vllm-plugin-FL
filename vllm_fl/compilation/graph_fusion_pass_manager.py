@@ -7,22 +7,21 @@ from __future__ import annotations
 from typing import Any
 
 from torch import fx
+
 from vllm.compilation.passes.inductor_pass import InductorPass, get_pass_context
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 
-from vllm_fl.compilation.config import ASCEND_COMPILATION_DEFAULTS
+from vllm_fl.compilation.config import (
+    ASCEND_COMPILATION_DEFAULTS,
+    validate_ascend_compilation_options,
+)
 
 logger = init_logger(__name__)
 
 
 class GraphFusionPassManager(InductorPass):
-    """Register and order the current Ascend fusion-pass closure.
-
-    npugraph_ex consumes the replacements registered while these passes are
-    constructed. The manager remains a valid InductorPass for vLLM's current
-    custom-pass API, but FL's compiler does not apply it a second time.
-    """
+    """Register local Ascend matchers and apply them to normalized FX graphs."""
 
     def __init__(self) -> None:
         self.passes: list[InductorPass] = []
@@ -43,7 +42,7 @@ class GraphFusionPassManager(InductorPass):
                 "FL graph fusion manager accepts only vLLM InductorPass instances"
             )
         raise NotImplementedError(
-            "FL Ascend npugraph_ex compilation does not yet support external "
+            "FL Ascend FX fusion does not yet support external "
             "InductorPass instances; accepting one would silently skip it"
         )
 
@@ -51,18 +50,7 @@ class GraphFusionPassManager(InductorPass):
         raw_options = (config.additional_config or {}).get(
             "ascend_compilation_config", {}
         )
-        options = {
-            name: raw_options.get(name, default)
-            for name, default in ASCEND_COMPILATION_DEFAULTS.items()
-        }
-        for name, value in options.items():
-            if type(value) is not bool:
-                raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
-        if options["fuse_allreduce_rms"]:
-            raise NotImplementedError(
-                "FL Ascend graph compilation does not yet support "
-                "fuse_allreduce_rms=True"
-            )
+        options = validate_ascend_compilation_options(raw_options)
         if config.compilation_config.pass_config.enable_sp:
             raise NotImplementedError(
                 "FL Ascend graph compilation does not yet support "

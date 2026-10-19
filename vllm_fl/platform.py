@@ -43,7 +43,7 @@ from vllm_fl.utils import (
 
 logger = init_logger(__name__)
 
-_ASCEND_COMPILER = "vllm_fl.compilation.compiler_interface.AscendCompiler"
+_FX_FUSION_ADAPTOR = "vllm_fl.compilation.fx_backend.FXFusionAdaptor"
 _ASCEND_PASS_MANAGER = (
     "vllm_fl.compilation.graph_fusion_pass_manager.GraphFusionPassManager"
 )
@@ -89,7 +89,7 @@ def _configure_ascend_cpu_binding(vllm_config: "VllmConfig") -> None:
 
 
 def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
-    """Apply the supported FL Ascend compilation configuration subset."""
+    """Use eager FX, optionally rewritten by vendor-scoped fusion passes."""
     from vllm.config import CUDAGraphMode, CompilationMode
 
     compilation_config = vllm_config.compilation_config
@@ -99,46 +99,56 @@ def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
         CompilationMode.VLLM_COMPILE,
     ):
         raise NotImplementedError(
-            "FL AscendCompiler currently supports only VLLM_COMPILE"
+            "FL Ascend FX compilation supports only VLLM_COMPILE or NONE"
         )
     additional_config = vllm_config.additional_config
     if additional_config is None:
         additional_config = {}
         vllm_config.additional_config = additional_config
+    if not isinstance(additional_config, dict):
+        raise TypeError("additional_config must be a dict")
     ascend_compilation_config = additional_config.setdefault(
         "ascend_compilation_config", {}
     )
-    if not isinstance(ascend_compilation_config, dict):
-        raise TypeError("additional_config.ascend_compilation_config must be a dict")
-    from vllm_fl.compilation.config import ascend_compilation_defaults
+    from vllm_fl.compilation.config import validate_ascend_compilation_options
 
-    for name, default in ascend_compilation_defaults().items():
-        ascend_compilation_config.setdefault(name, default)
+    ascend_compilation_config = validate_ascend_compilation_options(
+        ascend_compilation_config
+    )
+    additional_config["ascend_compilation_config"] = ascend_compilation_config
 
     # MiniMax-M3 must not run the QK-norm/RoPE Inductor fusion pass. The pass
     # discovers candidates through ``get_layers_from_vllm_config(.., Attention)``
     # while M3's sparse attention layers subclass ``AttentionLayerBase``, so the
     # fusion it produces can never match them. Building its match pattern is not
-    # free, though: the pattern body calls ``torch.ops.vllm.npu_rotary_embedding``,
-    # whose real implementation is ATB's ``_npu_rotary_embedding``, and ATB's
-    # RopeOperation cannot be set up outside a real kernel launch -- it aborts the
-    # whole npugraph_ex compilation with "RopeOperation setup failed!" and leaves
-    # the model fully uncompiled (~55% slower decode). M3 already fuses
+    # free, though, and exercises ATB RoPE during tracing. M3 already fuses
     # QK-norm/RoPE/KV-insert explicitly via
     # ``ops.fused_minimax_m3_qknorm_rope_kv_insert``, so skipping this pass loses
-    # nothing. An explicit user value still wins.
+    # nothing. Preserve the existing model-specific exclusion.
     architectures = getattr(vllm_config.model_config, "architectures", None) or []
     if any(str(a).startswith("MiniMaxM3") for a in architectures):
         if ascend_compilation_config.get("fuse_qknorm_rope", True):
             ascend_compilation_config["fuse_qknorm_rope"] = False
             logger.info(
                 "MiniMax-M3: disabled the qknorm-rope Inductor fusion pass "
-                "(cannot match AttentionLayerBase layers, and its pattern "
-                "construction triggers an ATB RoPE setup failure that aborts "
-                "graph compilation)"
+                "(sparse AttentionLayerBase layers use explicit fusion)"
             )
 
+    compilation_config.backend = (
+        "fl_fx_fusion"
+        if any(ascend_compilation_config[name] for name in (
+            "fuse_norm_quant", "fuse_qknorm_rope", "fuse_muls_add"
+        ))
+        else "eager"
+    )
+    compilation_config.use_inductor = False
+    model_config = vllm_config.model_config
+    if model_config is not None and getattr(model_config, "enforce_eager", False):
+        compilation_config.mode = CompilationMode.NONE
+        compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        return
     if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+        compilation_config.mode = CompilationMode.VLLM_COMPILE
         compilation_config.cudagraph_num_of_warmups = 1
         compilation_config.use_inductor_graph_partition = False
         compilation_config.splitting_ops = []
@@ -391,9 +401,9 @@ class PlatformFL(Platform):
 
     @classmethod
     def get_compile_backend(cls) -> str:
-        """Select the FL-owned compiler only for the Ascend backend."""
+        """Select the optional FX rewrite adapter only for Ascend."""
         if cls.device_type == "npu":
-            return _ASCEND_COMPILER
+            return _FX_FUSION_ADAPTOR
         return super().get_compile_backend()
 
     @property

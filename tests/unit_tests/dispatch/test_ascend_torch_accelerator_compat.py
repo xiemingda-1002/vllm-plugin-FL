@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PATCH_SOURCE = (
     REPO_ROOT
@@ -37,9 +36,7 @@ def _fake_torch():
 
     npu = SimpleNamespace(
         empty_cache=api("empty_cache"),
-        memory_stats=api(
-            "memory_stats", {"allocated_bytes.all.peak": 11}
-        ),
+        memory_stats=api("memory_stats", {"allocated_bytes.all.peak": 11}),
         memory_reserved=api("memory_reserved", 7),
         reset_peak_memory_stats=api("reset_peak_memory_stats"),
         mem_get_info=api("mem_get_info", (100, 200)),
@@ -122,8 +119,7 @@ def test_pre_register_keeps_only_its_ascend_package_import() -> None:
     method = next(
         node
         for node in platform.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "pre_register_and_update"
+        if isinstance(node, ast.FunctionDef) and node.name == "pre_register_and_update"
     )
     method.decorator_list = []
     namespace: dict[str, object] = {}
@@ -137,9 +133,7 @@ def test_pre_register_keeps_only_its_ascend_package_import() -> None:
         namespace,
     )
 
-    cls = SimpleNamespace(
-        device_type="cuda", device_name="cuda", vendor_name="nvidia"
-    )
+    cls = SimpleNamespace(device_type="cuda", device_name="cuda", vendor_name="nvidia")
     namespace["pre_register_and_update"](cls)
     source = ast.unparse(method)
     assert "patch_torch_accelerator" not in source
@@ -205,13 +199,9 @@ def test_register_model_does_not_patch_non_ascend_platforms(
         name: object() for name in _load_patch_module()._NPU_MEMORY_API_MAP
     }
     accelerator = SimpleNamespace(**sentinel_apis)
-    before = {
-        name: getattr(accelerator, name) for name in sentinel_apis
-    }
+    before = {name: getattr(accelerator, name) for name in sentinel_apis}
     calls: list[str] = []
-    platform = SimpleNamespace(
-        vendor_name=vendor_name, device_type=device_type
-    )
+    platform = SimpleNamespace(vendor_name=vendor_name, device_type=device_type)
 
     imported = _run_plugin_helper(
         platform, lambda: calls.append("patch_torch_accelerator")
@@ -219,9 +209,18 @@ def test_register_model_does_not_patch_non_ascend_platforms(
 
     assert calls == []
     assert not any(name.endswith("patch_torch_accelerator") for name in imported)
-    assert {
-        name: getattr(accelerator, name) for name in sentinel_apis
-    } == before
+    assert {name: getattr(accelerator, name) for name in sentinel_apis} == before
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda", "npu"])
+def test_register_model_ignores_platform_without_vendor_name(device_type) -> None:
+    calls: list[str] = []
+    imported = _run_plugin_helper(
+        SimpleNamespace(device_type=device_type),
+        lambda: calls.append("patch_torch_accelerator"),
+    )
+    assert calls == []
+    assert not any(name.endswith("patch_torch_accelerator") for name in imported)
 
 
 def test_register_model_calls_memory_shim_before_other_hooks() -> None:
@@ -251,8 +250,7 @@ def test_worker_loads_general_plugins_before_worker_construction() -> None:
     load_plugins = next(
         node
         for node in calls
-        if isinstance(node.func, ast.Name)
-        and node.func.id == "load_general_plugins"
+        if isinstance(node.func, ast.Name) and node.func.id == "load_general_plugins"
     )
     construct_worker = next(
         node
@@ -278,9 +276,7 @@ def test_vllm_memory_snapshot_uses_redirected_npu_apis(monkeypatch) -> None:
             lambda *args, **kwargs: None,
             raising=False,
         )
-    monkeypatch.setattr(
-        torch.accelerator, module._PATCH_MARKER, False, raising=False
-    )
+    monkeypatch.setattr(torch.accelerator, module._PATCH_MARKER, False, raising=False)
     module.torch = torch
     module.patch_torch_accelerator()
 

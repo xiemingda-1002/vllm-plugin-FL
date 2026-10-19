@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 from torch import fx
+
 from vllm.compilation.passes.inductor_pass import InductorPass, pass_context
 from vllm.config.compilation import Range
 
@@ -95,6 +96,23 @@ def test_manager_rejects_external_inductor_passes() -> None:
     manager = GraphFusionPassManager()
     with pytest.raises(NotImplementedError, match="external InductorPass"):
         manager.add(_Pass("generic"))
+    with pytest.raises(TypeError, match="InductorPass instances"):
+        manager.add(object())
+
+
+def test_manager_all_fusions_disabled_has_no_passes(monkeypatch) -> None:
+    import vllm_fl.compilation.graph_fusion_pass_manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module,
+        "set_current_vllm_config",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    manager = manager_module.GraphFusionPassManager()
+    manager.configure(
+        _config(fuse_norm_quant=False, fuse_qknorm_rope=False, fuse_muls_add=False)
+    )
+    assert manager.passes == []
 
 
 def test_manager_executes_configured_default_passes(monkeypatch) -> None:
@@ -133,6 +151,23 @@ def test_manager_optional_unsupported_features_fail_closed(monkeypatch) -> None:
         manager_module.GraphFusionPassManager().configure(config)
 
 
+@pytest.mark.parametrize("name", ["enable_npugraph_ex", "enable_static_kernel"])
+def test_manager_rejects_retired_compiler_features(name) -> None:
+    from vllm_fl.compilation.graph_fusion_pass_manager import GraphFusionPassManager
+
+    with pytest.raises(NotImplementedError, match=name):
+        GraphFusionPassManager().configure(_config(**{name: True}))
+
+
+def test_manager_rejects_unknown_and_nonboolean_options() -> None:
+    from vllm_fl.compilation.graph_fusion_pass_manager import GraphFusionPassManager
+
+    with pytest.raises(ValueError, match="unknown_fusion"):
+        GraphFusionPassManager().configure(_config(unknown_fusion=True))
+    with pytest.raises(TypeError, match="fuse_muls_add"):
+        GraphFusionPassManager().configure(_config(fuse_muls_add=1))
+
+
 def test_default_configuration_does_not_import_optional_pass_modules(
     monkeypatch,
 ) -> None:
@@ -151,6 +186,7 @@ def test_default_configuration_does_not_import_optional_pass_modules(
 
 def test_manager_never_delegates_to_upstream_post_grad(monkeypatch) -> None:
     import vllm.compilation.passes.pass_manager as upstream
+
     import vllm_fl.compilation.graph_fusion_pass_manager as manager_module
 
     _stub_default_passes(monkeypatch)

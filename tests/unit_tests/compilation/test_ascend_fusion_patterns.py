@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
-import pytest
 import torch
 
 
@@ -27,23 +26,21 @@ def _minimal_vllm_config(*, dtype=torch.bfloat16, quant_config=None):
     )
 
 
-def test_base_pattern_registers_each_local_pass_and_dedupes_npugraph(
+def test_base_pattern_registers_each_local_pass_with_stream_guard(
     monkeypatch,
 ) -> None:
     import torch._inductor.pattern_matcher as pm
+
     import vllm_fl.compilation.passes.base_pattern as base_module
 
     local_events = []
-    nge_events = []
     monkeypatch.setattr(
         pm,
         "register_replacement",
         lambda *args, **kwargs: local_events.append((args, kwargs)),
     )
-    nge = ModuleType("npugraph_ex")
-    nge.register_replacement = lambda **kwargs: nge_events.append(kwargs)
-    monkeypatch.setitem(sys.modules, "npugraph_ex", nge)
-    base_module._registered_npugraph_patterns.clear()
+    # Registration must work when the retired compiler is unavailable.
+    monkeypatch.setitem(sys.modules, "npugraph_ex", None)
 
     class Pattern(base_module.BasePattern):
         def __init__(self, config, scale, rope_dim=128):
@@ -67,11 +64,26 @@ def test_base_pattern_registers_each_local_pass_and_dedupes_npugraph(
     Pattern(_minimal_vllm_config(), 2.0).register(second_pm)
     Pattern(_minimal_vllm_config(), 2.0, rope_dim=64).register(second_pm)
     assert len(local_events) == 4
-    assert len(nge_events) == 3
+    assert [args[4] for args, _ in local_events] == [
+        first_pm,
+        second_pm,
+        second_pm,
+        second_pm,
+    ]
+    assert all(args[3] is pm.fwd_only for args, _ in local_events)
+    for _, kwargs in local_events:
+        assert kwargs["extra_check"] is base_module.extra_stream_scope_check
+        match = SimpleNamespace(
+            nodes=[
+                SimpleNamespace(op="call_function", meta={}),
+                SimpleNamespace(op="call_function", meta={"stream_label": "decode"}),
+            ]
+        )
+        assert not kwargs["extra_check"](match)
 
 
 def test_stream_guard_rejects_cross_stream_matches() -> None:
-    from vllm_fl.compilation.passes.utils.npugraph_ex_utils_check import (
+    from vllm_fl.compilation.passes.utils.stream_scope import (
         extra_stream_scope_check,
     )
 
@@ -79,12 +91,16 @@ def test_stream_guard_rejects_cross_stream_matches() -> None:
         op="call_function", meta={"stream_label": stream}
     )
     assert extra_stream_scope_check(SimpleNamespace(nodes=[node(None), node(None)]))
+    assert extra_stream_scope_check(SimpleNamespace(nodes=[node("a"), node("a")]))
+    assert extra_stream_scope_check(
+        SimpleNamespace(
+            nodes=[node("a"), SimpleNamespace(op="placeholder", meta={}), node("a")]
+        )
+    )
     assert not extra_stream_scope_check(
         SimpleNamespace(nodes=[node(None), node("decode")])
     )
-    assert not extra_stream_scope_check(
-        SimpleNamespace(nodes=[node("a"), node("b")])
-    )
+    assert not extra_stream_scope_check(SimpleNamespace(nodes=[node("a"), node("b")]))
 
 
 def test_norm_quant_pass_registers_dynamic_patterns_without_fl_custom_op(
@@ -119,7 +135,9 @@ def test_norm_quant_pass_registers_dynamic_patterns_without_fl_custom_op(
         "is_rms_norm_dynamic_mx_quant_fusion_available",
         lambda: False,
     )
-    monkeypatch.setattr(norm_module, "_static_norm_quant_patterns_available", lambda: False)
+    monkeypatch.setattr(
+        norm_module, "_static_norm_quant_patterns_available", lambda: False
+    )
     norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config())
     assert events == [("init", {"pass_name": "rmsnorm_quant_fusion_pass"})]
     assert registered == [
@@ -157,7 +175,9 @@ def test_norm_quant_pass_keeps_mx_and_static_branches_capability_gated(
         "is_rms_norm_dynamic_mx_quant_fusion_available",
         lambda: True,
     )
-    monkeypatch.setattr(norm_module, "_static_norm_quant_patterns_available", lambda: True)
+    monkeypatch.setattr(
+        norm_module, "_static_norm_quant_patterns_available", lambda: True
+    )
     norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config())
 
     assert registered.count("AddRMSNormDynamicQuantPattern") == 2
@@ -184,9 +204,7 @@ def test_norm_quant_pass_rejects_w4a4_and_unsupported_dtype(monkeypatch) -> None
         lambda self, _pm_pass: registered.append(self.__class__.__name__),
     )
     w4a4 = SimpleNamespace(quant_description={"layer": "W4A4_DYNAMIC"})
-    norm_module.AddRMSNormQuantFusionPass(
-        _minimal_vllm_config(quant_config=w4a4)
-    )
+    norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config(quant_config=w4a4))
     norm_module.AddRMSNormQuantFusionPass(_minimal_vllm_config(dtype=torch.float32))
     assert registered == []
 
@@ -232,9 +250,7 @@ def test_qknorm_registers_bias_and_no_bias_patterns_for_bf16_head128(
         qk_module,
         "get_layers_from_vllm_config",
         lambda *args, **kwargs: {
-            "layer": SimpleNamespace(
-                head_size=128, num_heads=8, num_kv_heads=2
-            )
+            "layer": SimpleNamespace(head_size=128, num_heads=8, num_kv_heads=2)
         },
     )
     monkeypatch.setattr(
@@ -253,9 +269,7 @@ def test_qknorm_registers_bias_and_no_bias_patterns_for_bf16_head128(
     ]
 
     records.clear()
-    qk_module.QKNormRopeFusionPass(
-        _minimal_vllm_config(dtype=torch.float16)
-    )
+    qk_module.QKNormRopeFusionPass(_minimal_vllm_config(dtype=torch.float16))
     assert records == []
 
 
