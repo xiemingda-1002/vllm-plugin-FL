@@ -24,6 +24,8 @@ from vllm.compilation.passes.inductor_pass import pass_context
 from vllm.config.utils import Range
 from vllm.platforms import current_platform
 
+from vllm_fl.compilation import graph_kind
+
 
 class FXFusionAdaptor(EagerAdaptor):
     """Apply configured normalized-forward passes and execute the resulting FX.
@@ -44,6 +46,15 @@ class FXFusionAdaptor(EagerAdaptor):
         compile_range: Range,
         key: str | None = None,
     ):
+        if graph_kind.dual_graph_enabled():
+            # Fingerprint the graph this compile produced, tagged with the
+            # capture pass that asked for it. ``_capture_dual_graphs`` compares
+            # the short and long fingerprints at start-up and refuses to run
+            # when they are equal -- "the compiler reused the artifact" is then
+            # a measured fact instead of an inference from a counter. Taken
+            # before the rewrites below so the fingerprint describes the traced
+            # body on both compiler paths.
+            graph_kind.note_traced_graph(graph, compile_range)
         manager = compiler_config[current_platform.pass_key]
         if not manager.passes:
             return super().compile(

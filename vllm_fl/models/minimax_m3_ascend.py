@@ -105,6 +105,30 @@ def _shortctx_dense_enabled() -> bool:
 
 _SHORTCTX_DENSE = _shortctx_dense_enabled()
 
+
+def _shortctx_active() -> bool:
+    """Whether the *current* graph capture/replay uses the short-context path.
+
+    Two ways in, and they must not be confused:
+
+    * ``VLLM_FL_M3_SHORTCTX_DENSE=1`` -- the whole process is short-context
+      mode. A start-up gate refuses a ``max_model_len`` above the bound.
+    * ``VLLM_FL_M3_DUAL_GRAPH=1`` -- the path is chosen per *graph*: it is on
+      while the short graph set is captured and while a short step is replayed,
+      off for the long set and for every non-decode (prefill/mixed) step. No
+      start-up ``max_model_len`` gate, because the bound is enforced per request
+      instead (admission class + replay assertion in the model runner).
+
+    Read through the ``graph_kind`` module so the value is the same one the
+    graph wrapper uses to pick the graph set.
+    """
+    if _SHORTCTX_DENSE:
+        return True
+    from vllm_fl.compilation import graph_kind
+
+    return graph_kind.short_active()
+
+
 _shortctx_slots_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _shortctx_attend_impl = None
 _shortctx_epoch = 0
@@ -311,17 +335,27 @@ def _enforce_shortctx_dense_bound(config) -> None:
 
     ``seq_len > topk_blocks * sparse_block_size`` is the only condition under
     which the identity selection differs from the indexer's (topk then drops
-    blocks), so it must abort at start-up rather than degrade silently.
+    blocks), so the *process-wide* short-context mode must abort at
+    start-up rather than degrade silently.
+
+    The dual-graph mode deliberately runs with a ``max_model_len`` far
+    above the bound and enforces it **per request** instead: the admission-time
+    lifetime class plus the replay assertion in the model runner. There the
+    bound is only registered here (single source of truth: this function is the
+    one the sparse layers call), and the start-up gate is skipped.
     """
     global _shortctx_bound_checked
     if _shortctx_bound_checked:
         return
     from vllm.config import get_current_vllm_config
 
+    from vllm_fl.compilation import graph_kind
+
     vllm_config = get_current_vllm_config()
     max_model_len = int(vllm_config.model_config.max_model_len)
     bound = _shortctx_selection_bound(config)
-    if max_model_len > bound:
+    graph_kind.set_selection_bound(bound)
+    if max_model_len > bound and not graph_kind.dual_graph_enabled():
         raise ValueError(
             f"{_SHORTCTX_DENSE_SWITCH}=1 replaces the block indexer with an "
             "identity selection of every visible block. That is equivalent to "
@@ -333,6 +367,10 @@ def _enforce_shortctx_dense_bound(config) -> None:
             "changing the output."
         )
     _shortctx_bound_checked = True
+    if graph_kind.dual_graph_enabled():
+        # The dual-graph mode prints its own confirmation from the model runner
+        # once the two sets are captured; here only the bound matters.
+        return
     # Operator-visible confirmation that the switch took effect at start-up.
     # ``logger.info`` is NOT usable here: vLLM installs handlers for its own
     # "vllm" logger only, and this deployment's root logger sits at WARNING, so
@@ -389,12 +427,23 @@ def _sparse_prepare(
         eps=eps,
     )
 
-    if _SHORTCTX_DENSE:
+    if _shortctx_active():
         # Short-context path: the index branch feeds only the indexer's block
         # scores, which the identity selection does not read. Alias q/k into the
         # two slots the opaque op still declares (it never dereferences them in
         # this mode); this drops the second fused norm/RoPE per sparse layer,
         # 50.94 us x 57 layers per decode step (measured on Ascend 910C).
+        #
+        # Trace-hit counter: this line only runs while the model forward is
+        # *traced*, so a non-zero count during the short capture pass proves the
+        # compiled artifact really was re-traced with the short body. If Dynamo
+        # had reused the long artifact, the count would stay 0 and the model
+        # runner aborts the start-up instead of shipping a graph that gains
+        # nothing (see ModelRunnerFL._capture_dual_graphs).
+        from vllm_fl.compilation import graph_kind
+
+        if graph_kind.capture_kind() == graph_kind.KIND_SHORT:
+            graph_kind.STATS["short_trace_hits"] += 1
         return q, k, v, q, k
 
     index_slab = qkv.narrow(-1, main_size, layer.index_q_size + head_dim)
@@ -453,13 +502,18 @@ def _sparse_forward_body(
     block_size = layer.kv_cache.size(2)
     _insert_kv(layer.kv_cache, main_slots, k, v, block_size)
 
-    if _SHORTCTX_DENSE:
+    if _shortctx_active():
         # Short-context path: no indexer and no index-key insert. The selection
         # is the identity (every visible block, ascending), written into the
         # shared buffer the attend already reads; ``_shortctx_attend`` is the
         # same attend call upstream's ``_run_attention`` reaches (upstream
         # model.py:619-630 is exactly ``indexer(...)`` + ``impl.forward(...)``),
         # with the same eager break kept around it.
+        #
+        # In the dual-graph mode this body is entered on every replay (the op is
+        # opaque, so its Python body re-runs per step), while the *traced* half
+        # above is frozen per graph -- which is why the graph set, not this
+        # branch, is what the dispatcher selects.
         if _shortctx_fill_due(layer):
             _shortctx_write_identity_topk(layer, block_size)
         _shortctx_attend(layer, q, attn_output)
@@ -805,12 +859,20 @@ def _build_classes():
         indexer (see the module-level note); the only extra start-up step is
         :func:`_enforce_shortctx_dense_bound`, which refuses a context length
         the identity selection cannot reproduce.
+
+        With ``VLLM_FL_M3_DUAL_GRAPH=1`` the same forward is traced twice (once
+        per graph set) and the bound is carried per request instead; the layer
+        still registers it here, so the model config remains the only source.
         """
 
         def __init__(self, *args, **kwargs):
             config = kwargs.get("config", args[0] if args else None)
             super().__init__(*args, **kwargs)
-            if _SHORTCTX_DENSE and config is not None:
+            from vllm_fl.compilation import graph_kind
+
+            if (_SHORTCTX_DENSE or graph_kind.dual_graph_enabled()) and (
+                config is not None
+            ):
                 _enforce_shortctx_dense_bound(config)
 
         def forward(

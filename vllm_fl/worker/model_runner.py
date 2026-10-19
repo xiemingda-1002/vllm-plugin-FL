@@ -242,6 +242,7 @@ from vllm.v1.worker.utils import (
 )
 
 # FL-specific imports
+from vllm_fl.compilation import graph_kind
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch import prewarm_cached_ops
 from vllm_fl.compilation.graph_runtime import (
@@ -606,6 +607,10 @@ class ModelRunnerFL(GPUModelRunner):
             ubatch_wrapper_type=UBatchWrapper,
             update_attention_tasks=not self.use_compress,
         )
+        # Dual-graph: lifetime class per request, fixed at admission
+        # ("prompt_tokens + max_tokens <= selection bound"). Only consulted when
+        # VLLM_FL_M3_DUAL_GRAPH=1; empty and unused otherwise.
+        self._req_short_lifetime: dict[str, bool] = {}
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
 
@@ -1423,6 +1428,7 @@ class ModelRunnerFL(GPUModelRunner):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._req_short_lifetime.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1522,6 +1528,25 @@ class ModelRunnerFL(GPUModelRunner):
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
+
+            if graph_kind.dual_graph_enabled():
+                # The request's lifetime class is fixed here, at admission,
+                # and never recomputed -- that is what makes "the graph never
+                # changes mid-request" true. Unspecified max_tokens (generate
+                # until EOS) is conservatively long-lived.
+                self._req_short_lifetime[req_id] = (
+                    graph_kind.request_is_short_lifetime(
+                        length_from_prompt_token_ids_or_embeds(
+                            new_req_data.prompt_token_ids,
+                            new_req_data.prompt_embeds,
+                        ),
+                        (
+                            sampling_params.max_tokens
+                            if sampling_params is not None
+                            else None
+                        ),
+                    )
+                )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -4631,6 +4656,98 @@ class ModelRunnerFL(GPUModelRunner):
             synced_cudagraph_mode,
         )
 
+    def _batch_is_all_short_lifetime(self, num_reqs: int) -> bool:
+        """O(batch) host check: is every scheduled request short-lived?
+
+        Reads only Python state (the per-request class recorded at admission and
+        the input batch's request ids): no tensor value, no device sync, so it
+        is safe on the decode hot path. Any long-lived request -- including one
+        whose ``max_tokens`` is unlimited -- makes the whole batch long.
+        """
+        if num_reqs <= 0:
+            return False
+        req_ids = self.input_batch.req_ids
+        if len(req_ids) < num_reqs:
+            return False
+        classes = self._req_short_lifetime
+        for index in range(num_reqs):
+            if not classes.get(req_ids[index], False):
+                return False
+        return True
+
+    def _assert_short_replay_safe(
+        self, num_reqs: int, num_scheduled_tokens_np: np.ndarray
+    ) -> None:
+        """Fail fast if replaying the short graph could leave the bound.
+
+        Two independent checks, both host-side:
+
+        1. the admission-time predicate for every request of the batch;
+        2. the sequence length this step reaches (``num_computed_tokens`` from
+           the scheduler plus this step's scheduled tokens).
+
+        The short graph does not write the index-key cache and selects every
+        visible block, which is only the same key set as the indexer while
+        ``seq_len <= sparse_topk_blocks * sparse_block_size``. Past that bound
+        the indexer would drop blocks, so replaying the short graph would
+        silently attend a different key set -- hence raise, never degrade.
+        """
+        all_short = self._batch_is_all_short_lifetime(num_reqs)
+        if num_reqs > 0 and all_short:
+            computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            scheduled = num_scheduled_tokens_np[:num_reqs]
+            worst = int((computed + scheduled).max())
+        else:
+            worst = 0
+        graph_kind.check_short_replay(all_short, worst)
+
+    def _decide_graph_kind(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
+        """Choose the graph set for this step.
+
+        * capture passes are forced (``graph_kind.capture_kind()``);
+        * the decision table itself lives in ``graph_kind.decide_step_kind`` so
+          it can be tested without torch: anything that is not a uniform
+          full-graph decode batch -- prefill, chunked prefill, mixed steps, eager
+          -- uses the long set, which also keeps the index-key cache fully
+          written for prompt tokens;
+        * a decode batch replays the short set only when *every* request in it is
+          short-lived and a short graph exists for the dispatched shape.
+        """
+        if not graph_kind.dual_graph_enabled():
+            return
+        forced = graph_kind.capture_kind()
+        if forced is not None:
+            graph_kind.set_graph_kind(forced)
+            return
+        all_short = self._batch_is_all_short_lifetime(num_reqs)
+        kind = graph_kind.decide_step_kind(
+            full_graph=cudagraph_mode == CUDAGraphMode.FULL,
+            uniform=bool(batch_descriptor.uniform),
+            num_tokens=batch_descriptor.num_tokens,
+            all_short=all_short,
+        )
+        if kind is graph_kind.KIND_SHORT:
+            self._assert_short_replay_safe(num_reqs, num_scheduled_tokens_np)
+            graph_kind.STATS["short_steps"] += 1
+        else:
+            graph_kind.STATS["long_steps"] += 1
+            if (
+                all_short
+                and cudagraph_mode == CUDAGraphMode.FULL
+                and batch_descriptor.uniform
+            ):
+                # All-short decode whose padded shape has no short graph (the
+                # optional VLLM_FL_M3_DUAL_GRAPH_SIZES filter). Correct but
+                # slower -- counted so the operator can see the coverage gap.
+                graph_kind.STATS["short_fallbacks"] += 1
+        graph_kind.set_graph_kind(kind)
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4755,6 +4872,13 @@ class ModelRunnerFL(GPUModelRunner):
                 num_paddings=batch_descriptor.num_tokens - num_tokens,
                 runtime_mode=str(cudagraph_mode),
             )
+
+        # Pick the graph set for this step. Host-side, O(batch), no sync;
+        # a no-op unless VLLM_FL_M3_DUAL_GRAPH=1. Must run after the DP
+        # re-dispatch above so the kind matches the shape actually launched.
+        self._decide_graph_kind(
+            cudagraph_mode, batch_descriptor, num_reqs, num_scheduled_tokens_np
+        )
 
         return (
             cudagraph_mode,
@@ -7779,6 +7903,17 @@ class ModelRunnerFL(GPUModelRunner):
             + max(shared_memory_estimate.values(), default=0)
             + sum(per_graph_estimate.values())
         )
+        if graph_kind.dual_graph_enabled():
+            # T58: the short set duplicates every captured decode shape, and both
+            # sets stay live, so the pool footprint roughly doubles. The estimate
+            # gates the KV-cache budget *before* capture, so it must reserve for
+            # both sets; under-reserving would fail during capture, not later.
+            decoder_estimate *= 2
+            logger.info(
+                "Dual-graph: decode-graph memory estimate doubled to %.2f GiB "
+                "(long + short sets)",
+                decoder_estimate / (1 << 30),
+            )
         # Encoder graphs use a manager-local pool at runtime, separate from the
         # decoder pool, so add their estimate instead of overlaying it.
         total_estimate = decoder_estimate + encoder_memory_estimate
@@ -7799,6 +7934,12 @@ class ModelRunnerFL(GPUModelRunner):
             return 0
 
         self._limit_musa_piecewise_capture_sizes()
+
+        # Refuse to capture a second graph set when its preconditions are
+        # not met (prefix-cache sharing would let a long request read the
+        # index-K blocks a short request never wrote).
+        if graph_kind.dual_graph_enabled():
+            self._check_dual_graph_preconditions()
 
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()
@@ -7955,6 +8096,199 @@ class ModelRunnerFL(GPUModelRunner):
             profile_seq_lens=profile_seq_lens,
         )
 
+    def _capture_dual_graphs(
+        self,
+        batch_descriptors: list[BatchDescriptor],
+        cudagraph_runtime_mode: CUDAGraphMode,
+    ) -> None:
+        """Capture the decode shapes twice: the short set, then the long set.
+
+        The two sets differ only in the **traced** body of the 57 sparse layers
+        (the short body returns early in ``_sparse_prepare`` and
+        ``_sparse_forward_body``), and that body is frozen when the graph is
+        captured -- which is exactly why one capture pass per kind is needed
+        instead of a per-step Python switch.
+
+        The short set may cover a subset of the sizes
+        (``VLLM_FL_M3_DUAL_GRAPH_SIZES``); a size without a short graph simply
+        replays the long one, which is always correct.
+        """
+        long_descs = list(batch_descriptors)
+        short_sizes = set(
+            graph_kind.short_sizes_for_capture(d.num_tokens for d in long_descs)
+        )
+        short_descs = [d for d in long_descs if d.num_tokens in short_sizes]
+        graph_kind.set_short_covered_sizes(short_sizes)
+        graph_kind.STATS["short_trace_hits"] = 0
+        # Forget any fingerprint the profiling run recorded, then reset the
+        # compile state before *each* pass. Without the reset the second pass
+        # replays the first pass's compiled artifact (vLLM drops every Dynamo
+        # guard and caches ``aot_compiled_fn`` on the model instance), so the
+        # captured "short" graphs are the long ones and the feature is a no-op.
+        graph_kind.reset_traced_graphs()
+        model = self.get_model()
+        try:
+            # Short set first, long set last. The kind is a traced global, so each
+            # pass re-traces the model forward; ending on the long set leaves the
+            # compiled artifact matching the eager path that serves prefill and
+            # mixed steps (they always run long), which avoids one extra
+            # re-trace on the first request after start-up.
+            for kind, descs, label in (
+                (graph_kind.KIND_SHORT, short_descs, "short"),
+                (graph_kind.KIND_LONG, long_descs, "long"),
+            ):
+                if not descs:
+                    continue
+                graph_kind.begin_capture(kind)
+                logger.info(
+                    "Dual-graph: capturing the %s set (%d shapes, %s)",
+                    label,
+                    len(descs),
+                    cudagraph_runtime_mode.name,
+                )
+                if graph_kind.retrace_enabled():
+                    # ``reset_compile_wrapper`` rebuilds the torch.compile
+                    # callable, which resolves the active VllmConfig; make sure
+                    # it is the runner's own config instead of relying on an
+                    # outer context being active.
+                    with set_current_vllm_config(self.vllm_config):
+                        retrace = graph_kind.force_fresh_trace(model)
+                    print(
+                        f"[DUAL_GRAPH] {label} pass: compile state reset "
+                        f"(wrapper={retrace['reset_wrapper']}, "
+                        f"dynamo={retrace['dynamo_reset']}, "
+                        f"dropped AOT artifact="
+                        f"{retrace['removed_artifact'] or 'none'})"
+                        + (
+                            f" WARNING {retrace['error']}"
+                            if retrace["error"]
+                            else ""
+                        ),
+                        flush=True,
+                    )
+                # ``super()`` is GPUModelRunner._capture_cudagraphs: the single
+                # pass this method replaces.
+                super()._capture_cudagraphs(descs, cudagraph_runtime_mode)
+                _accelerator_synchronize()
+        finally:
+            # Always leave the runner on the long set: serving must never start
+            # one capture pass short of a shape.
+            graph_kind.end_capture()
+        # The short set is only useful if the model forward was actually
+        # re-traced with the short body. A reused long artifact would capture 11
+        # graphs that cost memory and change nothing, so refuse to start.
+        trace_hits = graph_kind.STATS["short_trace_hits"]
+        if short_descs and trace_hits <= 0:
+            raise RuntimeError(
+                "Dual-graph: the short graph set was captured without tracing the "
+                "short body once (short_trace_hits=0). The compiler reused the "
+                "long artifact, so the short graphs would be identical to the "
+                "long ones and the feature would silently gain nothing. Refusing "
+                "to start; unset VLLM_FL_M3_DUAL_GRAPH or investigate the trace "
+                "guards."
+            )
+        # The counter above proves the short body ran; these fingerprints
+        # prove the *graph* is a different one. A reused artifact can also come
+        # from a disk cache that skips the trace, so both checks are needed.
+        short_graphs = graph_kind.traced_graphs(graph_kind.KIND_SHORT)
+        long_graphs = graph_kind.traced_graphs(graph_kind.KIND_LONG)
+        if short_descs and not short_graphs:
+            raise RuntimeError(
+                "Dual-graph: the short capture pass never reached the Ascend "
+                "compiler, so no short FX graph exists to compare "
+                "(short_trace_hits=0). Refusing to start."
+            )
+        if long_descs and not long_graphs:
+            raise RuntimeError(
+                "Dual-graph: the long capture pass never reached the Ascend "
+                "compiler. Refusing to start; the second set would not be the "
+                "shipping body."
+            )
+        short_hashes = sorted({g["fx_md5"] for g in short_graphs})
+        long_hashes = sorted({g["fx_md5"] for g in long_graphs})
+        shared = sorted(set(short_hashes) & set(long_hashes))
+        if shared:
+            raise RuntimeError(
+                "Dual-graph: the short and long capture passes produced the same "
+                f"traced FX graph (md5 {shared[0]}). The reset did not take, so "
+                "the two graph sets would be identical and the feature would "
+                "silently gain nothing. Refusing to start."
+            )
+        short_nodes = sum(g["nodes"] for g in short_graphs)
+        long_nodes = sum(g["nodes"] for g in long_graphs)
+        short_kernels = sum(g["kernels"] for g in short_graphs)
+        long_kernels = sum(g["kernels"] for g in long_graphs)
+        print(
+            f"[DUAL_GRAPH] traced graphs differ: short fx_md5="
+            f"{','.join(short_hashes)} nodes={short_nodes} "
+            f"kernels={short_kernels} | long fx_md5={','.join(long_hashes)} "
+            f"nodes={long_nodes} kernels={long_kernels} "
+            f"(delta nodes={short_nodes - long_nodes}, "
+            f"kernels={short_kernels - long_kernels})",
+            flush=True,
+        )
+        print(
+            f"[DUAL_GRAPH] captured decode graphs: long = {len(long_descs)} "
+            f"shapes, short = {len(short_descs)} shapes "
+            f"{sorted(short_sizes)} (bound {graph_kind.selection_bound()}, "
+            f"short trace hits {trace_hits})",
+            flush=True,
+        )
+        # Observability: a log line is the cheap witness of what happened. Printed
+        # at shutdown because a counter cannot be read from the hot path without
+        # paying for it: a 1k-only run should show short_steps >> long_steps
+        # (long only for prefill), a mixed run must show both non-zero, and a
+        # short-graph regression shows up as short_steps == 0.
+        import atexit
+
+        atexit.register(
+            lambda: print(
+                "[DUAL_GRAPH] stats "
+                f"short_steps={graph_kind.STATS['short_steps']} "
+                f"long_steps={graph_kind.STATS['long_steps']} "
+                f"short_fallbacks={graph_kind.STATS['short_fallbacks']}",
+                flush=True,
+            )
+        )
+
+    def _check_dual_graph_preconditions(self) -> None:
+        """Fail fast on the two conditions the short graph cannot survive.
+
+        1. **Prefix caching must be off.** A short-lifetime request never writes
+           the index-key cache, so its blocks must never be handed to another
+           request: a long-lived request that prefix-cache-hits those blocks
+           reads uninitialised index-K, scores blocks wrong and selects a
+           different key set -- silently. Otherwise every block a request reads
+           was written by that same request (it writes index-K for its prompt
+           and for each decode token before the indexer can see it), so turning
+           the cache off is sufficient as well as necessary.
+        2. **The bound must be known**: it is computed from the model config
+           (``sparse_topk_blocks * sparse_block_size``) and registered by the M3
+           sparse layers when they are built.
+        """
+        if self.cache_config.enable_prefix_caching:
+            raise RuntimeError(
+                "VLLM_FL_M3_DUAL_GRAPH=1 requires --no-enable-prefix-caching. "
+                "Short-lifetime requests skip the index-key cache write, and a "
+                "long-lived request that reuses their blocks through the prefix "
+                "cache would read unwritten index-K and silently select the "
+                "wrong blocks. Restart with --no-enable-prefix-caching."
+            )
+        bound = graph_kind.selection_bound()
+        if bound is None:
+            raise RuntimeError(
+                "VLLM_FL_M3_DUAL_GRAPH=1 needs the MiniMax-M3 sparse layers to "
+                "register the short-context selection bound "
+                "(sparse_topk_blocks * sparse_block_size) before capture; none "
+                "was registered. Is this the M3 model?"
+            )
+        graph_kind.set_graph_kind(graph_kind.KIND_LONG)
+        print(
+            "[DUAL_GRAPH] MiniMax-M3 dual decode graphs enabled: short set = "
+            f"requests with prompt+max_tokens <= {bound}; prefix caching off",
+            flush=True,
+        )
+
     def _capture_cudagraphs(
         self,
         batch_descriptors: list[BatchDescriptor],
@@ -7966,6 +8300,16 @@ class ModelRunnerFL(GPUModelRunner):
         ), f"Invalid cudagraph runtime mode: {cudagraph_runtime_mode}"
 
         if not batch_descriptors:
+            return
+
+        if (
+            graph_kind.dual_graph_enabled()
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            # Only FULL (whole decode step) graphs are duplicated: PIECEWISE and
+            # mixed steps keep the shipping single-set behaviour, and the short
+            # path is only ever dispatched for a uniform full-graph decode.
+            self._capture_dual_graphs(batch_descriptors, cudagraph_runtime_mode)
             return
 
         uniform_decode = batch_descriptors[0].uniform

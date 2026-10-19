@@ -56,18 +56,34 @@ class GraphParams:
 
 _GRAPH_PARAMS = GraphParams()
 
+# Second registry for the short-graph set of the dual-graph mode.
+# ``GraphParams`` is indexed by capture size only and ``prepare_shape`` refuses a
+# size that already holds captured state, so two graph sets over the *same*
+# sizes cannot share one registry. The active registry is selected by the graph
+# kind that the runner sets before every capture and every replay, so the
+# attention backends keep calling ``get_graph_params()`` unchanged.
+_SHORT_GRAPH_PARAMS = GraphParams()
+
+
+def _active_params() -> GraphParams:
+    from vllm_fl.compilation import graph_kind
+
+    return _SHORT_GRAPH_PARAMS if graph_kind.short_active() else _GRAPH_PARAMS
+
 
 def get_graph_params() -> GraphParams:
-    return _GRAPH_PARAMS
+    return _active_params()
 
 
 def prepare_graph_params(num_tokens: int) -> GraphParams:
-    _GRAPH_PARAMS.prepare_shape(num_tokens)
-    return _GRAPH_PARAMS
+    params = _active_params()
+    params.prepare_shape(num_tokens)
+    return params
 
 
 def clear_graph_params() -> None:
     _GRAPH_PARAMS.clear()
+    _SHORT_GRAPH_PARAMS.clear()
 
 
 def weak_ref_workspace(num_tokens: int) -> None:

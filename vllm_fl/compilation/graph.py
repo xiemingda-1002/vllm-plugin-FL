@@ -27,6 +27,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_fl.compilation import graph_kind
 from vllm_fl.compilation.graph_runtime import (
     GraphRuntimeController,
     StaticInputBindings,
@@ -175,6 +176,10 @@ class GraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_graph_entries: dict[BatchDescriptor, GraphEntry] = {}
+        # Second graph set for the short-lifetime requests of the dual-graph
+        # mode). Same keys, different captured body -- the short body skips the
+        # indexer and the index-key chain. Empty unless VLLM_FL_M3_DUAL_GRAPH=1.
+        self.short_graph_entries: dict[BatchDescriptor, GraphEntry] = {}
 
         GraphWrapper._all_instances.add(self)
 
@@ -199,6 +204,15 @@ class GraphWrapper:
 
     def clear_graphs(self) -> None:
         self.concrete_graph_entries.clear()
+        self.short_graph_entries.clear()
+
+    def _entries(self) -> dict[BatchDescriptor, GraphEntry]:
+        """Graph set for the current step kind (long unless dual mode says so)."""
+        return (
+            self.short_graph_entries
+            if graph_kind.short_active()
+            else self.concrete_graph_entries
+        )
 
     def __call__(self, *args, **kwargs):
         if not is_forward_context_available():
@@ -217,13 +231,25 @@ class GraphWrapper:
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
-        if batch_descriptor not in self.concrete_graph_entries:
+        entries = self._entries()
+        if batch_descriptor not in entries:
+            if graph_kind.short_active() and graph_kind.capture_kind() is None:
+                # Fail fast instead of lazily capturing at serving time: a short
+                # step whose shape has no short graph means the dispatcher and
+                # the capture loop disagree, which must never degrade silently.
+                raise RuntimeError(
+                    "Dual-graph: no SHORT graph captured for batch descriptor "
+                    f"{batch_descriptor} (captured short sizes: "
+                    f"{sorted(graph_kind.short_covered_sizes())}). "
+                    "VLLM_FL_M3_DUAL_GRAPH_SIZES must cover every size the "
+                    "dispatcher can send to the short set."
+                )
             # create a new entry for this batch descriptor
-            self.concrete_graph_entries[batch_descriptor] = GraphEntry(
+            entries[batch_descriptor] = GraphEntry(
                 batch_descriptor=batch_descriptor
             )
 
-        entry = self.concrete_graph_entries[batch_descriptor]
+        entry = entries[batch_descriptor]
 
         if entry.graph is None:
             if self.cudagraph_options.debug_log_enable:
