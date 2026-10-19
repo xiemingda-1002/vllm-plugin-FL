@@ -58,6 +58,295 @@ _ops_registered = False
 _rmsnorm_patched = False
 
 
+# ---------------------------------------------------------------------------
+# Short-context dense-equivalent selection (``VLLM_FL_M3_SHORTCTX_DENSE=1``)
+# ---------------------------------------------------------------------------
+# With ``n`` visible blocks and ``n <= topk_blocks`` the lightning indexer
+# selects **every** visible block, so it changes only the *order* in which the
+# attend reads them (fp32 accumulation order -> <= 1 bf16 ULP), never the key
+# set. Here ``n = ceil(seq_len / sparse_block_size)`` and the exact range is
+# ``topk_blocks * sparse_block_size = 16 * 128 = 2048`` for MiniMax-M3 decode.
+#
+# This path writes that selection itself -- block ids ``[0, 1, ..., n-1, -1]``
+# -- and skips the indexer and the index-key insert. The attend kernel
+# (``npu_sparse_attention_score``, reached through the same
+# ``layer.impl.forward``), the KV layout and the ``selectNumIdx`` contract
+# (``attention/ascend/sparse_attn_m3.py:68-70``: ``count(idx >= 0)``) are
+# untouched; only the producer of ``topk_indices_buffer`` changes.
+#
+# Why the identity set *is* the causal set (``npu_sparse_attention_score``,
+# :196-223): the operator reads ``logicalId = idx[j]`` for ``j < selectNumIdx``,
+# maps it through ``block_table``, skips negative ids, and truncates the block
+# whose id equals ``(history_len + q_offset) // block_size`` to
+# ``(history_len + q_offset) % block_size + 1`` tokens. Blocks ``0 .. n-1`` are
+# exactly those that end at or before this query token, so their union is the
+# full causal key set; no block past it is ever read.
+#
+# ``sparse_init_block`` / ``sparse_local_block`` (0 / 1 here) only *force*
+# blocks into the selection (``index_topk.py:237-244``). Selecting every
+# visible block already contains them, so nothing has to be re-added.
+#
+# Enabled at start-up only: under ``cudagraph_mode=FULL_DECODE_ONLY`` a Python
+# branch inside the forward is captured as-is, so a per-request decision would
+# freeze into the graph and silently change long-context output. The
+# equivalence bound is enforced when the layers are built instead
+# (:func:`_enforce_shortctx_dense_bound`).
+_SHORTCTX_DENSE_SWITCH = "VLLM_FL_M3_SHORTCTX_DENSE"
+_SHORTCTX_BLOCK_SIZE = 128  # SPARSE_BLOCK_SIZE, upstream ops/sparse_attn.py:25
+_SHORTCTX_DEFAULT_TOPK = 16  # config.json "sparse_topk_blocks"
+
+
+def _shortctx_dense_enabled() -> bool:
+    """Read the start-up switch; resolved once, at module import."""
+    import os
+
+    return os.environ.get(_SHORTCTX_DENSE_SWITCH, "0").strip() == "1"
+
+
+_SHORTCTX_DENSE = _shortctx_dense_enabled()
+
+_shortctx_slots_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_shortctx_attend_impl = None
+_shortctx_epoch = 0
+_shortctx_filled_epoch = -1
+_shortctx_last_ordinal: int | None = None
+_shortctx_bound_checked = False
+
+
+def _shortctx_attend(layer, q: torch.Tensor, attn_output: torch.Tensor) -> None:
+    """Attend for the short-context path, keeping upstream's eager break.
+
+    Upstream wraps indexer + attend in ``@eager_break_during_capture``
+    (model.py:619-630) so the split-K attention kernels are never captured.
+    This path has no indexer, so it applies the same decorator to the attend
+    alone; outside breakable cudagraph capture (``FULL_DECODE_ONLY`` here) the
+    decorator is a pass-through and the call is the plain ``impl.forward``.
+    """
+    global _shortctx_attend_impl
+
+    if _shortctx_attend_impl is None:
+
+        def _attend(layer, q: torch.Tensor, attn_output: torch.Tensor) -> None:
+            layer.impl.forward(layer, q, layer.kv_cache, attn_output)
+
+        try:
+            from vllm_fl.compilation.break_graph import eager_break_during_capture
+        except ImportError:  # pragma: no cover - upstream layout change
+            _shortctx_attend_impl = _attend
+        else:
+            _shortctx_attend_impl = eager_break_during_capture(_attend)
+    _shortctx_attend_impl(layer, q, attn_output)
+
+
+def _shortctx_slots(
+    topk: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[0 .. topk-1]`` and a scalar ``-1`` on ``device`` (cached per device)."""
+    key = (device.type, str(device), topk)
+    cached = _shortctx_slots_cache.get(key)
+    if cached is None:
+        slots = torch.arange(topk, dtype=torch.int32, device=device)
+        cached = (slots, slots.new_full((), -1))
+        _shortctx_slots_cache[key] = cached
+    return cached
+
+
+def _shortctx_blocks(kv_len: torch.Tensor, block_size: int) -> torch.Tensor:
+    """``ceil(kv_len / block_size)`` as int32: the visible block count."""
+    return ((kv_len + (block_size - 1)) // block_size).to(torch.int32)
+
+
+def _shortctx_decode_counts(
+    seq_lens: torch.Tensor, decode_query_len: int, block_size: int
+) -> torch.Tensor:
+    """Visible blocks per decode query token.
+
+    Mirrors ``index_topk_ascend._decode_visible_blocks``: ``kv_len`` is plain
+    ``seq_len`` when one query token per request, else
+    ``seq_len - decode_query_len + q_offset + 1``.
+    """
+    seq_lens = seq_lens.to(torch.long)
+    if decode_query_len == 1:
+        kv_len = seq_lens
+    else:
+        total_q = seq_lens.shape[0] * decode_query_len
+        ids = torch.arange(total_q, device=seq_lens.device, dtype=torch.long)
+        req = ids // decode_query_len
+        kv_len = seq_lens[req] - decode_query_len + (ids - req * decode_query_len) + 1
+    return _shortctx_blocks(kv_len, block_size)
+
+
+def _shortctx_prefill_counts(
+    cu_seqlens_q: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_prefill_tokens: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Visible blocks per prefill query token.
+
+    Mirrors ``minimax_m3_index_topk`` (``index_topk_ascend.py:230-235``):
+    ``valid = (context_len + q_offset + block) // block``, i.e.
+    ``ceil((context_len + q_offset + 1) / block)``.
+    """
+    device = cu_seqlens_q.device
+    q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.long)
+    num_prefills = q_lens.shape[0]
+    if num_prefills == 0 or num_prefill_tokens == 0:
+        return torch.empty(0, dtype=torch.int32, device=device)
+    req = torch.repeat_interleave(
+        torch.arange(num_prefills, device=device),
+        q_lens,
+        output_size=num_prefill_tokens,
+    )
+    q_off = torch.arange(
+        num_prefill_tokens, device=device, dtype=torch.long
+    ) - cu_seqlens_q[req].to(torch.long)
+    kv_len = context_lens[req].to(torch.long) + q_off + 1
+    return _shortctx_blocks(kv_len, block_size)
+
+
+def _shortctx_layer_ordinal(layer) -> int | None:
+    """Decoder-layer index parsed from ``layer.layer_name`` (``...layers.N....``)."""
+    name = getattr(layer, "layer_name", None)
+    if not isinstance(name, str):
+        return None
+    parts = name.split(".")
+    if "layers" not in parts:
+        return None
+    idx = parts.index("layers") + 1
+    if idx >= len(parts) or not parts[idx].isdigit():
+        return None
+    return int(parts[idx])
+
+
+def _shortctx_fill_due(layer) -> bool:
+    """``True`` on the first sparse layer of each model forward.
+
+    The identity buffer is layer-invariant, so one write per forward is enough.
+    The forward boundary is detected without reading any tensor value: the
+    layer loop restarts at the first sparse layer, so a non-increasing
+    decoder-layer ordinal means a new forward started -- the same argument as
+    ``attention/ascend/m3_step_cache.py``. Both replay modes stay correct:
+
+    * eager / graph-break replay: this runs on every step and rewrites the
+      buffer at the first sparse layer, before any attend reads it;
+    * fully captured replay: this runs once while capturing, and the write is
+      baked into the graph as device work, so every replay rewrites it.
+
+    If the ordinal cannot be derived, write on every layer: correct, at the
+    cost of one extra small copy per layer.
+    """
+    global _shortctx_epoch, _shortctx_filled_epoch, _shortctx_last_ordinal
+
+    ordinal = _shortctx_layer_ordinal(layer)
+    if ordinal is None:
+        return True
+    if _shortctx_last_ordinal is not None and ordinal <= _shortctx_last_ordinal:
+        _shortctx_epoch += 1
+    _shortctx_last_ordinal = ordinal
+    if _shortctx_filled_epoch == _shortctx_epoch:
+        return False
+    _shortctx_filled_epoch = _shortctx_epoch
+    return True
+
+
+def _shortctx_write_identity_topk(layer, block_size: int) -> None:
+    """Write ``[0 .. n-1, -1, ...]`` into ``layer.topk_indices_buffer``.
+
+    Same buffer, same layout, same dtype the indexer wrote (decode tokens at
+    ``[:, :num_decode_tokens]``, prefill tokens after them), so the attend sees
+    exactly the values it already knows how to read and ``selectNumIdx`` --
+    computed downstream as ``(idx >= 0).sum(-1)`` -- becomes ``n`` per token.
+    """
+    from vllm.forward_context import get_forward_context
+
+    attn_metadata = get_forward_context().attn_metadata
+    if not isinstance(attn_metadata, dict):
+        return  # memory-profiling run: no metadata, and no attend either
+    main_md = attn_metadata[layer.layer_name]
+    buf = layer.topk_indices_buffer
+    if buf is None:
+        return
+
+    parts = []
+    if main_md.num_decodes > 0:
+        d = main_md.decode
+        parts.append(
+            _shortctx_decode_counts(d.seq_lens, d.decode_query_len, block_size)
+        )
+    if main_md.num_prefills > 0:
+        p = main_md.prefill
+        parts.append(
+            _shortctx_prefill_counts(
+                p.cu_seqlens_q,
+                p.context_lens,
+                main_md.num_prefill_tokens,
+                block_size,
+            )
+        )
+    if not parts:
+        return
+    counts = parts[0] if len(parts) == 1 else torch.cat(parts)
+    if counts.numel() == 0:
+        return
+
+    topk = buf.shape[-1]
+    counts = counts.clamp_(max=topk)
+    slots, minus_one = _shortctx_slots(topk, buf.device)
+    identity = torch.where(slots.unsqueeze(0) < counts.unsqueeze(1), slots, minus_one)
+    total_q = main_md.num_actual_tokens
+    buf[:, :total_q, :].copy_(identity.unsqueeze(0))
+
+
+def _shortctx_selection_bound(config) -> int:
+    """``topk_blocks * sparse_block_size`` -- the largest exact ``seq_len``."""
+    sparse_cfg = getattr(config, "sparse_attention_config", None) or {}
+    topk = int(sparse_cfg.get("sparse_topk_blocks", _SHORTCTX_DEFAULT_TOPK))
+    block = int(sparse_cfg.get("sparse_block_size", _SHORTCTX_BLOCK_SIZE))
+    return topk * block
+
+
+def _enforce_shortctx_dense_bound(config) -> None:
+    """Fail fast unless the whole context stays inside the identity bound.
+
+    ``seq_len > topk_blocks * sparse_block_size`` is the only condition under
+    which the identity selection differs from the indexer's (topk then drops
+    blocks), so it must abort at start-up rather than degrade silently.
+    """
+    global _shortctx_bound_checked
+    if _shortctx_bound_checked:
+        return
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    bound = _shortctx_selection_bound(config)
+    if max_model_len > bound:
+        raise ValueError(
+            f"{_SHORTCTX_DENSE_SWITCH}=1 replaces the block indexer with an "
+            "identity selection of every visible block. That is equivalent to "
+            "the block-sparse path only while max_model_len <="
+            f" sparse_topk_blocks * sparse_block_size = {bound}, but got "
+            f"--max-model-len {max_model_len}. Re-run with --max-model-len "
+            f"{bound}, or unset the switch: above the bound the identity "
+            "selection would attend blocks the indexer drops, silently "
+            "changing the output."
+        )
+    _shortctx_bound_checked = True
+    # Operator-visible confirmation that the switch took effect at start-up.
+    # ``logger.info`` is NOT usable here: vLLM installs handlers for its own
+    # "vllm" logger only, and this deployment's root logger sits at WARNING, so
+    # the line was silently filtered in the field. ``print`` goes to the
+    # serve driver's stdout (captured by its ``tee``) and needs no logging
+    # configuration at all.
+    print(
+        f"[SHORTCTX_DENSE] MiniMax-M3: short-context dense-equivalent attention "
+        f"enabled ({_SHORTCTX_DENSE_SWITCH}=1: identity block selection, "
+        f"max_model_len {max_model_len} <= {bound})",
+        flush=True,
+    )
+
+
 def _sparse_prepare(
     layer,
     qkv: torch.Tensor,
@@ -99,6 +388,14 @@ def _sparse_prepare(
         head_dim=head_dim,
         eps=eps,
     )
+
+    if _SHORTCTX_DENSE:
+        # Short-context path: the index branch feeds only the indexer's block
+        # scores, which the identity selection does not read. Alias q/k into the
+        # two slots the opaque op still declares (it never dereferences them in
+        # this mode); this drops the second fused norm/RoPE per sparse layer,
+        # 50.94 us x 57 layers per decode step (measured on Ascend 910C).
+        return q, k, v, q, k
 
     index_slab = qkv.narrow(-1, main_size, layer.index_q_size + head_dim)
     index_packed = torch.cat(
@@ -155,6 +452,19 @@ def _sparse_forward_body(
 
     block_size = layer.kv_cache.size(2)
     _insert_kv(layer.kv_cache, main_slots, k, v, block_size)
+
+    if _SHORTCTX_DENSE:
+        # Short-context path: no indexer and no index-key insert. The selection
+        # is the identity (every visible block, ascending), written into the
+        # shared buffer the attend already reads; ``_shortctx_attend`` is the
+        # same attend call upstream's ``_run_attention`` reaches (upstream
+        # model.py:619-630 is exactly ``indexer(...)`` + ``impl.forward(...)``),
+        # with the same eager break kept around it.
+        if _shortctx_fill_due(layer):
+            _shortctx_write_identity_topk(layer, block_size)
+        _shortctx_attend(layer, q, attn_output)
+        return
+
     _insert_index_k(
         layer.indexer.index_cache.kv_cache, index_slots, index_k, block_size
     )
@@ -490,7 +800,18 @@ def _build_classes():
         cache inserts and the attend go through one opaque op, so graph replay
         cannot lose the stateful effects while the pure-function work still runs
         inside the ACL graph. This is how vLLM-Ascend splits its own M3 port.
+
+        With ``VLLM_FL_M3_SHORTCTX_DENSE=1`` the same forward runs without the
+        indexer (see the module-level note); the only extra start-up step is
+        :func:`_enforce_shortctx_dense_bound`, which refuses a context length
+        the identity selection cannot reproduce.
         """
+
+        def __init__(self, *args, **kwargs):
+            config = kwargs.get("config", args[0] if args else None)
+            super().__init__(*args, **kwargs)
+            if _SHORTCTX_DENSE and config is not None:
+                _enforce_shortctx_dense_bound(config)
 
         def forward(
             self,
