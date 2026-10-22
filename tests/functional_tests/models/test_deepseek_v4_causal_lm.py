@@ -671,3 +671,157 @@ def test_complete_model_changed_tokens_graph(model_env):
         torch.testing.assert_close(output, expected, rtol=0.03, atol=0.03)
         assert not torch.equal(output, previous)
         previous = output.clone()
+
+
+def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
+    model_env, monkeypatch
+):
+    import torch_npu  # noqa: F401
+
+    import vllm.compilation.monitor as graph_monitor
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    from vllm_fl.compilation.graph import GraphWrapper
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    env = model_env
+    request = _request(env, "fl-wrapper-boundaries")
+    _run(env, request, torch.arange(126, device="npu"), 126)
+    assert request.num_computed_tokens == 126
+    assert env.manager.allocate_slots(request, 1) is not None
+    _, snapshots = _metadata(env, request, 1, padded=2)
+    assert len(snapshots) == len(env.builders)
+    dummy = {
+        name: builder.build_for_dummy(common)
+        for (name, builder), (common, _, _) in zip(env.builders.items(), snapshots)
+    }
+    layout = {
+        (name, field): (tensor.data_ptr(), tensor.shape, tensor.stride())
+        for name, plan in dummy.items()
+        for field, tensor in vars(plan).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    # Include padding between typed pages, not just the logical cache elements.
+    raw_caches = {}
+    for name, leaf in env.leaves.items():
+        storage = leaf.kv_cache.untyped_storage()
+        raw_caches[name] = torch.empty(
+            0, dtype=torch.uint8, device=leaf.kv_cache.device
+        ).set_(storage, 0, (storage.nbytes(),), (1,))
+    before_dummy = {name: raw.clone() for name, raw in raw_caches.items()}
+
+    tokens = torch.tensor([19, 0], device="npu")
+    positions = torch.tensor([126, -1], device="npu")
+    descriptor = BatchDescriptor(num_tokens=2, num_reqs=2, uniform=True)
+    monkeypatch.setattr(
+        env.config.compilation_config,
+        "cudagraph_mode",
+        CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    monkeypatch.setattr(graph_monitor, "cudagraph_capturing_enabled", True)
+    controller = GraphRuntimeController(vllm_config=env.config)
+    controller.bind_attention_groups(
+        [[
+            SimpleNamespace(backend=leaf.get_attn_backend())
+            for leaf in env.leaves.values()
+        ]]
+    )
+    assert controller.attention_impls == ()
+    python_calls = []
+
+    def runnable(input_ids, input_positions):
+        python_calls.append("forward")
+        return env.model(input_ids, input_positions)
+
+    wrapper = GraphWrapper(
+        runnable,
+        env.config,
+        runtime_mode=CUDAGraphMode.FULL,
+        graph_runtime=controller,
+    )
+    try:
+        # Forced eager dummy warmups execute the same static numerical chain.
+        for _ in range(3):
+            with set_forward_context(
+                dummy, env.config, num_tokens=2,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=descriptor,
+            ):
+                wrapper(tokens, positions)
+            torch.npu.synchronize()
+            for name, raw in raw_caches.items():
+                torch.testing.assert_close(raw, before_dummy[name], rtol=0, atol=0)
+        assert len(python_calls) == 3
+        with set_forward_context(
+            dummy, env.config, num_tokens=2,
+            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+            batch_descriptor=descriptor,
+        ):
+            captured_hidden = wrapper(tokens, positions)
+        torch.npu.synchronize()
+        assert len(python_calls) == 4
+        assert wrapper.concrete_graph_entries[descriptor].graph is not None
+        for name, raw in raw_caches.items():
+            torch.testing.assert_close(raw, before_dummy[name], rtol=0, atol=0)
+
+        for position in range(126, 132):
+            token = (position * 13 + 7) % 128
+            if position >= request.num_tokens:
+                request.append_output_token_ids(token)
+            assert env.manager.allocate_slots(request, 1) is not None
+            real, public = _metadata(env, request, 1, padded=2)
+            for name, plan in real.items():
+                for field, tensor in vars(plan).items():
+                    if isinstance(tensor, torch.Tensor):
+                        assert (
+                            tensor.data_ptr(), tensor.shape, tensor.stride()
+                        ) == layout[name, field]
+            for ratio in (4, 128):
+                prefix = "model.layers.1" if ratio == 4 else "model.layers.2"
+                plan = real[prefix + ".self_attn.compact_cache"]
+                assert plan.num_completed == int((position + 1) % ratio == 0)
+                assert torch.all(plan.positions[1:] == -1)
+                assert torch.all(plan.output_slots[plan.num_completed :] == -1)
+            tokens.copy_(torch.tensor([token, 0], device="npu"))
+            positions.copy_(torch.tensor([position, -1], device="npu"))
+            before_real = {name: raw.clone() for name, raw in raw_caches.items()}
+            with set_forward_context(
+                real, env.config, num_tokens=2,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ):
+                expected_hidden = env.model(tokens, positions)
+                expected_logits = env.model.compute_logits(expected_hidden).clone()
+            expected_cache = {
+                name: leaf.kv_cache.clone() for name, leaf in env.leaves.items()
+            }
+            for name, raw in raw_caches.items():
+                raw.copy_(before_real[name])
+            with set_forward_context(
+                real, env.config, num_tokens=2,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                batch_descriptor=descriptor,
+            ):
+                hidden = wrapper(tokens, positions)
+            torch.npu.synchronize()
+            logits = env.model.compute_logits(hidden)
+            assert len(python_calls) == 4, "Replay re-entered the Python model"
+            assert wrapper.concrete_graph_entries[descriptor].graph is not None
+            assert hidden.data_ptr() == captured_hidden.data_ptr()
+            assert torch.isfinite(logits[:1]).all()
+            torch.testing.assert_close(
+                logits[:1], expected_logits[:1], rtol=0.03, atol=0.03
+            )
+            for name, leaf in env.leaves.items():
+                torch.testing.assert_close(
+                    leaf.kv_cache, expected_cache[name], rtol=0.03, atol=0.03
+                )
+                assert torch.count_nonzero(leaf.kv_cache[0]) == 0
+            for common, table, slots in public:
+                torch.testing.assert_close(common.block_table_tensor, table)
+                torch.testing.assert_close(common.slot_mapping, slots)
+            request.num_computed_tokens += 1
+    finally:
+        torch.npu.synchronize()
+        wrapper.clear_graphs()
+        controller.clear_decoder_graphs()

@@ -95,6 +95,8 @@ class GraphRuntimeController:
                 if backend in seen_backends:
                     continue
                 seen_backends.add(backend)
+                if getattr(backend, "requires_graph_task_updates", True) is False:
+                    continue
                 factory = getattr(backend, "get_impl_cls", None)
                 if factory is None or factory is AttentionBackend.get_impl_cls:
                     continue

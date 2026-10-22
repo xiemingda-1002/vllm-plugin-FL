@@ -2349,6 +2349,7 @@ class ModelRunnerFL(
         slot_mappings: dict[int, torch.Tensor] | None = None,
         block_table_rows_are_current: bool = False,
         ascend_attn_state: Any | None = None,
+        for_dummy_run: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2558,7 +2559,10 @@ class ModelRunnerFL(
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
 
-            if for_cudagraph_capture:
+            dummy_builder = getattr(builder, "build_for_dummy", None)
+            if for_dummy_run and callable(dummy_builder):
+                attn_metadata_i = dummy_builder(common_attn_metadata)
+            elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -6170,6 +6174,7 @@ class ModelRunnerFL(
                     use_spec_decode=self.speculative_config is not None,
                     block_table_rows_are_current=self.common_attention_metadata_graph is not None,
                     ascend_attn_state=ascend_dummy_attn_state,
+                    for_dummy_run=True,
                 )
 
             # Dummy forwards must not update real KV-cache slots. Capture the
