@@ -753,18 +753,19 @@ class DeepseekV4Model(nn.Module):
             if get_pp_group().is_last_rank
             else PPMissingLayer()
         )
-        if get_pp_group().is_last_rank:
-            for name, shape in (
-                ("fn", (config.hc_mult, config.hc_mult * config.hidden_size)),
-                ("base", (config.hc_mult,)),
-                ("scale", (1,)),
-            ):
-                self.register_parameter(
-                    f"hc_head_{name}",
-                    nn.Parameter(
-                        torch.empty(shape, dtype=torch.float32), requires_grad=False
-                    ),
-                )
+        # Checkpoints contain these root parameters on every PP rank. Keep
+        # their ownership uniform; only the final rank executes the HC head.
+        for name, shape in (
+            ("fn", (config.hc_mult, config.hc_mult * config.hidden_size)),
+            ("base", (config.hc_mult,)),
+            ("scale", (1,)),
+        ):
+            self.register_parameter(
+                f"hc_head_{name}",
+                nn.Parameter(
+                    torch.empty(shape, dtype=torch.float32), requires_grad=False
+                ),
+            )
 
     def embed_input_ids(self, input_ids):
         return self.embed_tokens(input_ids)

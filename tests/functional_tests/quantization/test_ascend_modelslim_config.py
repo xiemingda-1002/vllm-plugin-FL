@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit config checks using a Run-owned checkpoint metadata sample."""
+"""Self-contained ModelSlim metadata and framework mapping contracts."""
 
 import json
-import os
-from pathlib import Path
 
 import pytest
 import torch
@@ -17,16 +15,26 @@ pytestmark = [
 
 
 @pytest.fixture
-def config():
+def config(tmp_path):
     from vllm.model_executor.model_loader.utils import configure_quant_config
 
     from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
     from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
 
-    path = os.environ.get("FL_MODELSLIM_DESCRIPTOR")
-    if not path:
-        pytest.skip("Set FL_MODELSLIM_DESCRIPTOR to Run-owned metadata sample")
-    result = AscendModelSlimConfig(json.loads(Path(path).read_text()))
+    description = {
+        "embed.weight": "FLOAT",
+        "head.weight": "FLOAT",
+        "layers.0.attn.wq_a.weight": "W8A8_DYNAMIC",
+        "layers.0.attn.wq_b.weight": "W8A8_DYNAMIC",
+        "layers.0.attn.wo_a.weight": "FLOAT",
+        "layers.0.ffn.gate.weight": "FLOAT",
+    }
+    for projection in ("w1", "w2", "w3"):
+        for owner in ("experts.0", "shared_experts"):
+            description[f"layers.0.ffn.{owner}.{projection}.weight"] = "W8A8_DYNAMIC"
+    (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
+    result = AscendModelSlimConfig()
+    result.maybe_update_config(str(tmp_path))
     configure_quant_config(result, DeepseekV4ForCausalLM)
     return result
 
@@ -44,7 +52,7 @@ def config():
         ("lm_head", "FLOAT"),
     ],
 )
-def test_actual_descriptor_prefixes(config, prefix, expected):
+def test_descriptor_prefixes(config, prefix, expected):
     assert (
         config.get_layer_quant_type(prefix, is_moe=prefix.endswith(".experts"))
         == expected
@@ -247,3 +255,25 @@ def test_unsupported_types(description):
 
     with pytest.raises(NotImplementedError):
         AscendModelSlimConfig(description)
+
+
+def test_registration_idempotent(monkeypatch):
+    from vllm.model_executor.layers import quantization
+
+    from vllm_fl.quantization import ascend
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+
+    calls = []
+
+    def register(name):
+        def decorator(config_class):
+            calls.append((name, config_class))
+            return config_class
+
+        return decorator
+
+    monkeypatch.setattr(quantization, "register_quantization_config", register)
+    monkeypatch.setattr(ascend, "_modelslim_registered", False)
+    ascend.register_modelslim_config()
+    ascend.register_modelslim_config()
+    assert calls == [("ascend", AscendModelSlimConfig)]

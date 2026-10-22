@@ -228,7 +228,9 @@ def register_model():
         and getattr(current_platform, "vendor_name", None) == "ascend"
     ):
         from vllm_fl.dispatch.backends.vendor.ascend.patch import register_deepseek_v4
+        from vllm_fl.quantization.ascend import register_modelslim_config
 
+        register_modelslim_config()
         register_deepseek_v4()
     if current_platform.device_type == "cpu" and _arm_cpu_platform() is not None:
         from vllm_fl.patches.arm_cpu_gdn import (
