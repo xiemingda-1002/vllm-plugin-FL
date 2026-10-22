@@ -40,6 +40,10 @@ def register_builtins(registry) -> None:
     # vLLM 0.24 builds. One absent optional MoE helper must not prevent all
     # available PyTorch fallbacks from registering.
     op_names = (
+        "deepseek_v4_project",
+        "deepseek_v4_hc_pre",
+        "deepseek_v4_hc_post",
+        "deepseek_v4_hc_head",
         "deepseek_v4_save_state",
         "deepseek_v4_compress",
         "deepseek_v4_indexer",
