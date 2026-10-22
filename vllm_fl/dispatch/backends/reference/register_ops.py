@@ -45,6 +45,7 @@ def register_builtins(registry) -> None:
         "deepseek_v4_hc_post",
         "deepseek_v4_hc_head",
         "deepseek_v4_save_state",
+        "deepseek_v4_cache_write",
         "deepseek_v4_compress",
         "deepseek_v4_indexer",
         "deepseek_v4_sparse_attention",

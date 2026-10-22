@@ -122,6 +122,36 @@ def _lengths(lengths, requests):
     return lengths[requests.long().clamp(0, lengths.shape[0] - 1)]
 
 
+def deepseek_v4_cache_write(values, slots, cache):
+    """Write unique valid slots; negative slots are padding, never slot zero."""
+    if (
+        cache.ndim != 3
+        or values.ndim != 2
+        or values.shape[1] != cache.shape[-1]
+        or slots.shape != values.shape[:1]
+    ):
+        raise ValueError(
+            "Expected matching [tokens, dim], [tokens], [pages, block, dim]"
+        )
+    if cache.dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.int8):
+        raise ValueError("Unsupported cache storage dtype")
+    if values.shape[0] == 0:
+        return
+    flat = cache.reshape(-1, cache.shape[-1])
+    valid = (slots >= 0) & (slots < flat.shape[0])
+    indices = slots.long().clamp(0, flat.shape[0] - 1)
+    updates = torch.zeros_like(flat, dtype=torch.float32).index_add_(
+        0, indices, torch.where(valid[:, None], values.float(), 0)
+    )
+    touched = torch.zeros(flat.shape[0], device=flat.device, dtype=torch.int32)
+    touched.index_add_(0, indices, valid.to(torch.int32))
+    cache.copy_(
+        torch.where(touched[:, None] > 0, updates, flat.float())
+        .to(cache.dtype)
+        .reshape(cache.shape)
+    )
+
+
 def deepseek_v4_save_state(
     kv, gate, ape, positions, slot_mapping, state_cache, compress_ratio
 ):
@@ -147,19 +177,10 @@ def deepseek_v4_save_state(
     packed = torch.cat(
         [kv.float(), gate.float() + ape[positions.long() % compress_ratio].float()], -1
     )
-    valid = slot_mapping >= 0
-    slots = slot_mapping.long().clamp_min(0)
-    packed = torch.where(valid[:, None], packed, 0)
-    flat = state_cache.reshape(-1, state_cache.shape[-1])
     # A masked index_copy to slot zero races with a real slot-zero write.
     # Accumulating only nonzero valid contributions avoids that padding race,
     # including NaNs in padded projections, without data-dependent shapes.
-    updates = torch.zeros_like(flat).index_add_(0, slots, packed)
-    touched = torch.zeros(flat.shape[0], device=flat.device, dtype=torch.int32)
-    touched.index_add_(0, slots, valid.to(torch.int32))
-    state_cache.copy_(
-        torch.where(touched[:, None] > 0, updates, flat).reshape(state_cache.shape)
-    )
+    deepseek_v4_cache_write(packed, slot_mapping, state_cache)
 
 
 def deepseek_v4_compress(

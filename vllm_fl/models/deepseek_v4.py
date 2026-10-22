@@ -90,6 +90,33 @@ class DeepseekV4Compressor(nn.Module):
             output_dtype=x.dtype,
         )
 
+    def forward_from_cache(
+        self,
+        x,
+        state_leaf,
+        compact_leaf,
+        state_metadata,
+        compact_metadata,
+        cos_sin_cache,
+    ):
+        if (
+            state_leaf.spec.compress_ratio != 1
+            or compact_leaf.spec.compress_ratio != self.compress_ratio
+        ):
+            raise ValueError("Compressor cache ratios do not match the model")
+        output = self(
+            x,
+            state_metadata.positions,
+            state_metadata.slot_mapping,
+            state_leaf.kv_cache,
+            state_metadata.block_table,
+            compact_metadata.output_request_ids,
+            compact_metadata.output_positions,
+            cos_sin_cache,
+        )
+        compact_leaf.store(output, compact_metadata)
+        return output
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     """Compose injected attention/MoE modules without binding their math backend."""
