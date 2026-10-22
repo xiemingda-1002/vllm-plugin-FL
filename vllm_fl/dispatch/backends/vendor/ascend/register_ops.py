@@ -84,7 +84,11 @@ def register_builtins(registry: OpRegistry) -> None:
         ),
     ]
 
-    for op_name in ("gdn_decode", "gdn_prefill"):
+    for op_name in (
+        "modelslim_w8a8_prepare_experts", "modelslim_w8a8_experts",
+        "gdn_decode", "gdn_prefill", "modelslim_w8a8_prepare_weight",
+        "modelslim_w8a8_dynamic_linear",
+    ):
         impls.append(OpImpl(
             op_name=op_name,
             impl_id="vendor.ascend",
