@@ -280,7 +280,11 @@ def model_env(runtime):
     try:
         torch.set_default_dtype(torch.bfloat16)
         try:
-            model = DeepseekV4ForCausalLM(vllm_config=runtime).to("npu")
+            from vllm.model_executor.model_loader.utils import initialize_model
+
+            model = initialize_model(runtime, model_class=DeepseekV4ForCausalLM).to(
+                "npu"
+            )
         finally:
             torch.set_default_dtype(dtype)
         checkpoint, expected = _native_checkpoint(model)
@@ -436,7 +440,12 @@ def _run(env, request, tokens, count, padded=None, inputs_embeds=None):
 
 
 def test_native_loader_maps_complete_parameter_set(model_env):
+    from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
     env = model_env
+    assert is_mixture_of_experts(env.model)
+    assert env.model.num_local_physical_experts == 4
+    assert len(env.model.moe_layers) == env.model.num_moe_layers == 3
     assert set(dict(env.model.named_parameters())) <= env.loaded
     assert all("mtp" not in name for name in env.loaded)
     for index, layer in enumerate(env.model.model.layers):
@@ -447,6 +456,21 @@ def test_native_loader_maps_complete_parameter_set(model_env):
         assert routed.w13_weight.dtype == routed.w2_weight.dtype == torch.int8
         assert routed.quant_method.supports_internal_mk
     assert len(env.leaves) == 10
+
+
+def test_profile_is_cache_free(model_env):
+    from vllm.forward_context import set_forward_context
+
+    env = model_env
+    before = {name: leaf.kv_cache.clone() for name, leaf in env.leaves.items()}
+    tokens = torch.tensor([1, 2, 3, 4], device="npu")
+    with set_forward_context(None, env.config, num_tokens=4):
+        logits = env.model.compute_logits(
+            env.model(tokens, torch.arange(4, device="npu"))
+        )
+    assert torch.isfinite(logits).all()
+    for name, leaf in env.leaves.items():
+        torch.testing.assert_close(leaf.kv_cache, before[name], rtol=0, atol=0)
 
 
 def test_full_vs_chunk_decode_token_to_logits(model_env):

@@ -68,6 +68,37 @@ def test_packed_mixed_and_missing(config):
         config.get_layer_quant_type("model.layers.0.mlp.experts")
 
 
+def test_framework_packing_preserves_descriptor_expert_aliases(config):
+    from copy import deepcopy
+
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
+    from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    original = deepcopy(DeepseekV4ForCausalLM.packed_modules_mapping)
+    configure_quant_config(config, DeepseekV4ForCausalLM)
+    assert config.packed_modules_mapping is DeepseekV4ForCausalLM.packed_modules_mapping
+    assert "experts" not in config.packed_modules_mapping
+    assert config.get_layer_quant_type("model.layers.0.mlp.experts") == "W8A8_DYNAMIC"
+    assert (
+        config.get_layer_quant_type("model.layers.0.mlp.shared_experts.gate_up_proj")
+        == "W8A8_DYNAMIC"
+    )
+
+    class AlternatePacking(DeepseekV4ForCausalLM):
+        packed_modules_mapping = {"shared_pair": ["gate_proj", "up_proj"]}
+
+    alternate = deepcopy(AlternatePacking.packed_modules_mapping)
+    configure_quant_config(config, AlternatePacking)
+    assert (
+        config.get_layer_quant_type("model.layers.0.mlp.shared_experts.shared_pair")
+        == "W8A8_DYNAMIC"
+    )
+    assert config.get_layer_quant_type("model.layers.0.mlp.experts") == "W8A8_DYNAMIC"
+    assert AlternatePacking.packed_modules_mapping == alternate
+    assert DeepseekV4ForCausalLM.packed_modules_mapping == original
+
+
 def test_external_mapper_idempotence(config):
     from vllm.model_executor.models.utils import WeightsMapper
 

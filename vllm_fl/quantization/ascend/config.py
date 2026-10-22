@@ -11,6 +11,11 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import WeightsMapper
 
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
+_EXPERT_SHARDS = (
+    "experts.0.gate_proj",
+    "experts.0.up_proj",
+    "experts.0.down_proj",
+)
 
 
 def _deepseek_mapper():
@@ -47,11 +52,6 @@ class AscendModelSlimConfig(QuantizationConfig):
         self.weight_nz_mode = weight_nz_mode
         self.packed_modules_mapping = {
             "gate_up_proj": ["gate_proj", "up_proj"],
-            "experts": [
-                "experts.0.gate_proj",
-                "experts.0.up_proj",
-                "experts.0.down_proj",
-            ],
         }
         self.hf_to_vllm_mapper = None
         self.quant_description = {}
@@ -132,7 +132,14 @@ class AscendModelSlimConfig(QuantizationConfig):
         prefix = _deepseek_mapper()._map_name(prefix + ".weight")[:-7]
         name = prefix.rsplit(".", 1)[-1]
         base = prefix[: -len(name)]
-        shards = self.packed_modules_mapping.get(name, [name])
+        # configure_quant_config replaces the model's Linear packing map by
+        # reference. Expert-zero aliases describe the ModelSlim checkpoint
+        # format, so they must survive that independent framework operation.
+        shards = (
+            _EXPERT_SHARDS
+            if name == "experts"
+            else self.packed_modules_mapping.get(name, [name])
+        )
         keys = [base + shard + ".weight" for shard in shards]
         missing = [key for key in keys if key not in self.quant_description]
         if missing:

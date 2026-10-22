@@ -15,6 +15,72 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("mode_name", ["NONE", "PIECEWISE"])
+def test_non_full_graph_binding_skips_cache_factory(mode_name):
+    from vllm.config import CUDAGraphMode
+
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    calls = []
+
+    class RaisingBackend:
+        @staticmethod
+        def get_impl_cls():
+            calls.append("factory")
+            raise NotImplementedError("cache-only backend")
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode[mode_name])
+    )
+    controller = GraphRuntimeController(vllm_config=config)
+    controller.bind_attention_groups([[SimpleNamespace(backend=RaisingBackend)]])
+    assert controller.attention_impls == ()
+    assert calls == []
+
+
+@pytest.mark.parametrize("mode_name", ["FULL", "FULL_DECODE_ONLY"])
+@pytest.mark.parametrize("factory_kind", ["valid", "missing_updater", "raises"])
+def test_full_graph_binding_validates_factory(mode_name, factory_kind):
+    from vllm.config import CUDAGraphMode
+
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    calls = []
+
+    class Impl:
+        @staticmethod
+        def update_graph_params(*args):
+            pass
+
+    class Backend:
+        @staticmethod
+        def get_impl_cls():
+            calls.append("factory")
+            if factory_kind == "raises":
+                raise NotImplementedError("cache-only backend")
+            return Impl if factory_kind == "valid" else object
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode[mode_name])
+    )
+    controller = GraphRuntimeController(vllm_config=config)
+    groups = [[SimpleNamespace(backend=Backend), SimpleNamespace(backend=Backend)]]
+    if factory_kind == "valid":
+        controller.bind_attention_groups(groups)
+        assert controller.attention_impls == (Impl,)
+    else:
+        message = (
+            "lacks update_graph_params"
+            if factory_kind == "missing_updater"
+            else "Failed to resolve"
+        )
+        with pytest.raises(RuntimeError, match=message) as error:
+            controller.bind_attention_groups(groups)
+        if factory_kind == "raises":
+            assert isinstance(error.value.__cause__, NotImplementedError)
+    assert calls == ["factory"]
+
+
 @pytest.fixture(scope="module")
 def runtime():
     from vllm.config import (

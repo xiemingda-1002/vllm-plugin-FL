@@ -223,6 +223,13 @@ def register_model():
     apply_qwen3_5_text_patches()
 
     from vllm.platforms import current_platform
+    if (
+        current_platform.device_type == "npu"
+        and getattr(current_platform, "vendor_name", None) == "ascend"
+    ):
+        from vllm_fl.dispatch.backends.vendor.ascend.patch import register_deepseek_v4
+
+        register_deepseek_v4()
     if current_platform.device_type == "cpu" and _arm_cpu_platform() is not None:
         from vllm_fl.patches.arm_cpu_gdn import (
             apply_arm_cpu_gdn_state_indices_patch,

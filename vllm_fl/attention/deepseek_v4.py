@@ -26,6 +26,11 @@ class DeepseekV4CacheMetadata:
 
 
 class DeepseekV4CacheBackend(AttentionBackend):
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size):
+        # This is the full-cache logical block, not the smaller state page.
+        return 128
+
     @staticmethod
     def get_name():
         return "FL_DEEPSEEK_V4_CACHE"
