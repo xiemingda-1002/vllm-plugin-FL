@@ -7,6 +7,88 @@ not depend on an Ascend extension, runner or process group.
 """
 
 import torch
+import torch.nn.functional as F
+
+
+def deepseek_v4_project(x, wkv, wgate):
+    """Retain FP32 compressor projections instead of rounding before state storage."""
+    if x.ndim != 2 or wkv.ndim != 2 or wgate.shape != wkv.shape:
+        raise ValueError(
+            "Expected [tokens, hidden] inputs and matching projection weights"
+        )
+    if x.shape[-1] != wkv.shape[-1]:
+        raise ValueError("Compressor projection input width mismatch")
+    if any(
+        t.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        for t in (x, wkv, wgate)
+    ):
+        raise TypeError("Compressor projections require floating, unquantized weights")
+    if x.shape[0] == 0:
+        shape = (0, wkv.shape[0])
+        return x.new_empty(shape, dtype=torch.float32), x.new_empty(
+            shape, dtype=torch.float32
+        )
+    return F.linear(x.float(), wkv.float()), F.linear(x.float(), wgate.float())
+
+
+def deepseek_v4_hc_pre(x, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters):
+    """Return native-order layer input, post coefficients and residual mix matrix."""
+    from vllm.model_executor.kernels.mhc.torch import mhc_pre_torch
+
+    if x.ndim != 3 or x.dtype != torch.bfloat16:
+        raise ValueError("HC pre requires BF16 [tokens, hc, hidden] residuals")
+    hc, dim = x.shape[1:]
+    mix = (2 + hc) * hc
+    if fn.shape != (mix, hc * dim) or scale.shape != (3,) or base.shape != (mix,):
+        raise ValueError("HC pre mixing parameter shapes do not match the residual")
+    if any(t.dtype != torch.float32 for t in (fn, scale, base)):
+        raise ValueError("HC mixing parameters must remain FP32")
+    if sinkhorn_iters < 1:
+        raise ValueError("HC requires at least one Sinkhorn iteration")
+    if x.shape[0] == 0:
+        return (
+            x.new_empty((0, dim)),
+            x.new_empty((0, hc), dtype=torch.float32),
+            x.new_empty((0, hc, hc), dtype=torch.float32),
+        )
+    post, comb, layer_input = mhc_pre_torch(
+        x.contiguous(), fn, scale, base, rms_eps, hc_eps, hc_eps, 2.0, sinkhorn_iters
+    )
+    return layer_input, post.squeeze(-1), comb
+
+
+def deepseek_v4_hc_post(x, residual, post, comb):
+    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+
+    if residual.ndim != 3 or x.shape != (residual.shape[0], residual.shape[2]):
+        raise ValueError("HC post input and residual shapes do not match")
+    if post.shape != residual.shape[:2] or comb.shape != (
+        *residual.shape[:2],
+        residual.shape[1],
+    ):
+        raise ValueError("HC post mixing shapes do not match the residual")
+    if x.shape[0] == 0:
+        return torch.empty_like(residual)
+    return mhc_post_torch(x, residual, post.unsqueeze(-1), comb)
+
+
+def deepseek_v4_hc_head(x, fn, scale, base, rms_eps, hc_eps):
+    """Collapse residual streams with normalized, input-dependent head weights."""
+    if x.ndim != 3:
+        raise ValueError("HC head requires [tokens, hc, hidden] residuals")
+    hc, dim = x.shape[1:]
+    if fn.shape != (hc, hc * dim) or scale.numel() != 1 or base.shape != (hc,):
+        raise ValueError("HC head parameter shapes do not match the residual")
+    if any(t.dtype != torch.float32 for t in (fn, scale, base)):
+        raise ValueError("HC mixing parameters must remain FP32")
+    if x.shape[0] == 0:
+        return x.new_empty((0, dim))
+    flat = x.flatten(1).float()
+    mixes = F.linear(flat, fn) * torch.rsqrt(
+        flat.square().mean(-1, keepdim=True) + rms_eps
+    )
+    pre = torch.sigmoid(mixes * scale + base) + hc_eps
+    return (pre.unsqueeze(-1) * x.float()).sum(1).to(x.dtype)
 
 
 def _paged_read(cache, table, requests, positions):
