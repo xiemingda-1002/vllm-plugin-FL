@@ -18,18 +18,23 @@ pytestmark = [
 
 @pytest.fixture
 def config():
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
+    from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
     from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
 
     path = os.environ.get("FL_MODELSLIM_DESCRIPTOR")
     if not path:
         pytest.skip("Set FL_MODELSLIM_DESCRIPTOR to Run-owned metadata sample")
-    return AscendModelSlimConfig(json.loads(Path(path).read_text()))
+    result = AscendModelSlimConfig(json.loads(Path(path).read_text()))
+    configure_quant_config(result, DeepseekV4ForCausalLM)
+    return result
 
 
 @pytest.mark.parametrize(
     "prefix,expected",
     [
-        ("layers.0.attn.wq_a", "W8A8_DYNAMIC"),
+        ("model.layers.0.self_attn.wq_a", "W8A8_DYNAMIC"),
         ("model.layers.0.self_attn.wq_b", "W8A8_DYNAMIC"),
         ("model.layers.0.self_attn.wo_a", "FLOAT"),
         ("model.layers.0.mlp.gate", "FLOAT"),
@@ -40,7 +45,10 @@ def config():
     ],
 )
 def test_actual_descriptor_prefixes(config, prefix, expected):
-    assert config.get_layer_quant_type(prefix) == expected
+    assert (
+        config.get_layer_quant_type(prefix, is_moe=prefix.endswith(".experts"))
+        == expected
+    )
 
 
 def test_method_resolution(config):
@@ -62,10 +70,10 @@ def test_packed_mixed_and_missing(config):
     key = "model.layers.0.mlp.experts.0.down_proj.weight"
     config.quant_description[key] = "FLOAT"
     with pytest.raises(ValueError, match="Mixed"):
-        config.get_layer_quant_type("model.layers.0.mlp.experts")
+        config.get_layer_quant_type("model.layers.0.mlp.experts", is_moe=True)
     del config.quant_description[key]
     with pytest.raises(ValueError, match="Missing"):
-        config.get_layer_quant_type("model.layers.0.mlp.experts")
+        config.get_layer_quant_type("model.layers.0.mlp.experts", is_moe=True)
 
 
 def test_framework_packing_preserves_descriptor_expert_aliases(config):
@@ -79,7 +87,10 @@ def test_framework_packing_preserves_descriptor_expert_aliases(config):
     configure_quant_config(config, DeepseekV4ForCausalLM)
     assert config.packed_modules_mapping is DeepseekV4ForCausalLM.packed_modules_mapping
     assert "experts" not in config.packed_modules_mapping
-    assert config.get_layer_quant_type("model.layers.0.mlp.experts") == "W8A8_DYNAMIC"
+    assert (
+        config.get_layer_quant_type("model.layers.0.mlp.experts", is_moe=True)
+        == "W8A8_DYNAMIC"
+    )
     assert (
         config.get_layer_quant_type("model.layers.0.mlp.shared_experts.gate_up_proj")
         == "W8A8_DYNAMIC"
@@ -94,23 +105,132 @@ def test_framework_packing_preserves_descriptor_expert_aliases(config):
         config.get_layer_quant_type("model.layers.0.mlp.shared_experts.shared_pair")
         == "W8A8_DYNAMIC"
     )
-    assert config.get_layer_quant_type("model.layers.0.mlp.experts") == "W8A8_DYNAMIC"
+    assert (
+        config.get_layer_quant_type("model.layers.0.mlp.experts", is_moe=True)
+        == "W8A8_DYNAMIC"
+    )
     assert AlternatePacking.packed_modules_mapping == alternate
     assert DeepseekV4ForCausalLM.packed_modules_mapping == original
 
 
-def test_external_mapper_idempotence(config):
+def test_external_mapper_idempotence():
     from vllm.model_executor.models.utils import WeightsMapper
 
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+
+    config = AscendModelSlimConfig({"model.proj.weight": "W8A8_DYNAMIC"})
     mapper = WeightsMapper(orig_to_new_prefix={"model.": "wrapped.model."})
     config.apply_vllm_mapper(mapper)
     once = dict(config.quant_description)
     config.apply_vllm_mapper(mapper)
     assert config.quant_description == once
-    assert (
-        config.get_layer_quant_type("wrapped.model.layers.0.self_attn.wq_a")
-        == "W8A8_DYNAMIC"
+    assert config.get_layer_quant_type("wrapped.model.proj") == "W8A8_DYNAMIC"
+
+
+def test_generic_dense_names_and_framework_packing():
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+
+    description = {
+        "layers.0.attn.w1.weight": "W8A8_DYNAMIC",
+        "layers.0.attn.w3.weight": "W8A8_DYNAMIC",
+    }
+    config = AscendModelSlimConfig(description)
+    assert config.quant_description == description
+    assert config.get_layer_quant_type("layers.0.attn.w1") == "W8A8_DYNAMIC"
+
+    class DenseModel(torch.nn.Module):
+        packed_modules_mapping = {"pair": ["w1", "w3"]}
+
+    configure_quant_config(config, DenseModel)
+    layer = object.__new__(LinearBase)
+    torch.nn.Module.__init__(layer)
+    assert isinstance(
+        config.get_quant_method(layer, "layers.0.attn.pair"),
+        AscendW8A8DynamicLinearMethod,
     )
+    assert DenseModel.packed_modules_mapping == {"pair": ["w1", "w3"]}
+    assert config.quant_description == description
+
+
+def test_non_idempotent_model_mapper_applies_only_to_descriptor():
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+
+    class DenseModel(torch.nn.Module):
+        hf_to_vllm_mapper = WeightsMapper(
+            orig_to_new_prefix={"model.": "model.language_model."}
+        )
+
+    config = AscendModelSlimConfig({"model.proj.weight": "W8A8_DYNAMIC"})
+    configure_quant_config(config, DenseModel)
+    configure_quant_config(config, DenseModel)
+    assert config.quant_description == {
+        "model.language_model.proj.weight": "W8A8_DYNAMIC"
+    }
+    assert config.get_layer_quant_type("model.language_model.proj") == "W8A8_DYNAMIC"
+
+
+def test_dense_linear_named_experts_is_not_moe():
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+
+    config = AscendModelSlimConfig({"experts.weight": "W8A8_DYNAMIC"})
+    layer = object.__new__(LinearBase)
+    torch.nn.Module.__init__(layer)
+    assert config.get_layer_quant_type("experts") == "W8A8_DYNAMIC"
+    assert isinstance(
+        config.get_quant_method(layer, "experts"), AscendW8A8DynamicLinearMethod
+    )
+
+
+def test_generic_descriptor_file_load_other_model_type(tmp_path):
+    from types import SimpleNamespace
+
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+
+    description = {"layers.0.attn.w1.weight": "W8A8_DYNAMIC"}
+    (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
+    config = AscendModelSlimConfig()
+    config.maybe_update_config(str(tmp_path), SimpleNamespace(model_type="dense_probe"))
+    assert config.quant_description == description
+    assert config.get_layer_quant_type("layers.0.attn.w1") == "W8A8_DYNAMIC"
+
+
+def test_deepseek_descriptor_mapper_loading_order(tmp_path):
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
+    from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
+    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+
+    description = {"layers.0.attn.wq_a.weight": "W8A8_DYNAMIC"}
+    (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
+    before = AscendModelSlimConfig(description)
+    configure_quant_config(before, DeepseekV4ForCausalLM)
+    after = AscendModelSlimConfig()
+    configure_quant_config(after, DeepseekV4ForCausalLM)
+    after.maybe_update_config(str(tmp_path))
+    assert (
+        before.quant_description
+        == after.quant_description
+        == {"model.layers.0.self_attn.wq_a.weight": "W8A8_DYNAMIC"}
+    )
+    for config in (before, after):
+        configure_quant_config(config, DeepseekV4ForCausalLM)
+        assert config.quant_description == before.quant_description
+        with pytest.raises(ValueError, match="Missing"):
+            config.get_layer_quant_type("layers.0.attn.wq_a")
+        assert (
+            config.get_layer_quant_type("model.layers.0.self_attn.wq_a")
+            == "W8A8_DYNAMIC"
+        )
 
 
 @pytest.mark.parametrize(

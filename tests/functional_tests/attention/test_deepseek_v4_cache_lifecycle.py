@@ -81,6 +81,48 @@ def test_full_graph_binding_validates_factory(mode_name, factory_kind):
     assert calls == ["factory"]
 
 
+@pytest.mark.parametrize("mode_name", ["FULL", "FULL_DECODE_ONLY"])
+def test_full_graph_binding_cache_provider_needs_no_task_updater(
+    mode_name, monkeypatch
+):
+    from vllm.config import CUDAGraphMode
+
+    from vllm_fl.attention.deepseek_v4 import DeepseekV4CacheBackend
+    from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+    calls = []
+
+    def forbidden_factory():
+        calls.append("cache_factory")
+        raise AssertionError("Cache-only FULL execution must not resolve an impl")
+
+    monkeypatch.setattr(
+        DeepseekV4CacheBackend, "get_impl_cls", staticmethod(forbidden_factory)
+    )
+    assert DeepseekV4CacheBackend.requires_graph_task_updates is False
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode[mode_name])
+    )
+    controller = GraphRuntimeController(vllm_config=config)
+    cache_group = SimpleNamespace(backend=DeepseekV4CacheBackend)
+    controller.bind_attention_groups([[cache_group]])
+    assert controller.attention_impls == ()
+    assert calls == []
+
+    class OrdinaryBackend:
+        @staticmethod
+        def get_impl_cls():
+            calls.append("ordinary_factory")
+            return object
+
+    # A cache-only group must not suppress another backend's FULL validation.
+    with pytest.raises(RuntimeError, match="lacks update_graph_params"):
+        controller.bind_attention_groups(
+            [[cache_group, SimpleNamespace(backend=OrdinaryBackend)]]
+        )
+    assert calls == ["ordinary_factory"]
+
+
 @pytest.fixture(scope="module")
 def runtime():
     from vllm.config import (
@@ -297,6 +339,146 @@ def _builder(env, leaf_name):
     return DeepseekV4MetadataBuilder(
         env.specs[name], [name], env.config, torch.device("npu:0")
     )
+
+
+def _common_snapshot(common):
+    names = (
+        "query_start_loc",
+        "query_start_loc_cpu",
+        "seq_lens",
+        "_seq_lens_cpu",
+        "_num_computed_tokens_cpu",
+        "block_table_tensor",
+        "slot_mapping",
+    )
+    return {
+        name: getattr(common, name).clone()
+        for name in names
+        if getattr(common, name) is not None
+    }
+
+
+def _assert_common_unchanged(common, snapshot):
+    for name, expected in snapshot.items():
+        torch.testing.assert_close(getattr(common, name), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("capture", [False, True])
+def test_dummy_plan_is_inert_and_real_build_restores_private_buffers(
+    pools, ratio, capture, monkeypatch
+):
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    request = _request(pools)
+    count = ratio + 1
+    _allocate(pools, request, count)
+    common, _ = _common(
+        pools, request, f"compact{ratio}", count, padded=count + 2
+    )
+    common._num_computed_tokens_cpu = torch.tensor([0], dtype=torch.int32)
+    builder = _builder(pools, f"compact{ratio}")
+    assert builder.get_cudagraph_support(
+        pools.config, builder.kv_cache_spec
+    ) == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    real = builder.build(0, common)
+    tensors = {
+        name: tensor
+        for name, tensor in vars(real).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    expected = {name: tensor.clone() for name, tensor in tensors.items()}
+    layout = {
+        name: (tensor.data_ptr(), tensor.shape, tensor.stride())
+        for name, tensor in tensors.items()
+    }
+    cache_bytes = {name: raw.clone() for name, raw in pools.raw.items()}
+    # Dummy construction must not validate synthetic/stale computed counts.
+    common._num_computed_tokens_cpu.fill_(777)
+    public = _common_snapshot(common)
+    calls = []
+    original_dummy = builder.build_for_dummy
+
+    def record_dummy(*args, **kwargs):
+        calls.append("dummy")
+        return original_dummy(*args, **kwargs)
+
+    monkeypatch.setattr(builder, "build_for_dummy", record_dummy)
+    dummy = (
+        builder.build_for_cudagraph_capture(common)
+        if capture
+        else builder.build_for_dummy(common)
+    )
+    assert calls == ["dummy"]
+    assert dummy.num_completed == 0
+    for name, previous in layout.items():
+        tensor = getattr(dummy, name)
+        assert (tensor.data_ptr(), tensor.shape, tensor.stride()) == previous
+        fill = 0 if name in ("seq_lens", "key_lengths") else -1
+        assert torch.all(tensor == fill), name
+    # The full reusable capacities, not only the returned bucket views, are PAD.
+    for name, tensor in builder.buffers.items():
+        assert torch.all(tensor == (0 if name == "seq_lens" else -1)), name
+    assert torch.all(builder.slots == -1)
+    assert torch.all(builder.output_slots == -1)
+    assert torch.all(builder.key_lengths == 0)
+    _assert_common_unchanged(common, public)
+    for name, raw in pools.raw.items():
+        torch.testing.assert_close(raw, cache_bytes[name], rtol=0, atol=0)
+
+    common._num_computed_tokens_cpu.zero_()
+    public = _common_snapshot(common)
+    restored = builder.build(0, common)
+    assert restored.num_completed == 1
+    for name, previous in layout.items():
+        tensor = getattr(restored, name)
+        assert (tensor.data_ptr(), tensor.shape, tensor.stride()) == previous
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+    _assert_common_unchanged(common, public)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_zero_end_padded_request_is_inactive_but_active_counts_are_validated(
+    pools, ratio
+):
+    request = _request(pools)
+    _allocate(pools, request, ratio)
+    common, _ = _common(pools, request, f"compact{ratio}", ratio, padded=ratio + 2)
+    common.num_reqs = 2
+    common.query_start_loc_cpu = torch.tensor([0, ratio, ratio + 1], dtype=torch.int32)
+    common.query_start_loc = common.query_start_loc_cpu.to("npu")
+    common._seq_lens_cpu = torch.tensor([ratio, 0], dtype=torch.int32)
+    common.seq_lens = common._seq_lens_cpu.to("npu")
+    common._num_computed_tokens_cpu = torch.tensor([0, 777], dtype=torch.int32)
+    # A padded row may retain a real-looking page ID; private planning hides it.
+    common.block_table_tensor = common.block_table_tensor.repeat(2, 1)
+    public = _common_snapshot(common)
+    builder = _builder(pools, f"compact{ratio}")
+    meta = builder.build(0, common)
+    assert meta.num_completed == 1
+    assert torch.all(meta.request_ids[:ratio] == 0)
+    torch.testing.assert_close(
+        meta.positions[:ratio], torch.arange(ratio, device="npu"), rtol=0, atol=0
+    )
+    for name in ("request_ids", "positions", "slot_mapping"):
+        assert torch.all(getattr(meta, name)[ratio:] == -1), name
+    assert meta.output_request_ids[0] == 0
+    assert meta.output_positions[0] == ratio - 1
+    assert meta.output_slots[0] >= 0
+    for name in ("output_request_ids", "output_positions", "output_slots"):
+        assert torch.all(getattr(meta, name)[1:] == -1), name
+    assert torch.all(meta.block_table[1] == -1)
+    assert meta.seq_lens[1] == 0
+    assert meta.key_lengths[1] == 0
+    _assert_common_unchanged(common, public)
+
+    # Ignore stale computed counts only for the zero-end inactive row, never
+    # for a scheduled request (including a negative active computed count).
+    common._num_computed_tokens_cpu[0] = -1
+    public = _common_snapshot(common)
+    with pytest.raises(ValueError, match="Inconsistent exact CPU scheduler lengths"):
+        builder.build(0, common)
+    _assert_common_unchanged(common, public)
 
 
 def test_scheduler_groups_typed_views_and_binding(pools):

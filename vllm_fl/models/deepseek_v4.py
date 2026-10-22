@@ -36,6 +36,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    WeightsMapper,
     extract_layer_index,
     is_pp_missing_parameter,
     make_layers,
@@ -812,6 +813,22 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     """Checkpoint-facing envelope; operator implementations remain dispatched."""
 
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "embed.": "model.embed_tokens.",
+            "head.": "lm_head.",
+        },
+        orig_to_new_substr={
+            ".attn.": ".self_attn.",
+            ".w1.": ".gate_proj.",
+            ".w2.": ".down_proj.",
+            ".w3.": ".up_proj.",
+            ".ffn.": ".mlp.",
+            ".ffn_norm.": ".post_attention_layernorm.",
+            ".attn_norm.": ".input_layernorm.",
+        },
+    )
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()

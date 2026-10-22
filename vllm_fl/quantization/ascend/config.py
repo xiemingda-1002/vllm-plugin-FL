@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit ModelSlim configuration for dynamic INT8 DeepSeek weights."""
+"""Model-independent ModelSlim metadata and dynamic INT8 method selection."""
 
 import json
 from pathlib import Path
@@ -8,7 +8,6 @@ import torch
 
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.utils import WeightsMapper
 
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
 _EXPERT_SHARDS = (
@@ -18,31 +17,12 @@ _EXPERT_SHARDS = (
 )
 
 
-def _deepseek_mapper():
-    return WeightsMapper(
-        orig_to_new_prefix={
-            "layers.": "model.layers.",
-            "embed.": "model.embed_tokens.",
-            "head.": "lm_head.",
-        },
-        orig_to_new_substr={
-            ".attn.": ".self_attn.",
-            ".w1.": ".gate_proj.",
-            ".w2.": ".down_proj.",
-            ".w3.": ".up_proj.",
-            ".ffn.": ".mlp.",
-            ".ffn_norm.": ".post_attention_layernorm.",
-            ".attn_norm.": ".input_layernorm.",
-        },
-    )
-
-
 class AscendModelSlimConfig(QuantizationConfig):
     """Load dynamic/FLOAT metadata without implicitly enabling a model.
 
-    Both checkpoint and runtime prefixes use the same DeepSeek name mapper.
-    Other model catalogues, quantized attention/cache and static INT8 are outside
-    this component. Registration is an explicit action by platform integration.
+    Checkpoint naming belongs to the model's hf_to_vllm_mapper; absent a mapper,
+    names are preserved. Quantized attention/cache and static INT8 need their
+    own methods. Registration is an explicit action by platform integration.
     """
 
     def __init__(self, quant_config=None, *, weight_nz_mode=1):
@@ -82,7 +62,7 @@ class AscendModelSlimConfig(QuantizationConfig):
                 raise NotImplementedError(
                     "Grouped ModelSlim quantization is unsupported"
                 )
-        self.quant_description = _deepseek_mapper().apply_dict(description)
+        self.quant_description = dict(description)
         if self.hf_to_vllm_mapper is not None:
             self.quant_description = self.hf_to_vllm_mapper.apply_dict(
                 self.quant_description
@@ -110,8 +90,6 @@ class AscendModelSlimConfig(QuantizationConfig):
         return cls(config)
 
     def maybe_update_config(self, model_name, hf_config=None, revision=None):
-        if hf_config is not None and hf_config.model_type != "deepseek_v4":
-            raise NotImplementedError("This ModelSlim component supports deepseek_v4")
         if self.quant_description:
             return
         path = Path(model_name) / MODELSLIM_CONFIG_FILENAME
@@ -127,9 +105,9 @@ class AscendModelSlimConfig(QuantizationConfig):
         self.quant_description = mapper.apply_dict(self.quant_description)
         self.hf_to_vllm_mapper = mapper
 
-    def get_layer_quant_type(self, prefix):
-        # A suffix allows the mapper to rename final projection components too.
-        prefix = _deepseek_mapper()._map_name(prefix + ".weight")[:-7]
+    def get_layer_quant_type(self, prefix, *, is_moe=False):
+        # Prefixes come from runtime modules. Only checkpoint keys are mapped;
+        # reapplying a model mapper here can remap an already canonical prefix.
         name = prefix.rsplit(".", 1)[-1]
         base = prefix[: -len(name)]
         # configure_quant_config replaces the model's Linear packing map by
@@ -137,7 +115,7 @@ class AscendModelSlimConfig(QuantizationConfig):
         # format, so they must survive that independent framework operation.
         shards = (
             _EXPERT_SHARDS
-            if name == "experts"
+            if is_moe
             else self.packed_modules_mapping.get(name, [name])
         )
         keys = [base + shard + ".weight" for shard in shards]
@@ -156,7 +134,7 @@ class AscendModelSlimConfig(QuantizationConfig):
         is_moe = isinstance(layer, (RoutedExperts, MoERunner))
         if not isinstance(layer, LinearBase) and not is_moe:
             return None
-        quant_type = self.get_layer_quant_type(prefix)
+        quant_type = self.get_layer_quant_type(prefix, is_moe=is_moe)
         if quant_type == "FLOAT":
             # The existing FL MoE factory retains its unquantized method path.
             return None if is_moe else UnquantizedLinearMethod()

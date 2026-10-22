@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import torch
 
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadataBuilder
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+)
 
 from vllm_fl.kv_cache.deepseek_v4 import validate_cache_spec
 
@@ -26,6 +30,9 @@ class DeepseekV4CacheMetadata:
 
 
 class DeepseekV4CacheBackend(AttentionBackend):
+    # Tensor providers own capture/replay; there is no external attention task.
+    requires_graph_task_updates = False
+
     @classmethod
     def get_preferred_block_size(cls, default_block_size):
         # This is the full-cache logical block, not the smaller state page.
@@ -63,6 +70,8 @@ class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata
     hides stale speculative counts and introduces a per-layer device barrier.
     The runner's input-preparation event guards reuse of pinned host plans.
     """
+
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -119,13 +128,60 @@ class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata
         slots = pages * block + (positions.clamp_min(0) // self.ratio) % block
         return torch.where(valid, slots, -1)
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        common = common_attn_metadata
-        starts = self._cpu(common.query_start_loc_cpu, "query_start_loc")
-        ends = self._cpu(common._seq_lens_cpu, "seq_lens")
+    def _prepare_table(self, common):
         nreq, ntok = common.num_reqs, common.num_actual_tokens
         if not 0 < nreq <= self.request_cap or not 0 <= ntok <= self.token_cap:
             raise ValueError("Scheduler batch exceeds the private cache plan capacity")
+        public = common.block_table_tensor
+        if public.ndim != 2 or public.shape[0] < nreq or public.shape[1] == 0:
+            raise ValueError("Missing scheduler block-table rows")
+        if self.block_table is None:
+            self.block_table = torch.empty(
+                (self.request_cap, public.shape[1]),
+                dtype=public.dtype,
+                device=self.device,
+            )
+        if public.shape[1] > self.block_table.shape[1]:
+            raise ValueError("Block-table capacity cannot grow after plan initialization")
+        if public.dtype != self.block_table.dtype:
+            raise ValueError("Block-table dtype cannot change after plan initialization")
+        self.block_table.fill_(-1)
+        return public
+
+    def _metadata(self, ntok, completed):
+        return DeepseekV4CacheMetadata(
+            self.block_table,
+            self.buffers["request_ids"][:ntok],
+            self.buffers["positions"][:ntok],
+            self.slots[:ntok],
+            self.buffers["output_request_ids"][:ntok],
+            self.buffers["output_positions"][:ntok],
+            self.output_slots[:ntok],
+            self.buffers["seq_lens"],
+            self.key_lengths,
+            completed,
+        )
+
+    def build_for_dummy(self, common_attn_metadata):
+        """Reuse real-plan addresses without reading synthetic CPU lengths/pages."""
+        common = common_attn_metadata
+        self._prepare_table(common)
+        for name, buffer in self.buffers.items():
+            buffer.fill_(0 if name == "seq_lens" else -1)
+        self.slots.fill_(-1)
+        self.output_slots.fill_(-1)
+        self.key_lengths.zero_()
+        return self._metadata(common.num_actual_tokens, 0)
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        return self.build_for_dummy(common_attn_metadata)
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        common = common_attn_metadata
+        public = self._prepare_table(common)
+        starts = self._cpu(common.query_start_loc_cpu, "query_start_loc")
+        ends = self._cpu(common._seq_lens_cpu, "seq_lens")
+        nreq, ntok = common.num_reqs, common.num_actual_tokens
         if starts.numel() < nreq + 1 or ends.numel() < nreq:
             raise ValueError("Incomplete CPU scheduler metadata")
         starts, ends = starts[: nreq + 1].tolist(), ends[:nreq].tolist()
@@ -142,6 +198,11 @@ class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata
         for request, end in enumerate(ends):
             begin, stop = starts[request : request + 2]
             count = stop - begin
+            # The runner pads FULL decode with zero-length request rows. Their
+            # query spans/computed counters can be synthetic or stale; never
+            # derive live cache slots from them. Active rows retain strict checks.
+            if end == 0 and 0 <= count <= 1:
+                continue
             position = end - count
             if (
                 count < 0
@@ -159,24 +220,13 @@ class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata
                 boundaries + 1
             ) * self.ratio - 1
             completed += size
-        public = common.block_table_tensor
-        if public.ndim != 2 or public.shape[0] < nreq or public.shape[1] == 0:
-            raise ValueError("Missing scheduler block-table rows")
-        if self.block_table is None:
-            self.block_table = torch.empty(
-                (self.request_cap, public.shape[1]),
-                dtype=public.dtype,
-                device=self.device,
-            )
-        if public.shape[1] > self.block_table.shape[1]:
-            raise ValueError(
-                "Block-table capacity cannot grow after plan initialization"
-            )
-        self.block_table.fill_(-1)
         # Scheduler page zero is a null placeholder, not readable cache storage.
         self.block_table[:nreq, : public.shape[1]].copy_(
             torch.where(public[:nreq] > 0, public[:nreq], -1)
         )
+        for request, end in enumerate(ends):
+            if end == 0:
+                self.block_table[request].fill_(-1)
         for name, buffer in self.buffers.items():
             buffer.copy_(self.host[name], non_blocking=True)
         request_ids, positions = (
@@ -190,18 +240,9 @@ class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata
         slots = self._slots(request_ids, positions)
         if self.ratio > 1:
             slots = torch.where((positions + 1) % self.ratio == 0, slots, -1)
+        self.slots.fill_(-1)
+        self.output_slots.fill_(-1)
         self.slots[:ntok].copy_(slots)
         self.output_slots[:ntok].copy_(self._slots(output_requests, output_positions))
         self.key_lengths.copy_(self.buffers["seq_lens"] // self.ratio)
-        return DeepseekV4CacheMetadata(
-            self.block_table,
-            request_ids,
-            positions,
-            self.slots[:ntok],
-            output_requests,
-            output_positions,
-            self.output_slots[:ntok],
-            self.buffers["seq_lens"],
-            self.key_lengths,
-            completed,
-        )
+        return self._metadata(ntok, completed)
