@@ -33,7 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     extract_layer_index,
@@ -441,6 +441,10 @@ class DeepseekV4Attention(nn.Module):
             )
         if metadata is None:
             metadata = get_forward_context().attn_metadata
+        if metadata is None:
+            # Memory profiling precedes scheduler cache allocation. Keep that
+            # path cache-free, while the surrounding HC/MoE still executes.
+            return hidden_states.new_zeros((hidden_states.shape[0], self.hidden_size))
         swa = metadata[self.swa_cache_layer.prefix]
         if (
             hidden_states.ndim != 2
@@ -804,7 +808,7 @@ class DeepseekV4Model(nn.Module):
         return self.norm(hidden)
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     """Checkpoint-facing envelope; operator implementations remain dispatched."""
 
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
@@ -830,6 +834,24 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.expert_weights = []
+        self.moe_layers = [
+            layer.mlp.experts
+            for layer in self.model.layers
+            if isinstance(layer, DeepseekV4DecoderLayer)
+        ]
+        self.num_moe_layers = self.config.num_hidden_layers if self.moe_layers else 0
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+        self.num_logical_experts = self.config.n_routed_experts
+        self.num_physical_experts = self.num_logical_experts
+        self.num_local_physical_experts = (
+            self.moe_layers[0].routed_experts.local_num_experts
+            if self.moe_layers
+            else 0
+        )
+        self.num_routed_experts = self.config.n_routed_experts
+        self.num_shared_experts = self.config.n_shared_experts or 0
+        self.num_redundant_experts = 0
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_input_ids(input_ids)

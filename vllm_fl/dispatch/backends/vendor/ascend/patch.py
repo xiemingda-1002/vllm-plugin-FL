@@ -4,6 +4,24 @@ import logging
 
 logger = logging.getLogger(__name__)
 _patches_applied = False
+_deepseek_v4_registered = False
+
+
+def register_deepseek_v4():
+    """Register the lazy model and ModelSlim config in each Ascend process."""
+    global _deepseek_v4_registered
+    if _deepseek_v4_registered:
+        return
+    from vllm.model_executor.models import ModelRegistry
+
+    from vllm_fl.quantization.ascend import register_modelslim_config
+
+    register_modelslim_config()
+    ModelRegistry.register_model(
+        "DeepseekV4ForCausalLM",
+        "vllm_fl.models.deepseek_v4:DeepseekV4ForCausalLM",
+    )
+    _deepseek_v4_registered = True
 
 def apply_ascend_patches():
     """Apply all Ascend-specific patches."""
