@@ -47,6 +47,11 @@ class AscendBackend(Backend):
         return AscendBackend._available
 
     # ==================== Operator Implementations ====================
+    def deepseek_v4_index_quant(self, *args, **kwargs):
+        from .impl.deepseek_v4 import deepseek_v4_index_quant
+
+        return deepseek_v4_index_quant(*args, **kwargs)
+
     def modelslim_w8a8_prepare_experts(self, *args, **kwargs):
         from .impl.w8a8_moe import modelslim_w8a8_prepare_experts
 

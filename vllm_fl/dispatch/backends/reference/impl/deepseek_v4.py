@@ -10,6 +10,57 @@ import torch
 import torch.nn.functional as F
 
 
+def deepseek_v4_partial_rope(x, positions, cos_sin_cache, inverse=False):
+    """Rotate the final head dimensions in FP32 with adjacent-pair convention."""
+    width = cos_sin_cache.shape[-1]
+    if x.ndim not in (2, 3) or positions.shape != x.shape[:1]:
+        raise ValueError("Expected [tokens, (heads), dim] and one position per token")
+    if width <= 0 or width % 2 or width > x.shape[-1]:
+        raise ValueError("RoPE width must be positive, even and within the head")
+    cache = cos_sin_cache[positions.long().clamp(0, cos_sin_cache.shape[0] - 1)]
+    cos, sin = cache.float().chunk(2, -1)
+    if x.ndim == 3:
+        cos, sin = cos[:, None], sin[:, None]
+    if inverse:
+        sin = -sin
+    even, odd = x[..., -width::2].float(), x[..., -width + 1 :: 2].float()
+    rotated = torch.stack([even * cos - odd * sin, odd * cos + even * sin], -1)
+    result = torch.cat([x[..., :-width], rotated.flatten(-2).to(x.dtype)], -1)
+    valid = (positions >= 0) & (positions < cos_sin_cache.shape[0])
+    return torch.where(valid.reshape(-1, *([1] * (x.ndim - 1))), result, 0)
+
+
+def deepseek_v4_hadamard(x, matrix):
+    """Keep the projection and normalized scaling as separate dtype-round stages."""
+    dim = x.shape[-1]
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] < dim:
+        raise ValueError("Expected a covering square Hadamard matrix")
+    padded = F.pad(x, (0, matrix.shape[0] - dim))
+    return (F.linear(padded, matrix.to(x.dtype)) * dim**-0.5)[..., :dim]
+
+
+def deepseek_v4_index_quant(x):
+    from vllm_fl.quantization.w8a8.reference import dynamic_per_token_quant_int8
+
+    if x.ndim < 2 or not x.is_floating_point():
+        raise ValueError("Indexer quantization requires floating token/head rows")
+    quantized, scale = dynamic_per_token_quant_int8(x.reshape(-1, x.shape[-1]))
+    return quantized.reshape(x.shape), scale.reshape(*x.shape[:-1], 1).half()
+
+
+def deepseek_v4_grouped_project(x, weight, groups):
+    """Apply logical checkpoint [groups*out, in] weights, not a dense shared GEMM."""
+    if x.ndim != 3 or groups < 1 or weight.ndim != 2:
+        raise ValueError(
+            "Grouped projection requires [tokens, heads, dim] and [out,in]"
+        )
+    if weight.shape[0] % groups or x.shape[1] * x.shape[2] != groups * weight.shape[1]:
+        raise ValueError("Grouped output projection dimensions do not match")
+    grouped = x.reshape(x.shape[0], groups, weight.shape[1])
+    weights = weight.reshape(groups, weight.shape[0] // groups, weight.shape[1])
+    return torch.einsum("tgi,goi->tgo", grouped, weights).flatten(1)
+
+
 def deepseek_v4_project(x, wkv, wgate):
     """Retain FP32 compressor projections instead of rounding before state storage."""
     if x.ndim != 2 or wkv.ndim != 2 or wgate.shape != wkv.shape:

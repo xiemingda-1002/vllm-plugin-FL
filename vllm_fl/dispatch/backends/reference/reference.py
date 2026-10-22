@@ -43,6 +43,26 @@ class ReferenceBackend(Backend):
         return ReferenceBackend._available
 
     # ==================== Operator Implementations ====================
+    def deepseek_v4_partial_rope(self, *args, **kwargs):
+        from .impl.deepseek_v4 import deepseek_v4_partial_rope
+
+        return deepseek_v4_partial_rope(*args, **kwargs)
+
+    def deepseek_v4_hadamard(self, *args, **kwargs):
+        from .impl.deepseek_v4 import deepseek_v4_hadamard
+
+        return deepseek_v4_hadamard(*args, **kwargs)
+
+    def deepseek_v4_index_quant(self, *args, **kwargs):
+        from .impl.deepseek_v4 import deepseek_v4_index_quant
+
+        return deepseek_v4_index_quant(*args, **kwargs)
+
+    def deepseek_v4_grouped_project(self, *args, **kwargs):
+        from .impl.deepseek_v4 import deepseek_v4_grouped_project
+
+        return deepseek_v4_grouped_project(*args, **kwargs)
+
     def deepseek_v4_project(self, *args, **kwargs):
         from .impl.deepseek_v4 import deepseek_v4_project
 
