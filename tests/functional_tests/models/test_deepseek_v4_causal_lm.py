@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small actual CausalLM and scheduler lifecycle, without checkpoint downloads."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -94,36 +95,25 @@ def _description():
     return result
 
 
-@pytest.fixture(scope="module")
-def runtime():
+def _runtime_config(pipeline_parallel_size=1):
     from vllm.config import (
         CacheConfig,
         CompilationConfig,
         CompilationMode,
         DeviceConfig,
+        ParallelConfig,
         SchedulerConfig,
         VllmConfig,
-        set_current_vllm_config,
     )
-    from vllm.distributed import (
-        destroy_distributed_environment,
-        destroy_model_parallel,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from vllm.utils.network_utils import get_open_port
-    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
-    from vllm_fl import _patch_ascend_torch_accelerator
     from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
 
-    torch.npu.set_device(0)
-    _patch_ascend_torch_accelerator()
     config = VllmConfig(
         device_config=DeviceConfig(device="npu"),
         compilation_config=CompilationConfig(
             mode=CompilationMode.NONE, custom_ops=["all"]
         ),
+        parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         scheduler_config=SchedulerConfig(
             is_encoder_decoder=False,
             max_model_len=256,
@@ -144,6 +134,26 @@ def runtime():
         enforce_eager=False,
     )
     config.quant_config = AscendModelSlimConfig(_description(), weight_nz_mode=0)
+    return config
+
+
+@pytest.fixture(scope="module")
+def runtime():
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.utils.network_utils import get_open_port
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    from vllm_fl import _patch_ascend_torch_accelerator
+
+    torch.npu.set_device(0)
+    _patch_ascend_torch_accelerator()
+    config = _runtime_config()
     with set_current_vllm_config(config), torch.inference_mode():
         init_distributed_environment(
             world_size=1,
@@ -160,6 +170,102 @@ def runtime():
             reset_workspace_manager()
             destroy_model_parallel()
             destroy_distributed_environment()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 2,
+    reason="Requires isolated torchrun with two Ascend processes for PP2",
+)
+def test_pp_hc_head_checkpoint_loading():
+    """Native root HC-head parameters load on both real pipeline ranks."""
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        get_pp_group,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.model_loader.utils import initialize_model
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    from vllm_fl import _patch_ascend_torch_accelerator
+    from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"npu:{local_rank}")
+    torch.npu.set_device(local_rank)
+    _patch_ascend_torch_accelerator()
+    config = _runtime_config(pipeline_parallel_size=2)
+    with set_current_vllm_config(config), torch.inference_mode():
+        model = None
+        try:
+            init_distributed_environment(
+                world_size=2, rank=rank, local_rank=local_rank, backend="hccl"
+            )
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=2,
+                backend="hccl",
+            )
+            init_workspace_manager(device)
+            assert get_pp_group().world_size == 2
+            assert get_pp_group().rank_in_group == rank
+            assert get_tp_group().world_size == 1
+            previous_dtype = torch.get_default_dtype()
+            try:
+                torch.set_default_dtype(torch.bfloat16)
+                model = initialize_model(config, model_class=DeepseekV4ForCausalLM).to(
+                    device
+                )
+            finally:
+                torch.set_default_dtype(previous_dtype)
+            checkpoint = []
+            expected = {}
+            params = dict(model.named_parameters())
+            hf_config = config.model_config.hf_config
+            head_shapes = (
+                ("fn", (hf_config.hc_mult, hf_config.hc_mult * hf_config.hidden_size)),
+                ("base", (hf_config.hc_mult,)),
+                ("scale", (1,)),
+            )
+            for index, (suffix, shape) in enumerate(head_shapes):
+                raw_name = f"hc_head_{suffix}"
+                size = 1
+                for dimension in shape:
+                    size *= dimension
+                value = (
+                    torch.arange(size, device=device, dtype=torch.float32)
+                    .reshape(shape)
+                    .mul_(0.001)
+                    .add_(index + 0.25)
+                )
+                if f"model.{raw_name}" in params:
+                    params[f"model.{raw_name}"].fill_(float("nan"))
+                checkpoint.append((raw_name, value))
+                expected[f"model.{raw_name}"] = value
+            loaded = model.load_weights(iter(checkpoint))
+            assert loaded == set(expected)
+            for name, value in expected.items():
+                assert params[name].dtype == torch.float32
+                assert params[name].device == device
+                torch.testing.assert_close(params[name], value, rtol=0, atol=0)
+            print(
+                f"PP_HC_HEAD_LOAD_OK rank={rank} pp_rank={get_pp_group().rank_in_group} "
+                f"last={get_pp_group().is_last_rank} loaded={sorted(loaded)}",
+                flush=True,
+            )
+        finally:
+            model = None
+            try:
+                reset_workspace_manager()
+            finally:
+                try:
+                    destroy_model_parallel()
+                finally:
+                    destroy_distributed_environment()
 
 
 def _value(name, param, index):
@@ -722,10 +828,12 @@ def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
     monkeypatch.setattr(graph_monitor, "cudagraph_capturing_enabled", True)
     controller = GraphRuntimeController(vllm_config=env.config)
     controller.bind_attention_groups(
-        [[
-            SimpleNamespace(backend=leaf.get_attn_backend())
-            for leaf in env.leaves.values()
-        ]]
+        [
+            [
+                SimpleNamespace(backend=leaf.get_attn_backend())
+                for leaf in env.leaves.values()
+            ]
+        ]
     )
     assert controller.attention_impls == ()
     python_calls = []
@@ -744,7 +852,9 @@ def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
         # Forced eager dummy warmups execute the same static numerical chain.
         for _ in range(3):
             with set_forward_context(
-                dummy, env.config, num_tokens=2,
+                dummy,
+                env.config,
+                num_tokens=2,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 batch_descriptor=descriptor,
             ):
@@ -754,7 +864,9 @@ def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
                 torch.testing.assert_close(raw, before_dummy[name], rtol=0, atol=0)
         assert len(python_calls) == 3
         with set_forward_context(
-            dummy, env.config, num_tokens=2,
+            dummy,
+            env.config,
+            num_tokens=2,
             cudagraph_runtime_mode=CUDAGraphMode.FULL,
             batch_descriptor=descriptor,
         ):
@@ -775,7 +887,9 @@ def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
                 for field, tensor in vars(plan).items():
                     if isinstance(tensor, torch.Tensor):
                         assert (
-                            tensor.data_ptr(), tensor.shape, tensor.stride()
+                            tensor.data_ptr(),
+                            tensor.shape,
+                            tensor.stride(),
                         ) == layout[name, field]
             for ratio in (4, 128):
                 prefix = "model.layers.1" if ratio == 4 else "model.layers.2"
@@ -787,7 +901,9 @@ def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
             positions.copy_(torch.tensor([position, -1], device="npu"))
             before_real = {name: raw.clone() for name, raw in raw_caches.items()}
             with set_forward_context(
-                real, env.config, num_tokens=2,
+                real,
+                env.config,
+                num_tokens=2,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             ):
                 expected_hidden = env.model(tokens, positions)
@@ -798,7 +914,9 @@ def test_fl_graph_wrapper_dummy_capture_and_changed_decode_boundaries(
             for name, raw in raw_caches.items():
                 raw.copy_(before_real[name])
             with set_forward_context(
-                real, env.config, num_tokens=2,
+                real,
+                env.config,
+                num_tokens=2,
                 cudagraph_runtime_mode=CUDAGraphMode.FULL,
                 batch_descriptor=descriptor,
             ):

@@ -373,14 +373,13 @@ def test_dummy_plan_is_inert_and_real_build_restores_private_buffers(
     request = _request(pools)
     count = ratio + 1
     _allocate(pools, request, count)
-    common, _ = _common(
-        pools, request, f"compact{ratio}", count, padded=count + 2
-    )
+    common, _ = _common(pools, request, f"compact{ratio}", count, padded=count + 2)
     common._num_computed_tokens_cpu = torch.tensor([0], dtype=torch.int32)
     builder = _builder(pools, f"compact{ratio}")
-    assert builder.get_cudagraph_support(
-        pools.config, builder.kv_cache_spec
-    ) == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    assert (
+        builder.get_cudagraph_support(pools.config, builder.kv_cache_spec)
+        == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
     real = builder.build(0, common)
     tensors = {
         name: tensor
