@@ -89,6 +89,7 @@ def register_builtins(registry: OpRegistry) -> None:
         "modelslim_w8a8_prepare_experts", "modelslim_w8a8_experts",
         "gdn_decode", "gdn_prefill", "modelslim_w8a8_prepare_weight",
         "modelslim_w8a8_dynamic_linear",
+        "modelslim_w8a8_grouped_experts",
     ):
         impls.append(OpImpl(
             op_name=op_name,

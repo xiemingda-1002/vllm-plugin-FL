@@ -131,6 +131,39 @@ class AscendModelSlimMoEMethod(FusedMoEMethodBase):
         ):
             getattr(layer, name).data = tensor
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        parallel = self.moe.moe_parallel_config
+        if (
+            parallel.use_ep
+            and parallel.ep_size > 1
+            and not parallel.is_sequence_parallel
+            and 1024 <= self.moe.hidden_dim <= 8192
+        ):
+            from vllm.config import get_current_vllm_config
+            from vllm.distributed import get_ep_group
+            from vllm.model_executor.layers.fused_moe.modular_kernel import (
+                FusedMoEKernel,
+            )
+
+            from vllm_fl.distributed.device_communicators.npu_moe_context import (
+                is_a3_device,
+            )
+
+            if is_a3_device():
+                from vllm_fl.ops.fused_moe.prepare_finalize import (
+                    NpuMoEPrepareAndFinalize,
+                )
+                from vllm_fl.quantization.ascend.moe_experts import (
+                    AscendW8A8DispatchedExperts,
+                )
+
+                runtime = get_ep_group().device_communicator.get_moe_runtime(
+                    get_current_vllm_config(), device=layer.w13_weight.device
+                )
+                self.moe_kernel = FusedMoEKernel(
+                    NpuMoEPrepareAndFinalize(runtime, self.moe.num_experts),
+                    AscendW8A8DispatchedExperts(self.moe, self.moe_quant_config),
+                )
+                return
         self.moe_kernel = make_int8_moe_kernel(
             self.moe_quant_config,
             self.moe,

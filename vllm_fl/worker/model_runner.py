@@ -55,7 +55,6 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.forward_context import (
     BatchDescriptor,
-    set_forward_context,
 )
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
@@ -286,6 +285,7 @@ from vllm_fl.dispatch.io_dumper import (
     init_io_dump_from_env,
     register_io_module_hooks,
 )
+from vllm_fl.forward_context import set_forward_context
 from vllm_fl.worker.common_attention_metadata import (
     CommonAttentionMetadataGraphRunner,
     common_attention_metadata_enabled,
@@ -4554,6 +4554,7 @@ class ModelRunnerFL(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
+                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
@@ -6247,6 +6248,8 @@ class ModelRunnerFL(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
+                    num_actual_tokens=num_tokens_padded,
+                    in_profile_run=is_profile,
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
@@ -6602,6 +6605,25 @@ class ModelRunnerFL(
                         )
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
+
+        if (
+            getattr(current_platform, "vendor_name", None) == "ascend"
+            and self.parallel_config.enable_expert_parallel
+            and self.parallel_config.is_moe_model is not False
+        ):
+            from vllm_fl.distributed.device_communicators.npu_moe_context import (
+                get_moe_runtime,
+            )
+
+            runtime = get_moe_runtime()
+            if runtime is not None and self.max_num_tokens > runtime.mc2_tokens_capacity:
+                # The large profiling batch selects AllToAll. Also account for
+                # persistent MC2 buffers before calculating the KV-cache budget.
+                mc2_hidden, mc2_last = self._dummy_run(
+                    runtime.mc2_tokens_capacity, uniform_decode=False, is_profile=True
+                )
+                self._sync_device()
+                del mc2_hidden, mc2_last
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(

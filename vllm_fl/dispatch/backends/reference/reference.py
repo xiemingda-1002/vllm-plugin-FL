@@ -118,6 +118,11 @@ class ReferenceBackend(Backend):
 
         return modelslim_w8a8_prepare_experts(*args, **kwargs)
 
+    def modelslim_w8a8_grouped_experts(self, *args, **kwargs):
+        from .impl.w8a8_moe import modelslim_w8a8_grouped_experts
+
+        return modelslim_w8a8_grouped_experts(*args, **kwargs)
+
     def modelslim_w8a8_experts(self, *args, **kwargs):
         from .impl.w8a8_moe import modelslim_w8a8_experts
 

@@ -58,6 +58,7 @@ def register_builtins(registry) -> None:
         "modelslim_w8a8_experts",
         "modelslim_w8a8_prepare_weight",
         "modelslim_w8a8_dynamic_linear",
+        "modelslim_w8a8_grouped_experts",
         "dynamic_per_token_quant_int8",
         "silu_and_mul",
         "silu_and_mul_with_clamp",

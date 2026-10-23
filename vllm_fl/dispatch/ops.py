@@ -103,6 +103,29 @@ class VLLMFLBackendBase(ABC):
         """Return this local expert range's weighted [T,K] contribution."""
         raise NotImplementedError
 
+    def modelslim_w8a8_grouped_experts(
+        self,
+        x: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        s1: torch.Tensor,
+        s2: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+        output_dtype: torch.dtype,
+        activation: str = "silu",
+        limit: float | None = None,
+    ) -> torch.Tensor:
+        """Compute unweighted routed rows; type 0 prefix sums, type 1 counts.
+
+        INT8 x has shape [capacity,H], FP32 token scales [capacity] or
+        [capacity,1], prepared weights retain logical [E,N,K] shapes.
+        The caller guarantees nonnegative counts totaling at most capacity.
+        Invalid capacity tails return zero; no routing or input QDQ occurs.
+        """
+        raise NotImplementedError
+
     def topk_softplus_sqrt(
         self,
         hidden_states: torch.Tensor,

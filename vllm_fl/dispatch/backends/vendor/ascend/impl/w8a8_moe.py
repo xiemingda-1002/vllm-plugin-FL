@@ -130,3 +130,123 @@ def modelslim_w8a8_experts(
         sorted_indices=row_indices.clamp_min(0),
         probs=probs,
     )
+
+
+def _validate_grouped_inputs(
+    x,
+    pertoken_scale,
+    w1,
+    w2,
+    s1,
+    s2,
+    group_list,
+    group_list_type,
+    output_dtype,
+    activation,
+    limit,
+):
+    # Structural checks only: keep device values on device during capture.
+    if x.ndim != 2 or x.dtype != torch.int8:
+        raise ValueError("Routed input must be INT8 [capacity, hidden]")
+    if pertoken_scale.dtype != torch.float32 or pertoken_scale.shape not in (
+        (x.shape[0],),
+        (x.shape[0], 1),
+    ):
+        raise ValueError("Token scales must be FP32 [capacity] or [capacity,1]")
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("Output dtype must be BF16/FP16")
+    if group_list_type not in (0, 1):
+        raise ValueError("Group list type must be 0 (prefix) or 1 (count)")
+    if w1.ndim != 3 or w2.ndim != 3 or w1.dtype != torch.int8 or w2.dtype != torch.int8:
+        raise ValueError("Expert weights must be INT8 [experts, output, input]")
+    if (
+        w1.shape[0] == 0
+        or w1.shape[0] != w2.shape[0]
+        or w1.shape[1] != 2 * w2.shape[2]
+        or w1.shape[2] != w2.shape[1]
+        or x.shape[1] != w1.shape[2]
+        or x.shape[1] == 0
+        or w2.shape[2] == 0
+    ):
+        raise ValueError("Incompatible gated expert weight shapes")
+    if group_list.dtype != torch.int64 or group_list.shape != (w1.shape[0],):
+        raise ValueError("Group list must be INT64 [experts]")
+    for weight, scale in ((w1, s1), (w2, s2)):
+        if scale.shape != (*weight.shape[:2], 1) or scale.dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError("Prepared channel scales must be BF16/FP32 [E,N,1]")
+    if any(t.device != x.device for t in (pertoken_scale, w1, w2, s1, s2, group_list)):
+        raise ValueError("Grouped expert tensors must share a device")
+    if activation not in ("silu", "swiglustep"):
+        raise NotImplementedError(f"Unsupported ModelSlim activation: {activation}")
+    if activation == "swiglustep" and limit is None:
+        limit = 7.0
+    if limit is not None and (not math.isfinite(limit) or limit <= 0):
+        raise ValueError("Activation limit must be finite and positive")
+    return limit
+
+
+def modelslim_w8a8_grouped_experts(
+    x,
+    pertoken_scale,
+    w1,
+    w2,
+    s1,
+    s2,
+    group_list,
+    group_list_type,
+    output_dtype,
+    activation="silu",
+    limit=None,
+):
+    """Unfused GMM/activation/quant/GMM on dispatched rows; no routing."""
+    limit = _validate_grouped_inputs(
+        x,
+        pertoken_scale,
+        w1,
+        w2,
+        s1,
+        s2,
+        group_list,
+        group_list_type,
+        output_dtype,
+        activation,
+        limit,
+    )
+    if x.shape[0] == 0:
+        return torch.empty(x.shape, dtype=output_dtype, device=x.device)
+    total = group_list[-1] if group_list_type == 0 else group_list.sum()
+    valid = torch.arange(x.shape[0], device=x.device) < total
+    routed = torch.where(valid[:, None], x, 0)
+    token_scale = torch.where(valid, pertoken_scale.reshape(-1), 0)
+    gate_up = torch_npu.npu_grouped_matmul(
+        x=[routed],
+        weight=[w1.transpose(1, 2)],
+        scale=[s1.squeeze(-1)],
+        per_token_scale=[token_scale],
+        split_item=2,
+        group_type=0,
+        group_list_type=group_list_type,
+        group_list=group_list,
+        output_dtype=output_dtype,
+    )[0]
+    gate_up = torch.where(valid[:, None], gate_up, 0)
+    activated = _activate(gate_up, activation, limit)
+    activated = torch.where(valid[:, None], activated, 0)
+    quantized, token_scale = torch_npu.npu_dynamic_quant(activated, dst_type=torch.int8)
+    quantized = torch.where(valid[:, None], quantized, 0)
+    token_scale = torch.where(valid, token_scale.reshape(-1), 0)
+    output = torch_npu.npu_grouped_matmul(
+        x=[quantized],
+        weight=[w2.transpose(1, 2)],
+        scale=[s2.squeeze(-1)],
+        per_token_scale=[token_scale],
+        split_item=2,
+        group_type=0,
+        group_list_type=group_list_type,
+        group_list=group_list,
+        output_dtype=output_dtype,
+    )[0]
+    return torch.where(valid[:, None], output, 0)
