@@ -82,7 +82,6 @@ class AscendW8A8DynamicLinearMethod(LinearMethodBase):
         )
         layer.weight.data = weight
         layer.weight_scale.data = weight_scale
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
 
     def apply(self, layer, x, bias=None):

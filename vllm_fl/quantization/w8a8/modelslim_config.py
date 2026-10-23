@@ -10,6 +10,7 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
+_modelslim_registered = False
 _EXPERT_SHARDS = (
     "experts.0.gate_proj",
     "experts.0.up_proj",
@@ -114,9 +115,7 @@ class AscendModelSlimConfig(QuantizationConfig):
         # reference. Expert-zero aliases describe the ModelSlim checkpoint
         # format, so they must survive that independent framework operation.
         shards = (
-            _EXPERT_SHARDS
-            if is_moe
-            else self.packed_modules_mapping.get(name, [name])
+            _EXPERT_SHARDS if is_moe else self.packed_modules_mapping.get(name, [name])
         )
         keys = [base + shard + ".weight" for shard in shards]
         missing = [key for key in keys if key not in self.quant_description]
@@ -141,9 +140,22 @@ class AscendModelSlimConfig(QuantizationConfig):
         if quant_type != "W8A8_DYNAMIC":
             raise NotImplementedError(f"Unsupported ModelSlim type {quant_type!r}")
         if is_moe:
-            from .moe import AscendModelSlimMoEMethod
+            from .modelslim_moe import AscendModelSlimMoEMethod
 
             return AscendModelSlimMoEMethod(layer.moe_config)
-        from .linear import AscendW8A8DynamicLinearMethod
+        from .modelslim_linear import AscendW8A8DynamicLinearMethod
 
         return AscendW8A8DynamicLinearMethod(self.weight_nz_mode)
+
+
+def register_modelslim_config():
+    """Register only when an Ascend integration explicitly requests ModelSlim."""
+    global _modelslim_registered
+    if _modelslim_registered:
+        return
+    from vllm.model_executor.layers.quantization import register_quantization_config
+
+    register_quantization_config(AscendModelSlimConfig.get_name())(
+        AscendModelSlimConfig
+    )
+    _modelslim_registered = True

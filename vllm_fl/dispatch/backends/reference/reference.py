@@ -133,7 +133,6 @@ class ReferenceBackend(Backend):
 
         return modelslim_w8a8_dynamic_linear(*args, **kwargs)
 
-
     def dynamic_per_token_quant_int8(
         self,
         x: torch.Tensor,

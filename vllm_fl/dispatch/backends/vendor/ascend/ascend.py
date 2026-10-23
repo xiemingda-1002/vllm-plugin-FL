@@ -48,7 +48,7 @@ class AscendBackend(Backend):
 
     # ==================== Operator Implementations ====================
     def deepseek_v4_index_quant(self, *args, **kwargs):
-        from .impl.deepseek_v4 import deepseek_v4_index_quant
+        from .impl.quantization import deepseek_v4_index_quant
 
         return deepseek_v4_index_quant(*args, **kwargs)
 

@@ -228,7 +228,9 @@ def register_model():
         and getattr(current_platform, "vendor_name", None) == "ascend"
     ):
         from vllm_fl.dispatch.backends.vendor.ascend.patch import register_deepseek_v4
-        from vllm_fl.quantization.ascend import register_modelslim_config
+        from vllm_fl.quantization.w8a8.modelslim_config import (
+            register_modelslim_config,
+        )
 
         register_modelslim_config()
         register_deepseek_v4()

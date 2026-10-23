@@ -142,9 +142,13 @@ class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata
                 device=self.device,
             )
         if public.shape[1] > self.block_table.shape[1]:
-            raise ValueError("Block-table capacity cannot grow after plan initialization")
+            raise ValueError(
+                "Block-table capacity cannot grow after plan initialization"
+            )
         if public.dtype != self.block_table.dtype:
-            raise ValueError("Block-table dtype cannot change after plan initialization")
+            raise ValueError(
+                "Block-table dtype cannot change after plan initialization"
+            )
         self.block_table.fill_(-1)
         return public
 

@@ -17,7 +17,7 @@ pytestmark = [
 @pytest.fixture
 def native(monkeypatch):
     from vllm_fl.dispatch.backends.vendor.ascend.impl import quantization as ops
-    from vllm_fl.quantization.ascend import linear
+    from vllm_fl.quantization.w8a8 import modelslim_linear as linear
 
     monkeypatch.setattr(linear, "_prepare_weight", ops.modelslim_w8a8_prepare_weight)
     monkeypatch.setattr(linear, "_linear", ops.modelslim_w8a8_dynamic_linear)
@@ -50,7 +50,6 @@ def make_layer(method, dtype):
     assert layer.weight.shape == (128, 64)
     assert layer.weight_scale.shape == (64,)
     assert layer.weight_offset.shape == (64,)
-    assert layer.weight_scale_fp32.dtype == torch.float32
     torch.testing.assert_close(layer.weight, checkpoint_weight.t())
     return layer, checkpoint_weight
 
@@ -123,7 +122,7 @@ def test_nonzero_offset_rejected(native):
 
 def test_default_dispatch_native():
     from vllm_fl.dispatch import get_default_manager, with_strict_mode
-    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+    from vllm_fl.quantization.w8a8.modelslim_linear import AscendW8A8DynamicLinearMethod
 
     manager = get_default_manager()
     for op in ("modelslim_w8a8_prepare_weight", "modelslim_w8a8_dynamic_linear"):
@@ -140,7 +139,7 @@ def test_default_dispatch_native():
 
 def test_scoped_reference_dispatch():
     from vllm_fl.dispatch import get_default_manager, with_preference
-    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+    from vllm_fl.quantization.w8a8.modelslim_linear import AscendW8A8DynamicLinearMethod
 
     manager = get_default_manager()
     before = manager.get_selected_impl_id("modelslim_w8a8_dynamic_linear")
