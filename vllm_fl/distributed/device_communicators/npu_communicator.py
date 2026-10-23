@@ -28,7 +28,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         if not self.is_ep_communicator:
             raise RuntimeError("MoE runtime must be owned by the active EP communicator")
         if self.moe_runtime is None:
-            from .npu_moe_context import NpuMoERuntime
+            from .npu_moe_runtime import NpuMoERuntime
 
             # An OOT coordinator can retain a logical local index while the
             # worker/model uses an assigned visible ordinal. Topology comes

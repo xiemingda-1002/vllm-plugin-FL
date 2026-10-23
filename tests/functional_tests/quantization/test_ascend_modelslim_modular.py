@@ -6,9 +6,12 @@ import torch
 
 from vllm.platforms import current_platform
 
-pytestmark = pytest.mark.skipif(
-    current_platform.device_type != "npu", reason="Requires Ascend NPU"
-)
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        current_platform.device_type != "npu", reason="Requires Ascend NPU"
+    ),
+]
 
 
 @pytest.fixture
@@ -44,7 +47,7 @@ def test_loader_modular_eager_and_graph(dtype, workspace):
     from vllm_fl.dispatch.backends.reference.impl.w8a8_moe import (
         modelslim_w8a8_experts,
     )
-    from vllm_fl.quantization.ascend.moe import AscendModelSlimMoEMethod
+    from vllm_fl.quantization.w8a8.modelslim_moe import AscendModelSlimMoEMethod
 
     config = FusedMoEConfig(
         num_experts=2,

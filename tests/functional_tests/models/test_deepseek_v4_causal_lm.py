@@ -16,6 +16,25 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def strict_dispatch():
+    from vllm_fl.dispatch import get_default_manager, with_strict_mode
+
+    # Quantized native providers must not silently fall back. The ordinary
+    # DeepSeek reference-only math keeps its selected reference implementation.
+    with with_strict_mode():
+        manager = get_default_manager()
+        for name in (
+            "modelslim_w8a8_prepare_weight",
+            "modelslim_w8a8_dynamic_linear",
+            "modelslim_w8a8_prepare_experts",
+            "modelslim_w8a8_experts",
+            "deepseek_v4_index_quant",
+        ):
+            assert manager.get_selected_impl_id(name) == "vendor.ascend"
+        yield
+
+
 def _hf_config():
     from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
@@ -106,7 +125,7 @@ def _runtime_config(pipeline_parallel_size=1):
         VllmConfig,
     )
 
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     config = VllmConfig(
         device_config=DeviceConfig(device="npu"),
@@ -167,9 +186,13 @@ def runtime():
         try:
             yield config
         finally:
-            reset_workspace_manager()
-            destroy_model_parallel()
-            destroy_distributed_environment()
+            try:
+                reset_workspace_manager()
+            finally:
+                try:
+                    destroy_model_parallel()
+                finally:
+                    destroy_distributed_environment()
 
 
 @pytest.mark.skipif(
@@ -459,13 +482,15 @@ def model_env(runtime):
         )
     finally:
         torch.set_default_dtype(dtype)
-        if manager is not None:
-            for request in request_list:
-                manager.free(request)
-            assert manager.block_pool.get_num_free_blocks() == initial
-        for name in set(context) - original_names:
-            context.pop(name, None)
-        runtime.compilation_config.static_all_moe_layers[:] = original_moe_layers
+        try:
+            if manager is not None:
+                for request in request_list:
+                    manager.free(request)
+                assert manager.block_pool.get_num_free_blocks() == initial
+        finally:
+            for name in set(context) - original_names:
+                context.pop(name, None)
+            runtime.compilation_config.static_all_moe_layers[:] = original_moe_layers
 
 
 def _request(env, name):

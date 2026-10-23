@@ -221,7 +221,7 @@ class PlatformFL(Platform):
             or config.parallel_config.is_moe_model is False
         ):
             return {}
-        from vllm_fl.distributed.device_communicators.npu_moe_context import (
+        from vllm_fl.distributed.device_communicators.npu_moe_runtime import (
             get_moe_runtime,
         )
         from vllm_fl.forward_context import get_forward_execution_facts

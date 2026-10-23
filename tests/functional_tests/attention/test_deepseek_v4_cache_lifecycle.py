@@ -169,8 +169,10 @@ def runtime():
         try:
             yield config
         finally:
-            destroy_model_parallel()
-            destroy_distributed_environment()
+            try:
+                destroy_model_parallel()
+            finally:
+                destroy_distributed_environment()
 
 
 def _specs():
@@ -258,34 +260,36 @@ def pools(runtime):
         max_num_batched_tokens=512,
         enable_caching=False,
     )
-    leaves = {
-        name: DeepseekV4CacheLayer(name, spec, vllm_config=runtime)
-        for name, spec in specs.items()
-    }
-    runner_caches = []
-    bind_kv_cache(views, leaves, runner_caches)
+    context = runtime.compilation_config.static_forward_context
+    original_names = set(context)
+    leaves = {}
+    requests = []
     initial = manager.block_pool.get_num_free_blocks()
-    env = SimpleNamespace(
-        config=runtime,
-        specs=specs,
-        groups=groups,
-        views=views,
-        raw=raw,
-        leaves=leaves,
-        runner_caches=runner_caches,
-        manager=manager,
-        requests=[],
-        initial=initial,
-    )
     try:
-        yield env
+        for name, spec in specs.items():
+            leaves[name] = DeepseekV4CacheLayer(name, spec, vllm_config=runtime)
+        runner_caches = []
+        bind_kv_cache(views, leaves, runner_caches)
+        yield SimpleNamespace(
+            config=runtime,
+            specs=specs,
+            groups=groups,
+            views=views,
+            raw=raw,
+            leaves=leaves,
+            runner_caches=runner_caches,
+            manager=manager,
+            requests=requests,
+            initial=initial,
+        )
     finally:
-        for request in env.requests:
-            manager.free(request)
-        assert manager.block_pool.get_num_free_blocks() == initial
-        context = runtime.compilation_config.static_forward_context
-        for name in leaves:
-            context.pop(name, None)
+        try:
+            for request in requests:
+                manager.free(request)
+            assert manager.block_pool.get_num_free_blocks() == initial
+        finally:
+            for name in set(context) - original_names:
+                context.pop(name, None)
 
 
 def _request(env, name="request-0"):

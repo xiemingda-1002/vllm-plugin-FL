@@ -6611,7 +6611,7 @@ class ModelRunnerFL(
             and self.parallel_config.enable_expert_parallel
             and self.parallel_config.is_moe_model is not False
         ):
-            from vllm_fl.distributed.device_communicators.npu_moe_context import (
+            from vllm_fl.distributed.device_communicators.npu_moe_runtime import (
                 get_moe_runtime,
             )
 
