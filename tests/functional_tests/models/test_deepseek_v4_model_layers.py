@@ -52,8 +52,10 @@ def runtime_context():
         try:
             yield
         finally:
-            destroy_model_parallel()
-            destroy_distributed_environment()
+            try:
+                destroy_model_parallel()
+            finally:
+                destroy_distributed_environment()
 
 
 @pytest.fixture(autouse=True)

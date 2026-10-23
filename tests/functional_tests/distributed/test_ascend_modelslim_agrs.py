@@ -96,9 +96,13 @@ def groups():
             )
             yield config, ep, dp, tp
         finally:
-            reset_workspace_manager()
-            destroy_model_parallel()
-            destroy_distributed_environment()
+            try:
+                reset_workspace_manager()
+            finally:
+                try:
+                    destroy_model_parallel()
+                finally:
+                    destroy_distributed_environment()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -114,7 +118,7 @@ def test_dynamic_experts_real_agrs(groups, dtype, counts):
 
     from vllm_fl.dispatch import get_default_manager, with_strict_mode
     from vllm_fl.dispatch.backends.reference.impl.w8a8_moe import modelslim_w8a8_experts
-    from vllm_fl.quantization.ascend.moe import AscendModelSlimMoEMethod
+    from vllm_fl.quantization.w8a8.modelslim_moe import AscendModelSlimMoEMethod
 
     vllm_config, ep, dp, tp = groups
     parallel = FusedMoEParallelConfig(

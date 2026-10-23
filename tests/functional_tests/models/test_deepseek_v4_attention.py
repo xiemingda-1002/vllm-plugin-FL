@@ -61,8 +61,10 @@ def runtime():
         try:
             yield config
         finally:
-            destroy_model_parallel()
-            destroy_distributed_environment()
+            try:
+                destroy_model_parallel()
+            finally:
+                destroy_distributed_environment()
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +111,8 @@ def make_attention(runtime):
     from vllm_fl.worker.model_runner import ModelRunnerFL
 
     environments = []
+    context = runtime.compilation_config.static_forward_context
+    original_names = set(context)
 
     def create(ratio, mixed=False, topk=2):
         cfg = SimpleNamespace(
@@ -233,7 +237,7 @@ def make_attention(runtime):
         rope = torch.stack([angle.cos(), angle.sin()], -1)
         old_quant = runtime.quant_config
         if mixed:
-            from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+            from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
             runtime.quant_config = AscendModelSlimConfig(
                 {
@@ -277,12 +281,15 @@ def make_attention(runtime):
         return env
 
     yield create
-    for env in environments:
-        for request in env.requests:
-            env.manager.free(request)
-        assert env.manager.block_pool.get_num_free_blocks() == env.free_before
-        for leaf in env.leaves.values():
-            runtime.compilation_config.static_forward_context.pop(leaf.prefix, None)
+    try:
+        for env in environments:
+            for request in env.requests:
+                env.manager.free(request)
+        for env in environments:
+            assert env.manager.block_pool.get_num_free_blocks() == env.free_before
+    finally:
+        for name in set(context) - original_names:
+            context.pop(name, None)
 
 
 def _request(env, name="request"):

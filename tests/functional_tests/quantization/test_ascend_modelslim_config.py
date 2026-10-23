@@ -19,7 +19,7 @@ def config(tmp_path):
     from vllm.model_executor.model_loader.utils import configure_quant_config
 
     from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     description = {
         "embed.weight": "FLOAT",
@@ -62,7 +62,7 @@ def test_descriptor_prefixes(config, prefix, expected):
 def test_method_resolution(config):
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
-    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+    from vllm_fl.quantization.w8a8.modelslim_linear import AscendW8A8DynamicLinearMethod
 
     layer = object.__new__(LinearBase)
     torch.nn.Module.__init__(layer)
@@ -124,7 +124,7 @@ def test_framework_packing_preserves_descriptor_expert_aliases(config):
 def test_external_mapper_idempotence():
     from vllm.model_executor.models.utils import WeightsMapper
 
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     config = AscendModelSlimConfig({"model.proj.weight": "W8A8_DYNAMIC"})
     mapper = WeightsMapper(orig_to_new_prefix={"model.": "wrapped.model."})
@@ -139,8 +139,8 @@ def test_generic_dense_names_and_framework_packing():
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.model_loader.utils import configure_quant_config
 
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
-    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_linear import AscendW8A8DynamicLinearMethod
 
     description = {
         "layers.0.attn.w1.weight": "W8A8_DYNAMIC",
@@ -168,7 +168,7 @@ def test_non_idempotent_model_mapper_applies_only_to_descriptor():
     from vllm.model_executor.model_loader.utils import configure_quant_config
     from vllm.model_executor.models.utils import WeightsMapper
 
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     class DenseModel(torch.nn.Module):
         hf_to_vllm_mapper = WeightsMapper(
@@ -187,8 +187,8 @@ def test_non_idempotent_model_mapper_applies_only_to_descriptor():
 def test_dense_linear_named_experts_is_not_moe():
     from vllm.model_executor.layers.linear import LinearBase
 
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
-    from vllm_fl.quantization.ascend.linear import AscendW8A8DynamicLinearMethod
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_linear import AscendW8A8DynamicLinearMethod
 
     config = AscendModelSlimConfig({"experts.weight": "W8A8_DYNAMIC"})
     layer = object.__new__(LinearBase)
@@ -202,7 +202,7 @@ def test_dense_linear_named_experts_is_not_moe():
 def test_generic_descriptor_file_load_other_model_type(tmp_path):
     from types import SimpleNamespace
 
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     description = {"layers.0.attn.w1.weight": "W8A8_DYNAMIC"}
     (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
@@ -216,7 +216,7 @@ def test_deepseek_descriptor_mapper_loading_order(tmp_path):
     from vllm.model_executor.model_loader.utils import configure_quant_config
 
     from vllm_fl.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     description = {"layers.0.attn.wq_a.weight": "W8A8_DYNAMIC"}
     (tmp_path / "quant_model_description.json").write_text(json.dumps(description))
@@ -251,7 +251,7 @@ def test_deepseek_descriptor_mapper_loading_order(tmp_path):
     ],
 )
 def test_unsupported_types(description):
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     with pytest.raises(NotImplementedError):
         AscendModelSlimConfig(description)
@@ -260,8 +260,8 @@ def test_unsupported_types(description):
 def test_registration_idempotent(monkeypatch):
     from vllm.model_executor.layers import quantization
 
-    from vllm_fl.quantization import ascend
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8 import modelslim_config
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     calls = []
 
@@ -273,7 +273,7 @@ def test_registration_idempotent(monkeypatch):
         return decorator
 
     monkeypatch.setattr(quantization, "register_quantization_config", register)
-    monkeypatch.setattr(ascend, "_modelslim_registered", False)
-    ascend.register_modelslim_config()
-    ascend.register_modelslim_config()
+    monkeypatch.setattr(modelslim_config, "_modelslim_registered", False)
+    modelslim_config.register_modelslim_config()
+    modelslim_config.register_modelslim_config()
     assert calls == [("ascend", AscendModelSlimConfig)]

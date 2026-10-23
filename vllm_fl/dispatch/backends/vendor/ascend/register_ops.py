@@ -86,8 +86,11 @@ def register_builtins(registry: OpRegistry) -> None:
 
     for op_name in (
         "deepseek_v4_index_quant",
-        "modelslim_w8a8_prepare_experts", "modelslim_w8a8_experts",
-        "gdn_decode", "gdn_prefill", "modelslim_w8a8_prepare_weight",
+        "modelslim_w8a8_prepare_experts",
+        "modelslim_w8a8_experts",
+        "gdn_decode",
+        "gdn_prefill",
+        "modelslim_w8a8_prepare_weight",
         "modelslim_w8a8_dynamic_linear",
     ):
         impls.append(OpImpl(

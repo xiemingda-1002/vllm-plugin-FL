@@ -30,7 +30,7 @@ def test_attention_graph_updates_mixed_backends(order, linear_quantized):
     )
 
     torch.npu.set_device(0)
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     config = SimpleNamespace(
         speculative_config=None,
@@ -160,7 +160,7 @@ def test_attention_graph_quantization_gate(method, kv_dtype, cache_dtype, reject
         AscendAttentionBackendImpl,
         AscendAttentionState,
     )
-    from vllm_fl.quantization.ascend.config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
 
     impl = object.__new__(AscendAttentionBackendImpl)
     impl.vllm_config = SimpleNamespace(
