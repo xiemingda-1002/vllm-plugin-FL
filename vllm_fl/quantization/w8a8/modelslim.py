@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ModelSlim checkpoint loading with the upstream modular MoE lifecycle."""
+"""ModelSlim dynamic W8A8 configuration, Linear and modular MoE adapters."""
+
+import json
+from functools import cache
+from pathlib import Path
 
 import torch
 
@@ -18,6 +22,12 @@ from vllm.model_executor.layers.fused_moe.oracle.int8 import make_int8_moe_kerne
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8DynamicTokenSym,
     kInt8StaticChannelSym,
@@ -26,6 +36,246 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_fl.dispatch import CachedOp
 from vllm_fl.ops.fused_moe.prepare_finalize import NpuExpertTokensMetadata
+
+MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
+_EXPERT_SHARDS = (
+    "experts.0.gate_proj",
+    "experts.0.up_proj",
+    "experts.0.down_proj",
+)
+
+
+class AscendModelSlimConfig(QuantizationConfig):
+    """Load dynamic/FLOAT metadata without implicitly enabling a model.
+
+    Checkpoint naming belongs to the model's hf_to_vllm_mapper; absent a mapper,
+    names are preserved. Quantized attention/cache and static INT8 need their
+    own methods. Registration is an explicit action by platform integration.
+    """
+
+    def __init__(self, quant_config=None, *, weight_nz_mode=1):
+        super().__init__()
+        if weight_nz_mode not in (0, 1, 2):
+            raise ValueError("weight_nz_mode must be 0, 1 or 2")
+        self.weight_nz_mode = weight_nz_mode
+        self.packed_modules_mapping = {
+            "gate_up_proj": ["gate_proj", "up_proj"],
+        }
+        self.hf_to_vllm_mapper = None
+        self.quant_description = {}
+        self._set_description(quant_config or {})
+
+    def _set_description(self, description):
+        if not isinstance(description, dict):
+            raise ValueError("ModelSlim description must be a JSON object")
+        for key, value in description.items():
+            if (
+                key.endswith((".weight", ".weight_scale", ".weight_offset"))
+                or key == "model_quant_type"
+            ) and value not in ("FLOAT", "W8A8_DYNAMIC"):
+                raise NotImplementedError(
+                    f"Unsupported ModelSlim type {value!r} at {key}"
+                )
+            if (
+                key.endswith("quant_type")
+                and key != "model_quant_type"
+                and value != "FLOAT"
+            ):
+                raise NotImplementedError(
+                    f"Quantized attention/cache metadata at {key}"
+                )
+            if key == "kv_cache_type" and value != "FLOAT":
+                raise NotImplementedError("Quantized ModelSlim KV cache is unsupported")
+            if key == "group_size" and value != 0:
+                raise NotImplementedError(
+                    "Grouped ModelSlim quantization is unsupported"
+                )
+        self.quant_description = dict(description)
+        if self.hf_to_vllm_mapper is not None:
+            self.quant_description = self.hf_to_vllm_mapper.apply_dict(
+                self.quant_description
+            )
+
+    @classmethod
+    def get_name(cls):
+        return "ascend"
+
+    @classmethod
+    def get_supported_act_dtypes(cls):
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls):
+        raise NotImplementedError("Ascend does not have a CUDA compute capability")
+
+    @staticmethod
+    def get_config_filenames():
+        # The descriptor is loaded explicitly by maybe_update_config.
+        return []
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(config)
+
+    def maybe_update_config(self, model_name, hf_config=None, revision=None):
+        if self.quant_description:
+            return
+        path = Path(model_name) / MODELSLIM_CONFIG_FILENAME
+        if not path.is_file():
+            raise FileNotFoundError(f"Local ModelSlim descriptor missing: {path}")
+        self._set_description(json.loads(path.read_text()))
+
+    def apply_vllm_mapper(self, mapper):
+        if self.hf_to_vllm_mapper is mapper:
+            return
+        if self.hf_to_vllm_mapper is not None:
+            raise ValueError("ModelSlim mapper already applied; create a fresh config")
+        self.quant_description = mapper.apply_dict(self.quant_description)
+        self.hf_to_vllm_mapper = mapper
+
+    def get_layer_quant_type(self, prefix, *, is_moe=False):
+        # Prefixes come from runtime modules. Only checkpoint keys are mapped;
+        # reapplying a model mapper here can remap an already canonical prefix.
+        name = prefix.rsplit(".", 1)[-1]
+        base = prefix[: -len(name)]
+        # configure_quant_config replaces the model's Linear packing map by
+        # reference. Expert-zero aliases describe the ModelSlim checkpoint
+        # format, so they must survive that independent framework operation.
+        shards = (
+            _EXPERT_SHARDS if is_moe else self.packed_modules_mapping.get(name, [name])
+        )
+        keys = [base + shard + ".weight" for shard in shards]
+        missing = [key for key in keys if key not in self.quant_description]
+        if missing:
+            raise ValueError(f"Missing ModelSlim weight metadata: {missing}")
+        types = {self.quant_description[key] for key in keys}
+        if len(types) != 1:
+            raise ValueError(f"Mixed ModelSlim quantization for packed layer {prefix}")
+        return types.pop()
+
+    def get_quant_method(self, layer, prefix):
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+        is_moe = isinstance(layer, (RoutedExperts, MoERunner))
+        if not isinstance(layer, LinearBase) and not is_moe:
+            return None
+        quant_type = self.get_layer_quant_type(prefix, is_moe=is_moe)
+        if quant_type == "FLOAT":
+            # The existing FL MoE factory retains its unquantized method path.
+            return None if is_moe else UnquantizedLinearMethod()
+        if quant_type != "W8A8_DYNAMIC":
+            raise NotImplementedError(f"Unsupported ModelSlim type {quant_type!r}")
+        if is_moe:
+            return AscendModelSlimMoEMethod(layer.moe_config)
+        return AscendW8A8DynamicLinearMethod(self.weight_nz_mode)
+
+
+@cache
+def register_modelslim_config():
+    """Register only when an Ascend integration explicitly requests ModelSlim."""
+    from vllm.model_executor.layers.quantization import register_quantization_config
+
+    register_quantization_config(AscendModelSlimConfig.get_name())(
+        AscendModelSlimConfig
+    )
+
+
+_prepare_weight = CachedOp("modelslim_w8a8_prepare_weight")
+
+
+_linear = CachedOp("modelslim_w8a8_dynamic_linear")
+
+
+class AscendW8A8DynamicLinearMethod(LinearMethodBase):
+    """Load [N,K] int8 weights and channel scales; execute prepared [K,N].
+
+    The caller supplies the resolved weight_nz_mode when config integration is
+    added. Modes 1 and 2 both NZ-cast int8; mode 0 retains ND. This component
+    supports A2/A3 without FlashComm2 quantized communication or DSA-CP splitting.
+    """
+
+    def __init__(self, weight_nz_mode: int = 1):
+        if weight_nz_mode not in (0, 1, 2):
+            raise ValueError("weight_nz_mode must be 0, 1 or 2")
+        self.weight_nz_mode = weight_nz_mode
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if params_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError("ModelSlim dynamic Linear requires BF16/FP16")
+        n = sum(output_partition_sizes)
+        weight = torch.nn.Parameter(
+            torch.empty(n, input_size_per_partition, dtype=torch.int8),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight, extra_weight_attrs)
+        layer.register_parameter("weight", weight)
+        for name in ("weight_scale", "weight_offset"):
+            param = torch.nn.Parameter(
+                (torch.zeros if name == "weight_offset" else torch.empty)(
+                    n, 1, dtype=params_dtype
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(param, {"output_dim": 0})
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.register_parameter(name, param)
+
+    def get_computed_params(self) -> set[str]:
+        # Symmetric offsets can be computed rather than required weights.
+        return {"weight_offset"}
+
+    def process_weights_after_loading(self, layer):
+        if layer.weight.dtype != torch.int8 or layer.weight.ndim != 2:
+            raise ValueError("Expected ModelSlim [N,K] int8 weight")
+        if layer.weight_scale.shape != (layer.weight.shape[0], 1):
+            raise ValueError("Expected one ModelSlim scale per output channel")
+        if layer.weight_offset.shape != layer.weight_scale.shape:
+            raise ValueError("Expected one ModelSlim offset per output channel")
+        # Dynamic INT8 arithmetic loads offsets but does not apply them.
+        # Restrict this bounded component to the symmetric contract explicitly.
+        if torch.count_nonzero(layer.weight_offset).item():
+            raise NotImplementedError("Nonzero ModelSlim dynamic weight offsets")
+        if layer.weight.shape[0] >= 65536:
+            raise NotImplementedError(
+                "Large-output DSA-CP Linear splitting is not enabled"
+            )
+        weight, weight_scale = _prepare_weight(
+            layer.weight.data.transpose(0, 1).contiguous(),
+            layer.weight_scale.data.flatten(),
+            self.weight_nz_mode,
+        )
+        layer.weight.data = weight
+        layer.weight_scale.data = weight_scale
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
+
+    def apply(self, layer, x, bias=None):
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                "ModelSlim dynamic Linear requires BF16/FP16 input"
+            )
+        if x.ndim < 2 or x.shape[-1] != layer.weight.shape[0]:
+            raise ValueError("Expected [..., K] activations matching prepared [K,N]")
+        if bias is not None and bias.shape != (layer.weight.shape[1],):
+            raise ValueError("Expected bias [N]")
+        shape = (*x.shape[:-1], layer.weight.shape[1])
+        return _linear(
+            x.reshape(-1, x.shape[-1]).contiguous(),
+            layer.weight,
+            layer.weight_scale,
+            bias,
+        ).reshape(shape)
+
 
 _prepare = CachedOp("modelslim_w8a8_prepare_experts")
 

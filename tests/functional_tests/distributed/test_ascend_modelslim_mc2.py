@@ -55,7 +55,7 @@ from vllm_fl.dispatch.backends.vendor.ascend.impl.w8a8_moe import (
 )
 from vllm_fl.forward_context import set_forward_context
 from vllm_fl.ops.fused_moe.prepare_finalize import NpuMoEPrepareAndFinalize
-from vllm_fl.quantization.w8a8.modelslim_moe import AscendModelSlimMoEMethod
+from vllm_fl.quantization.w8a8.modelslim import AscendModelSlimMoEMethod
 
 RANK = int(os.environ.get("RANK", "0"))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))

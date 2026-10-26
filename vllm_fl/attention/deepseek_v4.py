@@ -86,7 +86,7 @@ class DeepseekV4CacheBackend(AttentionBackend):
 
     @staticmethod
     def get_kv_cache_stride_order(include_num_layers_dimension=False):
-        return (0, 1, 2, 3) if include_num_layers_dimension else (0, 1, 2)
+        return tuple(range(4 if include_num_layers_dimension else 3))
 
 
 class DeepseekV4MetadataBuilder(AttentionMetadataBuilder[DeepseekV4CacheMetadata]):

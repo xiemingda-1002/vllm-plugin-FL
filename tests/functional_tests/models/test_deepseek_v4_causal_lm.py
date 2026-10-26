@@ -125,7 +125,7 @@ def _runtime_config(pipeline_parallel_size=1):
         VllmConfig,
     )
 
-    from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
+    from vllm_fl.quantization.w8a8.modelslim import AscendModelSlimConfig
 
     config = VllmConfig(
         device_config=DeviceConfig(device="npu"),
@@ -281,7 +281,7 @@ def test_pp_hc_head_checkpoint_loading():
                 flush=True,
             )
         finally:
-            model = None
+            del model
             try:
                 reset_workspace_manager()
             finally:
