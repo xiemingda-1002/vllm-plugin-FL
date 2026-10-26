@@ -237,7 +237,7 @@ def make_attention(runtime):
         rope = torch.stack([angle.cos(), angle.sin()], -1)
         old_quant = runtime.quant_config
         if mixed:
-            from vllm_fl.quantization.w8a8.modelslim_config import AscendModelSlimConfig
+            from vllm_fl.quantization.w8a8.modelslim import AscendModelSlimConfig
 
             runtime.quant_config = AscendModelSlimConfig(
                 {
@@ -445,6 +445,7 @@ def _oracle(env, history, query_positions):
         else []
     )
     index_keys = []
+    index_query = None
     if env.ratio == 4:
         index_keys = [
             _quant(_hadamard(_compress(env, "indexer.compressor", history, end)))
@@ -458,12 +459,14 @@ def _oracle(env, history, query_positions):
         iw = (
             _linear(env, "indexer.weights_proj", history) * (4**-0.5 * 2**-0.5)
         ).half()
+        index_query = iq, iqscale, iw
     outputs = []
     for position in query_positions:
         rows = list(kv[max(0, position - 7) : position + 1].float())
         count = (position + 1) // env.ratio if env.ratio else 0
         selected = list(range(count))
-        if env.ratio == 4 and count:
+        if index_query is not None and count:
+            iq, iqscale, iw = index_query
             scores = []
             for key, kscale in index_keys[:count]:
                 logits = (

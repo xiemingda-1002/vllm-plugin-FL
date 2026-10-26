@@ -71,6 +71,7 @@ def test_modelslim_distributed_contracts(tmp_path, target):
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                # The finally block force-kills the group after the grace period.
                 pass
             finally:
                 with suppress(ProcessLookupError):

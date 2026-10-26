@@ -118,7 +118,7 @@ def test_dynamic_experts_real_agrs(groups, dtype, counts):
 
     from vllm_fl.dispatch import get_default_manager, with_strict_mode
     from vllm_fl.dispatch.backends.reference.impl.w8a8_moe import modelslim_w8a8_experts
-    from vllm_fl.quantization.w8a8.modelslim_moe import AscendModelSlimMoEMethod
+    from vllm_fl.quantization.w8a8.modelslim import AscendModelSlimMoEMethod
 
     vllm_config, ep, dp, tp = groups
     parallel = FusedMoEParallelConfig(
