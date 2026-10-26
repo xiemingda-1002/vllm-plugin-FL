@@ -8,8 +8,8 @@ import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 
 # Public HY4 MLA APIs, optional MetaX TLE fixes, and portable math shims.
-# The math fix is tracked in flagos-ai/FlagGems-vllm#955 (pending merge).
-COMMIT = "6f8a48649fafd8ec811b36acf7ce65915c84a6da"
+# Pinned to the upstream merge of flagos-ai/FlagGems-vllm#955.
+COMMIT = "f775b37f3066e2935742d26c7592a5dd55499159"
 REPOSITORY = "https://github.com/flagos-ai/FlagGems-vllm.git"
 RUNTIME_PACKAGES = ("torch", "triton", "flag-gems", "vllm", "numpy")
 PACKAGE_DEPENDENCIES = ("packaging", "pybind11", "PyYAML", "sqlalchemy")

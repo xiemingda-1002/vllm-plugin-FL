@@ -9,6 +9,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
+from vllm_fl.attention.deepseek_v4 import (
+    DeepseekV4CacheBackend,
+    validate_cache_spec,
+)
 from vllm_fl.dispatch import CachedOp
 
 _write = CachedOp("deepseek_v4_cache_write")
@@ -115,32 +119,6 @@ def create_deepseek_v4_cache_layers(config, cache_config, prefix):
     }
 
 
-def validate_cache_spec(spec):
-    if not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
-        raise TypeError("DeepSeek V4 requires an MLA cache spec")
-    if (
-        spec.num_kv_heads != 1
-        or spec.head_size <= 0
-        or spec.compress_ratio not in (1, 4, 128)
-        or spec.block_size <= 0
-        or spec.block_size % spec.compress_ratio
-    ):
-        raise ValueError("Invalid DeepSeek V4 cache dimensions or compression ratio")
-    if spec.dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.int8):
-        raise NotImplementedError("Only plain BF16/FP16/FP32/INT8 caches are supported")
-    if spec.cache_dtype_str not in (
-        None,
-        "auto",
-        "float16",
-        "bfloat16",
-        "float32",
-        "int8",
-    ):
-        raise NotImplementedError(
-            "Packed or quantized MLA cache layouts are not supported"
-        )
-
-
 class DeepseekV4CacheLayer(nn.Module, AttentionLayerBase):
     _fl_deepseek_v4_cache = True
 
@@ -160,8 +138,6 @@ class DeepseekV4CacheLayer(nn.Module, AttentionLayerBase):
         return self.spec
 
     def get_attn_backend(self):
-        from vllm_fl.attention.deepseek_v4 import DeepseekV4CacheBackend
-
         return DeepseekV4CacheBackend
 
     def store(self, values, metadata):
