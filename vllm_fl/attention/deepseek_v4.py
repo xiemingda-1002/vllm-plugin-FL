@@ -11,8 +11,34 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
-from vllm_fl.kv_cache.deepseek_v4 import validate_cache_spec
+
+def validate_cache_spec(spec):
+    """Validate the plain cache layouts accepted by this attention backend."""
+    if not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+        raise TypeError("DeepSeek V4 requires an MLA cache spec")
+    if (
+        spec.num_kv_heads != 1
+        or spec.head_size <= 0
+        or spec.compress_ratio not in (1, 4, 128)
+        or spec.block_size <= 0
+        or spec.block_size % spec.compress_ratio
+    ):
+        raise ValueError("Invalid DeepSeek V4 cache dimensions or compression ratio")
+    if spec.dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.int8):
+        raise NotImplementedError("Only plain BF16/FP16/FP32/INT8 caches are supported")
+    if spec.cache_dtype_str not in (
+        None,
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32",
+        "int8",
+    ):
+        raise NotImplementedError(
+            "Packed or quantized MLA cache layouts are not supported"
+        )
 
 
 @dataclass
