@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real scheduler allocations with installed NPU cache-layer components."""
 
+from math import prod
 from types import SimpleNamespace
 
 import pytest
@@ -619,6 +620,67 @@ def test_cache_write_typed_padding_and_null_page(pools, dtype):
     torch.testing.assert_close(cache[1, 0], values[0])
     torch.testing.assert_close(cache[2, 1], values[1])
     assert torch.count_nonzero(cache[0]) == 0
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.float32, torch.int8]
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_cache_write_padding_and_strides_graph_replay(dtype, strided):
+    from vllm_fl.dispatch.backends.reference.impl.deepseek_v4 import (
+        deepseek_v4_cache_write,
+    )
+
+    shape = (5, 4, 8) if strided else (3, 4, 4)
+    backing = torch.arange(prod(shape), device="npu").to(dtype).reshape(shape)
+    cache = backing[1:4, :, ::2] if strided else backing
+    original = backing.cpu()
+    values = torch.arange(16, device="npu").reshape(4, 4).to(dtype)
+    slots = torch.tensor([0, -1, 9, 99], device="npu")
+    deepseek_v4_cache_write(values, slots, cache)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        deepseek_v4_cache_write(values, slots, cache)
+    for raw_slots in ([0, -1, 9, 99], [-1, 4, 11, -1], [-1, -1, -1, -1]):
+        backing.copy_(original)
+        slots.copy_(torch.tensor(raw_slots, device="npu"))
+        values.copy_(torch.arange(16, device="npu").reshape(4, 4).to(dtype) + 20)
+        if dtype.is_floating_point:
+            for index, slot in enumerate(raw_slots):
+                if not 0 <= slot < 12:
+                    values[index].fill_(float("nan"))
+            cache[0, 0].fill_(float("nan"))
+        expected = backing.cpu()
+        expected_cache = expected[1:4, :, ::2] if strided else expected
+        host_values = values.cpu()
+        for index, slot in enumerate(raw_slots):
+            if 0 <= slot < 12:
+                expected_cache[slot // 4, slot % 4].copy_(host_values[index])
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            backing.cpu(), expected, rtol=0, atol=0, equal_nan=True
+        )
+
+
+def test_cache_write_workspace_is_independent_of_cache_capacity():
+    from vllm_fl.dispatch.backends.reference.impl.deepseek_v4 import (
+        deepseek_v4_cache_write,
+    )
+
+    values = torch.ones(2, 128, dtype=torch.bfloat16, device="npu")
+    slots = torch.tensor([0, -1], device="npu")
+    small = torch.zeros(2, 128, 128, dtype=torch.bfloat16, device="npu")
+    deepseek_v4_cache_write(values, slots, small)
+    large = torch.zeros(1024, 128, 128, dtype=torch.bfloat16, device="npu")
+    torch.npu.synchronize()
+    before = torch.npu.memory_allocated()
+    torch.npu.reset_peak_memory_stats()
+    deepseek_v4_cache_write(values, slots, large)
+    torch.npu.synchronize()
+    assert torch.npu.max_memory_allocated() - before < 8 * 1024 * 1024
+    torch.testing.assert_close(large[0, 0], values[0], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("missing", ["seq_lens", "query_start"])

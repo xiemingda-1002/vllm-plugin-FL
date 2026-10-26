@@ -188,19 +188,30 @@ def deepseek_v4_cache_write(values, slots, cache):
         raise ValueError("Unsupported cache storage dtype")
     if values.shape[0] == 0:
         return
-    flat = cache.reshape(-1, cache.shape[-1])
-    valid = (slots >= 0) & (slots < flat.shape[0])
-    indices = slots.long().clamp(0, flat.shape[0] - 1)
-    updates = torch.zeros_like(flat, dtype=torch.float32).index_add_(
-        0, indices, torch.where(valid[:, None], values.float(), 0)
+    if any(size == 0 for size in cache.shape):
+        raise ValueError("Cannot write to an empty cache")
+    num_slots = cache.shape[0] * cache.shape[1]
+    valid = (slots >= 0) & (slots < num_slots)
+    indices = slots.long().clamp(0, num_slots - 1)
+    # Address the original storage so padded/noncontiguous cache views retain
+    # their strides. This view allocates no cache-sized workspace.
+    span = 1 + sum(
+        (size - 1) * stride for size, stride in zip(cache.shape, cache.stride())
     )
-    touched = torch.zeros(flat.shape[0], device=flat.device, dtype=torch.int32)
-    touched.index_add_(0, indices, valid.to(torch.int32))
-    cache.copy_(
-        torch.where(touched[:, None] > 0, updates, flat.float())
-        .to(cache.dtype)
-        .reshape(cache.shape)
-    )
+    storage = cache.as_strided((span,), (1,))
+    channels = torch.arange(cache.shape[-1], device=cache.device) * cache.stride(2)
+    for token in range(values.shape[0]):
+        slot = indices[token]
+        addresses = (
+            slot.div(cache.shape[1], rounding_mode="floor") * cache.stride(0)
+            + (slot % cache.shape[1]) * cache.stride(1)
+            + channels
+        )
+        previous = torch.index_select(storage, 0, addresses)
+        update = torch.where(valid[token], values[token].to(cache.dtype), previous)
+        # One row per call avoids duplicate-index writes when padding aliases
+        # a valid slot, including slot zero. Scratch is bounded by row width.
+        storage.index_put_((addresses,), update)
 
 
 def deepseek_v4_save_state(
@@ -228,10 +239,15 @@ def deepseek_v4_save_state(
     packed = torch.cat(
         [kv.float(), gate.float() + ape[positions.long() % compress_ratio].float()], -1
     )
-    # A masked index_copy to slot zero races with a real slot-zero write.
-    # Accumulating only nonzero valid contributions avoids that padding race,
+    # The writer preserves padding without racing with a real slot-zero write,
     # including NaNs in padded projections, without data-dependent shapes.
     deepseek_v4_cache_write(packed, slot_mapping, state_cache)
+
+
+def _query_tile_size(capacity, width, num_heads=0):
+    # Bound the principal FP32 gather/score tensors to about 64 MiB per tile.
+    elements_per_query = max(1, capacity * (width + num_heads))
+    return min(32, max(1, (16 * 1024 * 1024) // elements_per_query))
 
 
 def deepseek_v4_compress(
@@ -264,6 +280,25 @@ def deepseek_v4_compress(
     if positions.shape[0] == 0:
         return state_cache.new_empty((0, dim), dtype=output_dtype)
     total = coff * compress_ratio
+    query_tile = _query_tile_size(total, state_cache.shape[-1])
+    if positions.shape[0] > query_tile:
+        return torch.cat(
+            [
+                deepseek_v4_compress(
+                    state_cache,
+                    block_table,
+                    request_ids[start : start + query_tile],
+                    positions[start : start + query_tile],
+                    rms_weight,
+                    cos_sin_cache,
+                    compress_ratio,
+                    rms_eps,
+                    output_dtype,
+                )
+                for start in range(0, positions.shape[0], query_tile)
+            ],
+            dim=0,
+        )
     source = (
         positions[:, None] - total + 1 + torch.arange(total, device=positions.device)
     )
@@ -331,6 +366,34 @@ def deepseek_v4_indexer(
     if query.shape[0] == 0:
         return torch.empty((0, topk), dtype=torch.int32, device=query.device)
     capacity = block_table.shape[1] * key_cache.shape[1]
+    # Each query is independent. Bound gathered/dequantized keys and logits
+    # instead of materializing the full prefill batch against every candidate.
+    query_tile = _query_tile_size(capacity, query.shape[2], query.shape[1])
+    if query.shape[0] > query_tile:
+        scales = (
+            query_scale.reshape(*query.shape[:2], 1)
+            if query_scale is not None
+            else None
+        )
+        return torch.cat(
+            [
+                deepseek_v4_indexer(
+                    query[start : start + query_tile],
+                    key_cache,
+                    weights[start : start + query_tile],
+                    block_table,
+                    request_ids[start : start + query_tile],
+                    positions[start : start + query_tile],
+                    key_lengths,
+                    topk,
+                    compress_ratio,
+                    None if scales is None else scales[start : start + query_tile],
+                    key_scale_cache,
+                )
+                for start in range(0, query.shape[0], query_tile)
+            ],
+            dim=0,
+        )
     logical = torch.arange(capacity, device=query.device)[None].expand(
         query.shape[0], -1
     )
@@ -392,6 +455,38 @@ def deepseek_v4_sparse_attention(
         raise ValueError("Value width must be within the shared KV width")
     if query.shape[0] == 0:
         return query.new_empty((0, query.shape[1], value_dim))
+    if compact_cache is not None and (compress_ratio == 0 or compact_indices is None):
+        raise ValueError("Compact attention requires compressed indices and a ratio")
+    capacity = window_size + (
+        compact_indices.shape[-1] if compact_cache is not None else 0
+    )
+    query_tile = _query_tile_size(capacity, dim, query.shape[1])
+    if query.shape[0] > query_tile:
+        return torch.cat(
+            [
+                deepseek_v4_sparse_attention(
+                    query[start : start + query_tile],
+                    swa_cache,
+                    compact_cache,
+                    swa_block_table,
+                    compact_block_table,
+                    request_ids[start : start + query_tile],
+                    positions[start : start + query_tile],
+                    swa_lengths,
+                    compact_lengths,
+                    None
+                    if compact_indices is None
+                    else compact_indices[start : start + query_tile],
+                    window_size,
+                    compress_ratio,
+                    scale,
+                    attn_sink,
+                    value_dim,
+                )
+                for start in range(0, query.shape[0], query_tile)
+            ],
+            dim=0,
+        )
     source = (
         positions[:, None]
         - window_size
@@ -401,10 +496,6 @@ def deepseek_v4_sparse_attention(
     kv, valid = _paged_read(swa_cache, swa_block_table, request_ids, source)
     valid = valid & (source < _lengths(swa_lengths, request_ids)[:, None])
     if compact_cache is not None:
-        if compress_ratio == 0 or compact_indices is None:
-            raise ValueError(
-                "Compact attention requires compressed indices and a ratio"
-            )
         compact, compact_valid = _paged_read(
             compact_cache, compact_block_table, request_ids, compact_indices
         )

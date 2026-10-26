@@ -217,6 +217,53 @@ def test_indexer_causality_and_int8_scales(quantized):
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("quantized", [False, True])
+def test_indexer_query_tiles_match_independent_requests(quantized):
+    keys, table = _keys()
+    q = torch.arange(39 * 2 * 4, device="npu").reshape(39, 2, 4) % 7 + 1
+    q = q.to(torch.int8 if quantized else torch.bfloat16)
+    if quantized:
+        keys = keys.to(torch.int8)
+    weights = torch.tensor([[0.3, 0.7]] * 39, device="npu")
+    reqs = torch.tensor([0, 1, -1] * 13, device="npu")
+    ends = torch.tensor([7, 3, -1] * 13, device="npu")
+    lengths = torch.tensor([3, 3], device="npu")
+    scales = torch.full((39, 2), 0.25, device="npu") if quantized else None
+    key_scales = torch.full((4, 4, 1), 0.125, device="npu") if quantized else None
+    actual = _call(
+        "indexer",
+        q,
+        keys,
+        weights,
+        table,
+        reqs,
+        ends,
+        lengths,
+        3,
+        query_scale=None if scales is None else scales.flatten(),
+        key_scale_cache=key_scales,
+    )
+    expected = torch.cat(
+        [
+            _call(
+                "indexer",
+                q[row : row + 1],
+                keys,
+                weights[row : row + 1],
+                table,
+                reqs[row : row + 1],
+                ends[row : row + 1],
+                lengths,
+                3,
+                query_scale=None if scales is None else scales[row : row + 1],
+                key_scale_cache=key_scales,
+            )
+            for row in range(39)
+        ]
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _attention_oracle(q, swa, compact, tables, reqs, ends, sink, window, value_dim):
     result = torch.zeros((*q.shape[:2], value_dim), device="npu", dtype=torch.float32)
     swa_table, compact_table = tables
@@ -398,6 +445,61 @@ def test_compress_fixed_shape_changed_state_graph():
         graph.replay()
         torch.npu.synchronize()
         torch.testing.assert_close(output, expected, rtol=0.01, atol=0.01)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_compression_query_tiles_match_independent_requests(ratio):
+    kv, gate, ape, pos, slots, cache, table, weight, rope = _state_case(ratio)
+    _call("save_state", kv, gate, ape, pos, slots, cache, ratio)
+    reqs = torch.tensor([0, 1, -1] * 13, device="npu")
+    ends = torch.tensor([ratio - 1, 2 * ratio - 1, -1] * 13, device="npu")
+    actual = _call("compress", cache, table, reqs, ends, weight, rope, ratio)
+    expected = torch.cat(
+        [
+            _call(
+                "compress",
+                cache,
+                table,
+                reqs[row : row + 1],
+                ends[row : row + 1],
+                weight,
+                rope,
+                ratio,
+            )
+            for row in range(39)
+        ]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_attention_query_tiles_match_oracle():
+    swa, table = _keys()
+    swa = swa * 0.03
+    compact = swa + 0.2
+    q = torch.full((39, 2, 4), 0.4, device="npu", dtype=torch.bfloat16)
+    reqs, ends = [0, 1, -1] * 13, [5, 3, -1] * 13
+    sink = torch.tensor([0.5, -0.2], device="npu")
+    indices = torch.tensor([[0, 1, 3, -1]] * 39, device="npu")
+    actual = _call(
+        "sparse_attention",
+        q,
+        swa,
+        compact,
+        table,
+        table,
+        torch.tensor(reqs, device="npu"),
+        torch.tensor(ends, device="npu"),
+        torch.tensor([6, 6], device="npu"),
+        torch.tensor([2, 2], device="npu"),
+        indices,
+        3,
+        compress_ratio=4,
+        attn_sink=sink,
+        value_dim=3,
+    )
+    tables = ([[2, 0], [3, 1]], [[2, 0], [3, 1]])
+    expected = _attention_oracle(q, swa, compact, tables, reqs, ends, sink, 3, 3)
+    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01)
 
 
 def test_empty_chain_inputs():
