@@ -52,6 +52,12 @@ class AscendBackend(Backend):
 
         return deepseek_v4_index_quant(*args, **kwargs)
 
+    def paged_cache_write(self, *args, **kwargs):
+        """Write token rows into a paged cache using Triton."""
+        from .impl.scatter_nd_update_v2 import scatter_nd_update_v2
+
+        return scatter_nd_update_v2(*args, **kwargs)
+
     def modelslim_w8a8_prepare_experts(self, *args, **kwargs):
         from .impl.w8a8_moe import modelslim_w8a8_prepare_experts
 

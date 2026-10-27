@@ -195,7 +195,7 @@ class VLLMFLBackendBase(ABC):
         """Collapse HC streams [T,C,D] to [T,D] with FP32 mixing parameters."""
         raise NotImplementedError
 
-    def deepseek_v4_cache_write(
+    def paged_cache_write(
         self,
         values: torch.Tensor,
         slots: torch.Tensor,
