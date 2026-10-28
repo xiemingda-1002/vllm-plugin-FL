@@ -158,9 +158,9 @@ def _runtime_config(pipeline_parallel_size=1):
 
 @pytest.fixture(scope="module")
 def runtime():
-    from tests.utils.ascend import single_rank_runtime
+    from tests.utils.device_utils import ascend_single_rank_runtime
 
-    with single_rank_runtime(_runtime_config, workspace=True) as config:
+    with ascend_single_rank_runtime(_runtime_config, workspace=True) as config:
         yield config
 
 

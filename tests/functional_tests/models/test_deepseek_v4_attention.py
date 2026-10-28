@@ -17,7 +17,7 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def runtime():
-    from tests.utils.ascend import single_rank_runtime
+    from tests.utils.device_utils import ascend_single_rank_runtime
     from vllm.config import (
         CacheConfig,
         CompilationConfig,
@@ -40,7 +40,7 @@ def runtime():
             cache_config=CacheConfig(block_size=128, enable_prefix_caching=False),
         )
 
-    with single_rank_runtime(config_factory) as config:
+    with ascend_single_rank_runtime(config_factory) as config:
         yield config
 
 
