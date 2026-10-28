@@ -87,6 +87,7 @@ def register_builtins(registry: OpRegistry) -> None:
     for op_name in (
         "deepseek_v4_sparse_attention",
         "deepseek_v4_index_quant",
+        "deepseek_v4_indexer",
         "paged_cache_write",
         "modelslim_w8a8_prepare_experts",
         "modelslim_w8a8_experts",

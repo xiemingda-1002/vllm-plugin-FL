@@ -50,6 +50,11 @@ class AscendBackend(Backend):
 
         return deepseek_v4_sparse_attention(*args, **kwargs)
 
+    def deepseek_v4_indexer(self, *args, **kwargs):
+        from .impl.quant_lightning_indexer import deepseek_v4_indexer
+
+        return deepseek_v4_indexer(*args, **kwargs)
+
     def deepseek_v4_index_quant(self, *args, **kwargs):
         from .impl.quantization import deepseek_v4_index_quant
 

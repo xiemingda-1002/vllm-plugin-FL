@@ -19,12 +19,16 @@ def strict_dispatch():
     from vllm_fl.dispatch import get_default_manager, with_strict_mode
 
     with with_strict_mode():
-        for name in ("save_state", "compress", "indexer"):
+        for name in ("save_state", "compress"):
             assert (
                 get_default_manager().get_selected_impl_id("deepseek_v4_" + name)
                 == "reference.torch"
             )
-        for name in ("deepseek_v4_sparse_attention", "paged_cache_write"):
+        for name in (
+            "deepseek_v4_sparse_attention",
+            "deepseek_v4_indexer",
+            "paged_cache_write",
+        ):
             assert get_default_manager().get_selected_impl_id(name) == "vendor.ascend"
         yield
 
