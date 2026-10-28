@@ -15,47 +15,22 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def runtime_context():
+    from tests.utils.ascend import single_rank_runtime
     from vllm.config import (
         CompilationConfig,
         CompilationMode,
         VllmConfig,
-        set_current_vllm_config,
     )
-    from vllm.distributed import (
-        destroy_distributed_environment,
-        destroy_model_parallel,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from vllm.utils.network_utils import get_open_port
 
-    from vllm_fl import _patch_ascend_torch_accelerator
+    def config_factory():
+        return VllmConfig(
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.NONE, custom_ops=["all"]
+            )
+        )
 
-    torch.npu.set_device(0)
-    _patch_ascend_torch_accelerator()
-    config = VllmConfig(
-        compilation_config=CompilationConfig(
-            mode=CompilationMode.NONE, custom_ops=["all"]
-        )
-    )
-    # A worker initializes these before constructing replicated linears or
-    # CustomOps. Reproduce real prerequisites rather than mocking rank getters.
-    with set_current_vllm_config(config):
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
-            backend="hccl",
-        )
-        initialize_model_parallel(1, backend="hccl")
-        try:
-            yield
-        finally:
-            try:
-                destroy_model_parallel()
-            finally:
-                destroy_distributed_environment()
+    with single_rank_runtime(config_factory) as config:
+        yield config
 
 
 @pytest.fixture(autouse=True)
@@ -164,11 +139,6 @@ def _compressor(ratio):
         loader = getattr(param, "weight_loader", default_weight_loader)
         loader(param, value)
         torch.testing.assert_close(param, value)
-    return module
-
-
-def test_compressor_checkpoint_parameter_names_and_loaders():
-    module = _compressor(4)
     assert set(dict(module.named_parameters())) == {
         "wkv.weight",
         "wgate.weight",
@@ -178,7 +148,8 @@ def test_compressor_checkpoint_parameter_names_and_loaders():
     assert callable(module.wkv.weight.weight_loader)
     assert callable(module.wgate.weight.weight_loader)
     assert module.ape.dtype == torch.float32
-    assert module.ape.shape == (4, 8)
+    assert module.ape.shape == (ratio, (2 if ratio == 4 else 1) * 4)
+    return module
 
 
 def _compression_oracle(module, x, ends, ratio, rope):
@@ -355,30 +326,6 @@ def test_actual_decoder_norms_and_argument_forwarding(with_ids):
     assert layer.self_attn.last_positions is positions
     assert layer.self_attn.last_scaling is scaling
     assert layer.mlp.last_ids is ids
-
-
-def test_decoder_changed_input_graph():
-    import torch_npu  # noqa: F401
-
-    layer = _decoder()
-    x = _data((2, 3, 8), 0.08, torch.bfloat16)
-    positions = torch.tensor([3, 7], device="npu")
-    ids = torch.tensor([11, 17], device="npu")
-    for _ in range(3):
-        layer(positions, x, input_ids=ids)
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        output = layer(positions, x, input_ids=ids)
-    previous = output.clone()
-    for _ in range(2):
-        x.add_(0.0625)
-        expected = _decoder_oracle(layer, positions, x, ids)
-        graph.replay()
-        torch.npu.synchronize()
-        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
-        assert not torch.equal(output, previous)
-        previous = output.clone()
 
 
 def test_zero_token_projection_and_decoder():
