@@ -83,11 +83,6 @@ class ReferenceBackend(Backend):
 
         return deepseek_v4_hc_head(*args, **kwargs)
 
-    def paged_cache_write(self, *args, **kwargs):
-        from .impl.paged_cache import paged_cache_write
-
-        return paged_cache_write(*args, **kwargs)
-
     def deepseek_v4_save_state(self, *args, **kwargs):
         from .impl.deepseek_v4 import deepseek_v4_save_state
 

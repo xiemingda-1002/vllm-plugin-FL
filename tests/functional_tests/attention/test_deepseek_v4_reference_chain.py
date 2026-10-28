@@ -681,29 +681,3 @@ def test_full_reference_pipeline_changed_inputs_graph():
         assert torch.isfinite(output).all()
         assert not torch.equal(output, previous)
         previous = output.clone()
-
-
-def test_state_writer_keeps_portable_reference_backend():
-    from vllm_fl.dispatch import (
-        SelectionPolicy,
-        get_default_manager,
-        policy_context,
-    )
-
-    policy = SelectionPolicy(strict=True, deny_vendors=frozenset({"ascend"}))
-    with policy_context(policy):
-        assert (
-            get_default_manager().get_selected_impl_id("paged_cache_write")
-            == "reference.torch"
-        )
-        kv = torch.ones(2, 4, dtype=torch.float32, device="npu")
-        gate = torch.full_like(kv, 2)
-        ape = torch.zeros(4, 4, dtype=torch.float32, device="npu")
-        positions = torch.tensor([0, 1], device="npu")
-        slots = torch.tensor([0, -1], device="npu")
-        cache = torch.zeros(2, 4, 8, dtype=torch.float32, device="npu")
-        _call("save_state", kv, gate, ape, positions, slots, cache, 4)
-        torch.testing.assert_close(cache[0, 0, :4], kv[0], rtol=0, atol=0)
-        torch.testing.assert_close(cache[0, 0, 4:], gate[0], rtol=0, atol=0)
-        assert torch.count_nonzero(cache[0, 1:]) == 0
-        assert torch.count_nonzero(cache[1]) == 0
