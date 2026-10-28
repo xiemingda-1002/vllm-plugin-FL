@@ -15,15 +15,17 @@ pytestmark = [
 
 
 @pytest.fixture(autouse=True)
-def reference_dispatch():
-    from vllm_fl.dispatch import get_default_manager, with_preference, with_strict_mode
+def strict_dispatch():
+    from vllm_fl.dispatch import get_default_manager, with_strict_mode
 
-    with with_preference("reference"), with_strict_mode():
-        for name in ("save_state", "compress", "indexer", "sparse_attention"):
+    with with_strict_mode():
+        for name in ("save_state", "compress", "indexer"):
             assert (
                 get_default_manager().get_selected_impl_id("deepseek_v4_" + name)
                 == "reference.torch"
             )
+        for name in ("deepseek_v4_sparse_attention", "paged_cache_write"):
+            assert get_default_manager().get_selected_impl_id(name) == "vendor.ascend"
         yield
 
 

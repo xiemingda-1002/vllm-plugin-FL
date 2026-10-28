@@ -98,11 +98,6 @@ class ReferenceBackend(Backend):
 
         return deepseek_v4_indexer(*args, **kwargs)
 
-    def deepseek_v4_sparse_attention(self, *args, **kwargs):
-        from .impl.deepseek_v4 import deepseek_v4_sparse_attention
-
-        return deepseek_v4_sparse_attention(*args, **kwargs)
-
     def topk_softplus_sqrt(self, *args, **kwargs):
         from .impl.routing import topk_softplus_sqrt
 

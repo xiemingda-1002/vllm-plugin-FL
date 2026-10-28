@@ -51,7 +51,6 @@ def register_builtins(registry) -> None:
         "deepseek_v4_save_state",
         "deepseek_v4_compress",
         "deepseek_v4_indexer",
-        "deepseek_v4_sparse_attention",
         "topk_softplus_sqrt",
         "modelslim_w8a8_prepare_experts",
         "modelslim_w8a8_experts",
