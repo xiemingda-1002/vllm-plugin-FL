@@ -8,8 +8,6 @@ This backend provides operator implementations for Huawei Ascend NPUs.
 
 from __future__ import annotations
 
-from typing import Optional, Union
-
 import torch
 
 from vllm_fl.dispatch.backends.base import Backend
@@ -23,7 +21,7 @@ class AscendBackend(Backend):
     operator implementations for Huawei Ascend NPUs.
     """
 
-    _available: Optional[bool] = None
+    _available: bool | None = None
 
     def __init__(self) -> None:
         super().__init__()
@@ -33,7 +31,7 @@ class AscendBackend(Backend):
         return "ascend"
 
     @property
-    def vendor(self) -> Optional[str]:
+    def vendor(self) -> str | None:
         return "ascend"
 
     def is_available(self) -> bool:
@@ -47,6 +45,11 @@ class AscendBackend(Backend):
         return AscendBackend._available
 
     # ==================== Operator Implementations ====================
+    def deepseek_v4_sparse_attention(self, *args, **kwargs):
+        from .impl.sparse_attn_sharedkv import deepseek_v4_sparse_attention
+
+        return deepseek_v4_sparse_attention(*args, **kwargs)
+
     def deepseek_v4_index_quant(self, *args, **kwargs):
         from .impl.quantization import deepseek_v4_index_quant
 
@@ -95,7 +98,11 @@ class AscendBackend(Backend):
         return fused_experts_impl(*args, **kwargs)
 
     def topk_softmax(
-        self, topk_weights, topk_ids, token_expert_indices, gating_output,
+        self,
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        gating_output,
         renormalize: bool,
     ):
         from .impl.fused_moe import topk_softmax
@@ -123,8 +130,8 @@ class AscendBackend(Backend):
         self,
         obj,
         x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         RMS normalization.
 
@@ -200,6 +207,8 @@ class AscendBackend(Backend):
         """
         if use_mla:
             if use_sparse:
-                raise NotImplementedError("MLA with sparse attention is not implemented for Ascend yet.")
+                raise NotImplementedError(
+                    "MLA with sparse attention is not implemented for Ascend yet."
+                )
             return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendMLABackend"
         return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendAttentionBackend"

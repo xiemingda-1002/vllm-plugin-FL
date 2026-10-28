@@ -85,6 +85,7 @@ def register_builtins(registry: OpRegistry) -> None:
     ]
 
     for op_name in (
+        "deepseek_v4_sparse_attention",
         "deepseek_v4_index_quant",
         "paged_cache_write",
         "modelslim_w8a8_prepare_experts",
@@ -94,20 +95,24 @@ def register_builtins(registry: OpRegistry) -> None:
         "modelslim_w8a8_prepare_weight",
         "modelslim_w8a8_dynamic_linear",
     ):
-        impls.append(OpImpl(
-            op_name=op_name,
+        impls.append(
+            OpImpl(
+                op_name=op_name,
+                impl_id="vendor.ascend",
+                kind=BackendImplKind.VENDOR,
+                fn=_bind_is_available(getattr(backend, op_name), is_avail),
+                vendor="ascend",
+                priority=BackendPriority.VENDOR,
+            )
+        )
+    impls.append(
+        OpImpl(
+            op_name="fused_experts",
             impl_id="vendor.ascend",
             kind=BackendImplKind.VENDOR,
-            fn=_bind_is_available(getattr(backend, op_name), is_avail),
+            fn=_bind_is_available(backend.fused_experts, is_avail),
             vendor="ascend",
             priority=BackendPriority.VENDOR,
-        ))
-    impls.append(OpImpl(
-        op_name="fused_experts",
-        impl_id="vendor.ascend",
-        kind=BackendImplKind.VENDOR,
-        fn=_bind_is_available(backend.fused_experts, is_avail),
-        vendor="ascend",
-        priority=BackendPriority.VENDOR,
-    ))
+        )
+    )
     registry.register_many(impls)
