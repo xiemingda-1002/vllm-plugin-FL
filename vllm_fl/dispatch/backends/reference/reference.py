@@ -93,11 +93,6 @@ class ReferenceBackend(Backend):
 
         return deepseek_v4_compress(*args, **kwargs)
 
-    def deepseek_v4_indexer(self, *args, **kwargs):
-        from .impl.deepseek_v4 import deepseek_v4_indexer
-
-        return deepseek_v4_indexer(*args, **kwargs)
-
     def topk_softplus_sqrt(self, *args, **kwargs):
         from .impl.routing import topk_softplus_sqrt
 

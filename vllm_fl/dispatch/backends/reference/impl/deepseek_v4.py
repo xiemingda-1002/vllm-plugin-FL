@@ -173,10 +173,6 @@ def _paged_read(cache, table, requests, positions):
     return torch.where(valid[..., None], values, 0), valid
 
 
-def _lengths(lengths, requests):
-    return lengths[requests.long().clamp(0, lengths.shape[0] - 1)]
-
-
 def deepseek_v4_save_state(
     kv, gate, ape, positions, slot_mapping, state_cache, compress_ratio
 ):
@@ -207,9 +203,9 @@ def deepseek_v4_save_state(
     _cache_write(packed, slot_mapping, state_cache)
 
 
-def _query_tile_size(capacity, width, num_heads=0):
+def _query_tile_size(capacity, width):
     # Bound the principal FP32 gather/score tensors to about 64 MiB per tile.
-    elements_per_query = max(1, capacity * (width + num_heads))
+    elements_per_query = max(1, capacity * width)
     return min(32, max(1, (16 * 1024 * 1024) // elements_per_query))
 
 
@@ -295,91 +291,3 @@ def deepseek_v4_compress(
     rotated = torch.stack([even * cos - odd * sin, odd * cos + even * sin], -1)
     result = torch.cat([nope, rotated.flatten(1)], -1)
     return torch.where(has_source[:, None], result, 0).to(output_dtype)
-
-
-def deepseek_v4_indexer(
-    query,
-    key_cache,
-    weights,
-    block_table,
-    request_ids,
-    positions,
-    key_lengths,
-    topk,
-    compress_ratio=4,
-    query_scale=None,
-    key_scale_cache=None,
-):
-    """C4 weighted ReLU index scores and causal logical compact-row IDs.
-
-    Weights include model-side projection/head scaling. Quantized Q/K scales are
-    dequantization scales, not additional attention scaling. C128 attends every
-    completed compact row and does not use this indexer.
-    """
-    if compress_ratio != 4 or topk < 1:
-        raise ValueError("The compressed indexer requires C4 and positive topk")
-    if query.ndim != 3 or weights.shape != query.shape[:2]:
-        raise ValueError(
-            "Expected [tokens, heads, dim] queries and [tokens, heads] weights"
-        )
-    if query.dtype == torch.int8 and query_scale is None:
-        raise ValueError("INT8 queries require per-token/head scales")
-    if key_cache.dtype == torch.int8 and key_scale_cache is None:
-        raise ValueError("INT8 keys require per-row scales")
-    if query.shape[0] == 0:
-        return torch.empty((0, topk), dtype=torch.int32, device=query.device)
-    capacity = block_table.shape[1] * key_cache.shape[1]
-    # Each query is independent. Bound gathered/dequantized keys and logits
-    # instead of materializing the full prefill batch against every candidate.
-    query_tile = _query_tile_size(capacity, query.shape[2], query.shape[1])
-    if query.shape[0] > query_tile:
-        scales = (
-            query_scale.reshape(*query.shape[:2], 1)
-            if query_scale is not None
-            else None
-        )
-        return torch.cat(
-            [
-                deepseek_v4_indexer(
-                    query[start : start + query_tile],
-                    key_cache,
-                    weights[start : start + query_tile],
-                    block_table,
-                    request_ids[start : start + query_tile],
-                    positions[start : start + query_tile],
-                    key_lengths,
-                    topk,
-                    compress_ratio,
-                    None if scales is None else scales[start : start + query_tile],
-                    key_scale_cache,
-                )
-                for start in range(0, query.shape[0], query_tile)
-            ],
-            dim=0,
-        )
-    logical = torch.arange(capacity, device=query.device)[None].expand(
-        query.shape[0], -1
-    )
-    keys, valid = _paged_read(key_cache, block_table, request_ids, logical)
-    q = query.float()
-    if query_scale is not None:
-        q = q * query_scale.reshape(*query.shape[:2], 1).float()
-    if key_scale_cache is not None:
-        scales, scale_valid = _paged_read(
-            key_scale_cache, block_table, request_ids, logical
-        )
-        keys = keys.float() * scales.float()
-        valid = valid & scale_valid
-    logits = torch.einsum("thd,tkd->thk", q, keys.float()).relu()
-    scores = (logits * weights.float()[:, :, None]).sum(1)
-    limit = torch.minimum(
-        (positions + 1) // compress_ratio, _lengths(key_lengths, request_ids)
-    )
-    valid = valid & (positions[:, None] >= 0) & (logical < limit[:, None])
-    scores = scores.masked_fill(~valid, -torch.inf)
-    if topk > capacity:
-        scores = torch.cat(
-            [scores, scores.new_full((query.shape[0], topk - capacity), -torch.inf)], -1
-        )
-    values, indices = scores.topk(topk, dim=-1)
-    return torch.where(torch.isfinite(values), indices, -1).to(torch.int32)
