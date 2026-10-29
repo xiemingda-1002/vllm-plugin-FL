@@ -45,6 +45,11 @@ class AscendBackend(Backend):
         return AscendBackend._available
 
     # ==================== Operator Implementations ====================
+    def deepseek_v4_compressor(self, *args, **kwargs):
+        from .impl.compressor import deepseek_v4_compressor
+
+        return deepseek_v4_compressor(*args, **kwargs)
+
     def deepseek_v4_sparse_attention(self, *args, **kwargs):
         from .impl.sparse_attn_sharedkv import deepseek_v4_sparse_attention
 

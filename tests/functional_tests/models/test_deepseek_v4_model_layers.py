@@ -38,6 +38,10 @@ def inference_and_dispatch(runtime_context):
     from vllm_fl.dispatch import get_default_manager, with_strict_mode
 
     with torch.inference_mode(), with_strict_mode():
+        assert (
+            get_default_manager().get_selected_impl_id("deepseek_v4_compressor")
+            == "vendor.ascend"
+        )
         for name in ("project", "hc_pre", "hc_post", "hc_head"):
             assert (
                 get_default_manager().get_selected_impl_id("deepseek_v4_" + name)
@@ -220,7 +224,127 @@ def test_compressor_actual_module_prefill_decode(ratio, chunked):
     actual = torch.cat(outputs)
     expected = _compression_oracle(module, x, [ratio - 1, n - 1], ratio, rope)
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01)
-    assert torch.isfinite(state).all()
+    # Independently check the complete persistent state on CPU, including the
+    # physical page permutation. Finite outputs alone cannot detect lost writes
+    # during the chunks that return no compressed rows.
+    cpu_x = x.cpu().float()
+    cpu_kv = F.linear(cpu_x, module.wkv.weight.cpu().float())
+    cpu_gate = F.linear(cpu_x, module.wgate.weight.cpu().float())
+    cpu_ape = module.ape.cpu()
+    expected_state = torch.zeros(state.shape, dtype=torch.float32)
+    for index, slot in enumerate(slots.cpu().tolist()):
+        expected_state[slot // ratio, slot % ratio] = torch.cat(
+            [cpu_kv[index], cpu_gate[index] + cpu_ape[index % ratio]]
+        )
+    torch.testing.assert_close(state.cpu(), expected_state)
+
+
+def test_full_compressor_fake_has_no_kernel_launch(monkeypatch):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from triton.runtime.jit import JITFunction
+
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.compressor import (
+        _compressor_op,
+        deepseek_v4_compressor,
+    )
+
+    module = _compressor(4)
+    x = _data((2, 8), dtype=torch.bfloat16)
+    state = torch.empty(2, 4, 16, dtype=torch.float32, device="npu")
+    positions = torch.arange(2, device="npu")
+    slots = torch.tensor([0, 1], device="npu")
+    table = torch.tensor([[0, 1]], dtype=torch.int32, device="npu")
+    ends = torch.tensor([3, 7, -1], device="npu")
+    requests = torch.tensor([0, 0, -1], device="npu")
+    rope = torch.empty(8, 2, dtype=torch.float32, device="npu")
+    args = (
+        x,
+        module.wkv.weight,
+        module.wgate.weight,
+        module.ape,
+        state,
+        positions,
+        slots,
+        table,
+        requests,
+        ends,
+        module.norm.weight,
+        rope,
+    )
+
+    def forbidden_launch(*args, **kwargs):
+        pytest.fail("FakeTensor evaluation launched a Triton kernel")
+
+    monkeypatch.setattr(JITFunction, "run", forbidden_launch)
+    with FakeTensorMode() as mode:
+        fake_args = tuple(mode.from_tensor(tensor) for tensor in args)
+        result = deepseek_v4_compressor(*fake_args)
+        assert result.shape == (3, 4)
+        assert result.dtype == x.dtype
+        assert result.device == x.device
+        assert isinstance(result, torch._subclasses.fake_tensor.FakeTensor)
+
+    # Mutation must be present in the dispatcher schema, where functionalization
+    # and graph dead-code elimination can see it, rather than only in a comment.
+    schema = _compressor_op._opoverload._schema
+    mutated = {
+        argument.name
+        for argument in schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    }
+    assert mutated == {"state_cache"}
+
+
+def test_full_compressor_write_only_compile_preserves_state():
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.compressor import (
+        deepseek_v4_compressor,
+    )
+
+    module = _compressor(4)
+    x = _data((3, 8), 0.04, torch.bfloat16)
+    state = torch.full((2, 4, 16), -9.0, device="npu", dtype=torch.float32)
+    positions = torch.tensor([0, 3, 7], device="npu")
+    slots = torch.tensor([0, 3, 7], device="npu")
+    table = torch.tensor([[0, 1]], device="npu", dtype=torch.int32)
+    empty = torch.empty(0, device="npu", dtype=torch.int64)
+    rope = torch.ones(8, 2, device="npu", dtype=torch.float32)
+
+    def write_only(hidden, cache):
+        # Intentionally discard the zero-row result. The state mutation is the
+        # only observable effect of the custom op and must survive compilation.
+        deepseek_v4_compressor(
+            hidden,
+            module.wkv.weight,
+            module.wgate.weight,
+            module.ape,
+            cache,
+            positions,
+            slots,
+            table,
+            empty,
+            empty,
+            module.norm.weight,
+            rope,
+        )
+        return cache.clone()
+
+    compiled = torch.compile(write_only, backend="aot_eager", fullgraph=True)
+    expected = torch.full(state.shape, -9.0, dtype=torch.float32)
+    cpu_ape = module.ape.cpu()
+    cpu_positions = positions.cpu().tolist()
+    cpu_slots = slots.cpu().tolist()
+    for hidden in (x, x * 2):
+        cpu_hidden = hidden.cpu().float()
+        cpu_kv = F.linear(cpu_hidden, module.wkv.weight.cpu().float())
+        cpu_gate = F.linear(cpu_hidden, module.wgate.weight.cpu().float())
+        for index, slot in enumerate(cpu_slots):
+            expected[slot // 4, slot % 4] = torch.cat(
+                [cpu_kv[index], cpu_gate[index] + cpu_ape[cpu_positions[index] % 4]]
+            )
+        output = compiled(hidden, state)
+        torch.npu.synchronize()
+        torch.testing.assert_close(output.cpu(), expected)
+        torch.testing.assert_close(state.cpu(), expected)
 
 
 @pytest.mark.parametrize("iterations", [1, 4])

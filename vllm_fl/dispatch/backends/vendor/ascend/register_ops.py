@@ -34,6 +34,10 @@ def register_builtins(registry: OpRegistry) -> None:
     """
     from .ascend import AscendBackend
 
+    # Register the mutable fake boundary before an initial Dynamo trace.
+    # This function is only loaded for the current vendor.
+    from .impl import compressor as _compressor  # noqa: F401
+
     backend = AscendBackend()
     is_avail = backend.is_available
 
@@ -85,6 +89,7 @@ def register_builtins(registry: OpRegistry) -> None:
     ]
 
     for op_name in (
+        "deepseek_v4_compressor",
         "deepseek_v4_sparse_attention",
         "deepseek_v4_index_quant",
         "deepseek_v4_indexer",
