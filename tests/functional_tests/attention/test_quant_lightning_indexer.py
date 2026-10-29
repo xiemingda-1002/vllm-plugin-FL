@@ -313,7 +313,64 @@ def test_page_tile_fast_metadata_masks(dim):
     assert bool((out[0, :32] < 32).all())
     a[4].zero_()
     a[5].fill_(2)
-    check(a)  # Causal mask makes the scalar block-pointer shape zero.
+    check(a)  # No causal candidates: the whole fast tile is skipped.
+    for limit in (31, 33, 63):
+        a[3].copy_(torch.tensor([[0, 2, 4], [5, 3, 1]], device="npu"))
+        a[5].fill_(limit * 4 - 1)
+        check(a)  # A valid first row must retain the partial tile vector mask.
     a[5].fill_(383)
     a[3].fill_(-1)
     check(a)  # Every physical page is invalid.
+
+
+@pytest.mark.parametrize("p", [32, 64, 512])
+def test_sorted_merge_tuple_order(p):
+    mod = implementation()
+    for ns in (1, 3, 5):
+        generator = torch.Generator().manual_seed(781 + p + ns)
+        values = torch.randint(-17, 18, (2, ns, p), generator=generator).float() / 4
+        flat = torch.arange(2 * ns * p).reshape(2, ns, p)
+        # These IDs include subnormal and NaN FP32 bit patterns as well as
+        # integers that cannot be represented numerically by FP32.
+        ids = torch.where(
+            flat % 3 == 0,
+            2**24 + 2 * flat + 1,
+            torch.where(flat % 3 == 1, 2**31 - 2 - 2 * flat, flat),
+        ).to(torch.int32)
+        lists = []
+        for row in range(2):
+            row_lists = []
+            for seg in range(ns):
+                pairs = sorted(
+                    zip(values[row, seg].tolist(), ids[row, seg].tolist()),
+                    key=lambda pair: (-pair[0], pair[1]),
+                )
+                row_lists.append(pairs)
+                values[row, seg] = torch.tensor([pair[0] for pair in pairs])
+                ids[row, seg] = torch.tensor([pair[1] for pair in pairs])
+            lists.append(row_lists)
+        os = (ns + 1) // 2
+        expected = [
+            [
+                sorted(
+                    sum(row[2 * seg : 2 * seg + 2], []),
+                    key=lambda pair: (-pair[0], pair[1]),
+                )[:p]
+                for seg in range(os)
+            ]
+            for row in lists
+        ]
+        want_values = torch.tensor(
+            [[[pair[0] for pair in seg] for seg in row] for row in expected]
+        )
+        want_ids = torch.tensor(
+            [[[pair[1] for pair in seg] for seg in row] for row in expected],
+            dtype=torch.int32,
+        )
+        out_values = torch.empty((2, os, p), device="npu")
+        out_ids = torch.empty((2, os, p), dtype=torch.int32, device="npu")
+        mod._launch_chunks(
+            mod._merge, 2 * os, values.npu(), ids.npu(), out_values, out_ids, p, ns, os
+        )
+        assert torch.equal(out_values.cpu(), want_values)
+        assert torch.equal(out_ids.cpu(), want_ids)

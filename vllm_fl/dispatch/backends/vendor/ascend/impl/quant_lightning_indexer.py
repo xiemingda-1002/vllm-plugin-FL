@@ -101,13 +101,7 @@ def _score(
         t = (work // tiles).to(tl.int64)
         tile = work % tiles
         j = tile * BN + tl.arange(0, BN)
-        page, valid = _metadata(
-            BT, R, POS, LEN, t, j, NR, NL, NC, BS, NP, B0, B1, R0, P0, L0
-        )
-        valid = valid & ((page < NSP) if HAS_KS else True)
-        page = tl.where(valid, page, 0)
-        h = tl.arange(0, BH).to(tl.int64)
-        if (
+        fast: tl.constexpr = (
             QUANT
             and D > 0
             and D <= 128
@@ -121,7 +115,10 @@ def _score(
             and (BS - 1) * K1 + (D - 1) * K2 < 2**31
             and (BH - 1) * Q1 + (BD - 1) * Q2 < 2**31
             and NP > 0
-        ):
+        )
+
+        active = True
+        if fast:
             # This tile belongs to one physical page. Keep the global page
             # address scalar INT64; only page-local row/column offsets vary.
             j0 = tile * BN
@@ -130,70 +127,89 @@ def _score(
             )
             valid0 = valid0 & ((pp0 < NSP) if HAS_KS else True)
             pp0 = tl.where(valid0, pp0, 0)
-            key_tile = tl.make_block_ptr(
-                base=K + pp0 * K0,
-                shape=(tl.where(valid0, BS, 0), D),
-                strides=(K1, K2),
-                offsets=((j0 % BS).to(tl.int32), 0),
-                block_shape=(BN, BD),
-                order=(1, 0),
+            active = valid0
+        # A page-contained tile shares its page validity. Causal validity is
+        # a monotone prefix, so an invalid first candidate invalidates the tile.
+        if active:
+            page, valid = _metadata(
+                BT, R, POS, LEN, t, j, NR, NL, NC, BS, NP, B0, B1, R0, P0, L0
             )
-            k = tl.load(key_tile, boundary_check=(0, 1), padding_option="zero")
-            d = tl.arange(0, BD)
-            q = tl.load(
-                Q + t * Q0 + h[:, None] * Q1 + d[None, :],
-                mask=(h[:, None] < H) & (d[None, :] < D),
-                other=0,
-            )
-            dots = tl.dot(q, tl.trans(k)).to(tl.float32)
-        elif QUANT:
-            acc = tl.zeros((BH, BN), tl.int32)
-            for start in range(triton.cdiv(D, 32)):
-                d = start * 32 + tl.arange(0, 32)
+            valid = valid & ((page < NSP) if HAS_KS else True)
+            page = tl.where(valid, page, 0)
+            h = tl.arange(0, BH).to(tl.int64)
+            if fast:
+                key_tile = tl.make_block_ptr(
+                    base=K + pp0 * K0,
+                    shape=(tl.where(valid0, BS, 0), D),
+                    strides=(K1, K2),
+                    offsets=((j0 % BS).to(tl.int32), 0),
+                    block_shape=(BN, BD),
+                    order=(1, 0),
+                )
+                k = tl.load(key_tile, boundary_check=(0, 1), padding_option="zero")
+                d = tl.arange(0, BD)
                 q = tl.load(
-                    Q + t * Q0 + h[:, None] * Q1 + d[None, :] * Q2,
+                    Q + t * Q0 + h[:, None] * Q1 + d[None, :],
                     mask=(h[:, None] < H) & (d[None, :] < D),
                     other=0,
                 )
-                # Flat gather avoids the backend's strided 2D DMA lowering.
-                f = tl.arange(0, BN * 32)
-                jj = tile * BN + f // 32
-                pp, vv = _metadata(
-                    BT, R, POS, LEN, t, jj, NR, NL, NC, BS, NP, B0, B1, R0, P0, L0
-                )
-                vv = vv & ((pp < NSP) if HAS_KS else True)
-                pp = tl.where(vv, pp, 0)
-                dd = start * 32 + f % 32
-                off = (
-                    pp * K0
-                    + tl.where(vv, jj % BS, 0).to(tl.int64) * K1
-                    + dd.to(tl.int64) * K2
-                )
-                k = tl.load(K + off, mask=vv & (dd < D), other=0).reshape(BN, 32)
-                acc += tl.dot(q, tl.trans(k))
-            dots = acc.to(tl.float32)
+                dots = tl.dot(q, tl.trans(k)).to(tl.float32)
+            elif QUANT:
+                acc = tl.zeros((BH, BN), tl.int32)
+                for start in range(triton.cdiv(D, 32)):
+                    d = start * 32 + tl.arange(0, 32)
+                    q = tl.load(
+                        Q + t * Q0 + h[:, None] * Q1 + d[None, :] * Q2,
+                        mask=(h[:, None] < H) & (d[None, :] < D),
+                        other=0,
+                    )
+                    # Flat gather avoids the backend's strided 2D DMA lowering.
+                    f = tl.arange(0, BN * 32)
+                    jj = tile * BN + f // 32
+                    pp, vv = _metadata(
+                        BT, R, POS, LEN, t, jj, NR, NL, NC, BS, NP, B0, B1, R0, P0, L0
+                    )
+                    vv = vv & ((pp < NSP) if HAS_KS else True)
+                    pp = tl.where(vv, pp, 0)
+                    dd = start * 32 + f % 32
+                    off = (
+                        pp * K0
+                        + tl.where(vv, jj % BS, 0).to(tl.int64) * K1
+                        + dd.to(tl.int64) * K2
+                    )
+                    k = tl.load(K + off, mask=vv & (dd < D), other=0).reshape(BN, 32)
+                    acc += tl.dot(q, tl.trans(k))
+                dots = acc.to(tl.float32)
+            else:
+                # General floating/mixed input path: exact FP32 vector products, with
+                # scales applied after the reduction just as in the INT8 path.
+                dots = tl.full((BH, BN), 0, tl.float32)
+                for d in range(D):
+                    q = tl.load(Q + t * Q0 + h * Q1 + d * Q2, h < H, other=0).to(
+                        tl.float32
+                    )
+                    off = (
+                        page * K0
+                        + tl.where(valid, j % BS, 0).to(tl.int64) * K1
+                        + d * K2
+                    )
+                    k = tl.load(K + off, valid, other=0).to(tl.float32)
+                    dots = dots + q[:, None] * k[None, :]
+            if HAS_QS:
+                qs = tl.load(QS + t * QS0 + h * QS1, h < H, other=0).to(tl.float32)
+                dots = dots * qs[:, None]
+            if HAS_KS:
+                ks = tl.load(
+                    KS + page * S0 + tl.where(valid, j % BS, 0).to(tl.int64) * S1,
+                    valid,
+                    other=0,
+                ).to(tl.float32)
+                dots = dots * ks[None, :]
+            weight = tl.load(W + t * W0 + h * W1, h < H, other=0).to(tl.float32)
+            scores = tl.sum(tl.maximum(dots, 0) * weight[:, None], axis=0)
+            tl.store(S + t * CAP + j, tl.where(valid, scores, -float("inf")), j < CAP)
         else:
-            # General floating/mixed input path: exact FP32 vector products, with
-            # scales applied after the reduction just as in the INT8 path.
-            dots = tl.full((BH, BN), 0, tl.float32)
-            for d in range(D):
-                q = tl.load(Q + t * Q0 + h * Q1 + d * Q2, h < H, other=0).to(tl.float32)
-                off = page * K0 + tl.where(valid, j % BS, 0).to(tl.int64) * K1 + d * K2
-                k = tl.load(K + off, valid, other=0).to(tl.float32)
-                dots = dots + q[:, None] * k[None, :]
-        if HAS_QS:
-            qs = tl.load(QS + t * QS0 + h * QS1, h < H, other=0).to(tl.float32)
-            dots = dots * qs[:, None]
-        if HAS_KS:
-            ks = tl.load(
-                KS + page * S0 + tl.where(valid, j % BS, 0).to(tl.int64) * S1,
-                valid,
-                other=0,
-            ).to(tl.float32)
-            dots = dots * ks[None, :]
-        weight = tl.load(W + t * W0 + h * W1, h < H, other=0).to(tl.float32)
-        scores = tl.sum(tl.maximum(dots, 0) * weight[:, None], axis=0)
-        tl.store(S + t * CAP + j, tl.where(valid, scores, -float("inf")), j < CAP)
+            tl.store(S + t * CAP + j, -float("inf"), j < CAP)
 
 
 @triton.jit
@@ -238,7 +254,23 @@ def _merge(V, I, OV, OI, P: tl.constexpr, NS, OS, START):
     source = seg * 2 * P + r
     value = tl.load(V + t * NS * P + source, source < NS * P, other=-float("inf"))
     index = tl.load(I + t * NS * P + source, source < NS * P, other=2147483647)
-    value, index = _paired_sort(value, index, 2 * P)
+    # Keep global reads contiguous, then form the bitonic sequence on chip.
+    reverse = tl.where(r < P, r, 3 * P - 1 - r)
+    value = tl.gather(value, reverse, axis=0)
+    index = tl.gather(index.to(tl.float32, bitcast=True), reverse, axis=0).to(
+        tl.int32, bitcast=True
+    )
+    for step in tl.static_range((2 * P).bit_length() - 2, -1, -1):
+        partner = r ^ (1 << step)
+        v = tl.gather(value, partner, axis=0)
+        i = tl.gather(index.to(tl.float32, bitcast=True), partner, axis=0).to(
+            tl.int32, bitcast=True
+        )
+        better = (v > value) | ((v == value) & (i < index))
+        lower = (r & (1 << step)) == 0
+        take = tl.where(lower, better, ~better)
+        value = tl.where(take, v, value)
+        index = tl.where(take, i, index)
     tl.store(OV + (t * OS + seg) * P + r, value, r < P)
     tl.store(OI + (t * OS + seg) * P + r, index, r < P)
 
