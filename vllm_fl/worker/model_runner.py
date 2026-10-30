@@ -545,10 +545,8 @@ class ModelRunnerFL(GPUModelRunner):
             self._ascend_attn_state = None
         if self.use_compress:
             if self.speculative_config is not None:
-                raise NotImplementedError(
-                    "FL Ascend DeepSeek-V4 compressed DSA does not support "
-                    "MTP/speculative decoding yet."
-                )
+                from vllm_fl.spec_decode.dsv4_mtp_utils import validate_dsv4_mtp_config
+                validate_dsv4_mtp_config(self.vllm_config)
             from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
                 get_ascend_config,
             )
@@ -742,6 +740,9 @@ class ModelRunnerFL(GPUModelRunner):
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.use_compress and self.speculative_config.method == "mtp":
+                from vllm_fl.spec_decode.dsv4_mtp import Dsv4MTPProposer
+                self.drafter = Dsv4MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -762,7 +763,11 @@ class ModelRunnerFL(GPUModelRunner):
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RejectionSampler(
+            sampler_cls = RejectionSampler
+            if self.use_compress:
+                from vllm_fl.spec_decode.dsv4_mtp import Dsv4GreedyRejectionSampler
+                sampler_cls = Dsv4GreedyRejectionSampler
+            self.rejection_sampler = sampler_cls(
                 self.sampler, self.speculative_config, self.device
             )
 
@@ -866,6 +871,11 @@ class ModelRunnerFL(GPUModelRunner):
         # DSA metadata consumes host positions while its device-side RoPE path
         # consumes ``self.positions``.  The pinned buffer is populated during
         # scheduling and never inferred back from device tensors.
+        # DSv4's host compressor planner needs actual accepted lengths. These
+        # private snapshots never replace the scheduler's optimistic counters.
+        self._dsv4_async_prev_computed_cpu: np.ndarray | None = None
+        self._dsv4_async_seq_lens_cpu: torch.Tensor | None = None
+        self._dsv4_async_computed_cpu: torch.Tensor | None = None
         self._dsa_positions_cpu_buf: torch.Tensor | None = None
         self._dsa_positions_np_buf: np.ndarray | None = None
         if self.use_compress:
@@ -1091,6 +1101,20 @@ class ModelRunnerFL(GPUModelRunner):
                     device="cpu",
                     pin_memory=self.pin_memory,
                 )
+
+        # Cache only completed DSv4 async-MTP count snapshots. Other models
+        # retain the original getter, including its fresh-list return contract.
+        self._mtp_count_list_cache_enabled = False
+        if (self.use_compress and self.use_async_spec_decode
+                and getattr(self.speculative_config, "method", None) == "mtp"
+                and (self.vllm_config.additional_config or {}).get("enable_dsv4_mtp", False)):
+            import os
+            flag = os.getenv("MTP_COUNT_LIST_CACHE", "1")
+            if flag not in ("0", "1"):
+                raise ValueError("MTP_COUNT_LIST_CACHE must be 0 or 1")
+            self._mtp_count_list_cache_enabled = flag == "1"
+        self._mtp_count_list_generation = 0
+        self._mtp_count_list_snapshot = None
 
         # Model weight offloader
         # Make sure this is called before any get_offloader call
@@ -1960,6 +1984,34 @@ class ModelRunnerFL(GPUModelRunner):
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
 
+    def _prepare_dsv4_async_host_metadata(self, num_reqs, num_scheduled_tokens):
+        if not (self.use_compress and self.use_async_spec_decode):
+            return
+        from vllm_fl.spec_decode.dsv4_mtp_utils import (
+            prepare_async_dsv4_host_metadata,
+        )
+        counts = None
+        if (self.valid_sampled_token_count_gpu is not None
+                and self.input_batch.prev_req_id_to_index):
+            # Reuse vLLM's existing acceptance-count D2H event. Do not read
+            # pending buffers or issue a device-wide synchronization.
+            counts = self._get_valid_sampled_token_count()
+            if not counts:
+                raise RuntimeError("DSv4 async MTP acceptance counts are not ready")
+        computed, lengths, positions = prepare_async_dsv4_host_metadata(
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            num_scheduled_tokens,
+            self.prev_positions.np[:num_reqs],
+            counts,
+            self.prev_num_draft_tokens.np,
+            self._dsv4_async_prev_computed_cpu,
+        )
+        self._dsv4_async_prev_computed_cpu = computed.copy()
+        self._dsv4_async_computed_cpu = torch.from_numpy(computed)
+        self._dsv4_async_seq_lens_cpu = torch.from_numpy(lengths)
+        assert self._dsa_positions_np_buf is not None
+        np.copyto(self._dsa_positions_np_buf[:len(positions)], positions)
+
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2321,6 +2373,7 @@ class ModelRunnerFL(GPUModelRunner):
         # Used for gathering from previous iteration's GPU tensors.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         self._compute_prev_positions(num_reqs)
+        self._prepare_dsv4_async_host_metadata(num_reqs, num_scheduled_tokens)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -2704,6 +2757,17 @@ class ModelRunnerFL(GPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+            if self.use_compress and num_scheduled_tokens is not None:
+                # Real target batches only. Capture/idle dummy calls must keep
+                # their independent sentinel metadata and never consume these.
+                assert self._dsv4_async_seq_lens_cpu is not None
+                assert self._dsv4_async_computed_cpu is not None
+                seq_lens_cpu = torch.zeros(num_reqs_padded, dtype=torch.int32)
+                num_computed_tokens_cpu = torch.zeros_like(seq_lens_cpu)
+                seq_lens_cpu[:num_reqs].copy_(self._dsv4_async_seq_lens_cpu[:num_reqs])
+                num_computed_tokens_cpu[:num_reqs].copy_(
+                    self._dsv4_async_computed_cpu[:num_reqs])
+
         # Compute mm_prefix bidirectional ranges before building
         # attention metadata so builders handle them during build().
         # Ranges exceeding sliding_window are skipped to prevent
@@ -2773,6 +2837,15 @@ class ModelRunnerFL(GPUModelRunner):
             if self.use_compress:
                 assert self._dsa_positions_cpu_buf is not None
                 cm_base.positions_cpu = self._dsa_positions_cpu_buf
+                if self.use_async_spec_decode and num_scheduled_tokens is not None:
+                    cm_base.seq_lens_cpu = seq_lens_cpu
+                    cm_base.num_computed_tokens_cpu = num_computed_tokens_cpu
+        if getattr(self.model_config, "rswa_window", None) is not None:
+            # Retain the complete prompt across prefill chunks and request reorder.
+            # Padded request rows must never inherit a stale prompt length.
+            cm_base.rswa_num_actual_reqs = num_reqs
+            cm_base.rswa_prefix_lens = num_prompt_tokens_cpu.clone()
+            cm_base.rswa_prefix_lens[num_reqs:] = 0
         self._set_ascend_common_attention_state(cm_base, ascend_attn_state)
 
         if self.dcp_world_size > 1:
@@ -3972,6 +4045,19 @@ class ModelRunnerFL(GPUModelRunner):
                 if batch_desc_num_reqs is not None
                 else num_reqs
             )
+
+        if (
+            getattr(self.model_config, "rswa_window", None) is not None
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and self.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.uniform_decode_query_len == 1
+        ):
+            # R-SWA replay copies masks into capture-time buffers. Keep one
+            # request per token in every decode bucket, matching capture B;
+            # merging all padding into one request would change the mask and
+            # block-table shapes (e.g. five real rows plus one dummy vs B=8).
+            num_reqs_padded = num_tokens_padded
 
         if (
             num_tokens_padded
@@ -5431,6 +5517,19 @@ class ModelRunnerFL(GPUModelRunner):
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
+                if (not input_fits_in_drafter and self.use_compress
+                        and spec_config.method == "mtp"
+                        and self.parallel_config.data_parallel_size > 1):
+                    # Other DP ranks may still propose. Let the drafter select
+                    # its matching default or prepared communication schedule
+                    # and K dummy forwards without real attention/KV writes.
+                    draft_steps = scheduler_output.num_spec_tokens_to_schedule
+                    if not 1 <= draft_steps <= 3:
+                        raise ValueError("DSv4 MTP dummy steps require K1..3")
+                    self.drafter.num_speculative_tokens = draft_steps
+                    self.drafter.dummy_run(
+                        1, use_cudagraphs=False, is_graph_capturing=False,
+                        slot_mappings=slot_mappings)
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
@@ -5704,6 +5803,11 @@ class ModelRunnerFL(GPUModelRunner):
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
+        if self._mtp_count_list_cache_enabled:
+            # Invalidate before any copy/record, including the no-event case.
+            # Re-recording the same event object starts a new generation.
+            self._mtp_count_list_generation += 1
+            self._mtp_count_list_snapshot = None
         if self.valid_sampled_token_count_event is None:
             return
 
@@ -5724,6 +5828,8 @@ class ModelRunnerFL(GPUModelRunner):
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
+        if self._mtp_count_list_cache_enabled:
+            return self._get_mtp_count_list_snapshot()
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
@@ -5734,6 +5840,34 @@ class ModelRunnerFL(GPUModelRunner):
         assert counts_cpu is not None
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+
+    def _get_mtp_count_list_snapshot(self) -> list[int]:
+        """Reuse a completed count generation, without sharing a mutable list."""
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        sampled_count_event = self.valid_sampled_token_count_event
+        if sampled_count_event is None or prev_sampled_token_ids is None:
+            self._mtp_count_list_snapshot = None
+            return []
+
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        rows = prev_sampled_token_ids.shape[0]
+        generation = self._mtp_count_list_generation
+        snapshot = self._mtp_count_list_snapshot
+        if (snapshot is not None and snapshot[0] == generation
+                and snapshot[1] is sampled_count_event
+                and snapshot[2] is counts_cpu
+                and snapshot[3] is prev_sampled_token_ids
+                and snapshot[4] == rows):
+            return snapshot[5].copy()
+
+        # The first read of this generation still waits for its own D2H.
+        sampled_count_event.synchronize()
+        counts = counts_cpu[:rows].tolist()
+        self._mtp_count_list_snapshot = (
+            generation, sampled_count_event, counts_cpu,
+            prev_sampled_token_ids, rows, counts)
+        return counts.copy()
 
     def _get_spec_decode_draft_probs(
         self, spec_decode_metadata: SpecDecodeMetadata

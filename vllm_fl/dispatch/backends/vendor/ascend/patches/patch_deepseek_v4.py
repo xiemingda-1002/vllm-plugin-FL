@@ -2,3 +2,4 @@
 def apply_deepseek_v4_patches() -> None:
     from vllm import ModelRegistry
     ModelRegistry.register_model("DeepseekV4ForCausalLM", "vllm_fl.models.deepseek_v4:AscendDeepseekV4ForCausalLM")
+    ModelRegistry.register_model("DeepSeekV4MTPModel", "vllm_fl.models.deepseek_v4_mtp:AscendDeepSeekV4MTP")

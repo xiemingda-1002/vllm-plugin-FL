@@ -1,4 +1,4 @@
-"""Ascend-only DeepSeek-V4 non-MTP KV-cache planning and coordination.
+"""Ascend-only DeepSeek-V4 KV-cache planning and coordination.
 
 This is the current vLLM-Ascend 0.24 non-packed closure.  vLLM's default
 DeepSeek-V4 planner uses a packed tensor with ``block_stride``; FL's NPU model
@@ -230,7 +230,7 @@ def group_and_unify_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
 
 
 def _get_kv_cache_groups_uniform_groups(grouped_specs):
-    """rc1 DeepSeek-V4 group construction, excluding the out-of-scope MTP path."""
+    """rc1 DeepSeek-V4 group construction, including SWA-only MTP layers."""
     from vllm.utils.math_utils import round_up
     from vllm.v1.core.kv_cache_utils import _approximate_gcd
 
@@ -266,29 +266,38 @@ def _get_kv_cache_groups_uniform_groups(grouped_specs):
 def _get_kv_cache_config_non_packed(vllm_config, kv_cache_groups: list[KVCacheGroupSpec],
                                     available_memory: int):
     """rc1 DeepSeek-V4 layout: independent tensors, never ``block_stride``."""
-    if any("mtp" in name.lower() for group in kv_cache_groups for name in group.layer_names):
-        raise NotImplementedError("Ascend DeepSeek-V4 MTP KV-cache planning is not supported")
     full = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full.get_page_sizes())
     buckets: list[dict[int, list[str]]] = []
+    mtp_layers: list[tuple[str, int]] = []
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         bucket: dict[int, list[str]] = defaultdict(list)
         specs = group.kv_cache_spec.kv_cache_specs
         for name in group.layer_names:
-            bucket[specs[name].page_size_bytes].append(name)
+            if "mtp" in name.lower():
+                # Draft and target can write the same logical block index in
+                # one iteration. They must never share physical tensor storage.
+                mtp_layers.append((name, specs[name].page_size_bytes))
+            else:
+                bucket[specs[name].page_size_bytes].append(name)
         buckets.append(bucket)
+    if mtp_layers:
+        from vllm_fl.spec_decode.dsv4_mtp_utils import validate_dsv4_mtp_config
+        validate_dsv4_mtp_config(vllm_config)
     tuple_count = max(len(names) for bucket in buckets for names in bucket.values())
     bytes_per_tuple = sum(page_sizes)
-    num_blocks = may_override_num_blocks(
-        vllm_config, available_memory // (bytes_per_tuple * tuple_count))
+    bytes_per_block = bytes_per_tuple * tuple_count + sum(size for _, size in mtp_layers)
+    num_blocks = may_override_num_blocks(vllm_config, available_memory // bytes_per_block)
     tensors = []
     for index in range(tuple_count):
         for page_size in page_sizes:
             shared_by = [names[index] for bucket in buckets
                          if (names := bucket.get(page_size)) is not None and index < len(names)]
             tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by))
+    for name, page_size in mtp_layers:
+        tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=[name]))
     return num_blocks, tensors
 
 

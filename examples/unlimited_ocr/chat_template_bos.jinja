@@ -1,0 +1,16 @@
+{{- bos_token }}
+{%- for message in messages %}
+    {%- if message['content'] is string %}
+        {{- message['content'] }}
+    {%- else %}
+        {%- for content in message['content'] | selectattr('type', 'equalto', 'image') %}
+            {{- '<image>' }}
+        {%- endfor %}
+        {%- for content in message['content'] | selectattr('type', 'equalto', 'text') %}
+            {{- content['text'] }}
+        {%- endfor %}
+    {%- endif %}
+    {%- if message['role'] == 'assistant' %}
+        {{- eos_token }}
+    {%- endif %}
+{%- endfor %}

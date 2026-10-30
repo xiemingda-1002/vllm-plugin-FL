@@ -1,0 +1,98 @@
+{
+  "vllm_base_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+  "fl_base_commit": "7e68bd246bffa3be5d77e56c556a9876e61ba04b",
+  "core_files": [
+    {
+      "path": "vllm/model_executor/models/unlimited_ocr.py",
+      "before_sha256": null,
+      "after_sha256": "2e27b2bc2c4b4de317b34eb1973f3942aa685a9f675542cd23e55f3c4520007c"
+    },
+    {
+      "path": "vllm/transformers_utils/configs/unlimited_ocr.py",
+      "before_sha256": null,
+      "after_sha256": "4aae6ffdd795e2962bffa3c980d83842e155beca0b155e531932e03232396cc7"
+    },
+    {
+      "path": "vllm/transformers_utils/processors/unlimited_ocr.py",
+      "before_sha256": null,
+      "after_sha256": "497c4e826e74ab59d7f9d2765a0fc391985f4214aaebaed866c897497173f769"
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/rswa_attention.py",
+      "before_sha256": null,
+      "after_sha256": "252d4f6c32a8f9d1ae74ed83ad0c8c23a13daf7dd6f3b2893708952b46796234"
+    },
+    {
+      "path": "vllm/model_executor/models/registry.py",
+      "before_sha256": "ab52495073a046b79d00a314cbc96e719e3ed916ea8a8bf6f3202015062b5676",
+      "after_sha256": "3f4f3a909d06cf65cdd48a167e555dfe51cf8fb9b0bf4ecde0bacc9aca8b0b5b"
+    },
+    {
+      "path": "vllm/transformers_utils/configs/__init__.py",
+      "before_sha256": "08afc6008f98a3139fa13fb63e32120ced12215dc47f9a62250685ea34e1ad7d",
+      "after_sha256": "a0b3583bfd21cc9c45a2052988c8cacc554c5a0f8eaf48868615cfab3c705277"
+    },
+    {
+      "path": "vllm/transformers_utils/config.py",
+      "before_sha256": "7f35941f6041206be01c599c4372fe94112100b0ccbfa73e743c659a485e071f",
+      "after_sha256": "dee08695d41cfd34faa80941826d5da95ee9ca8013f44a9e71deca6f442c06c5"
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_ocr.py",
+      "before_sha256": "ca5a32905c1a77b8ce41bc483012eb9a5ab1e6a6833f9a5c71663a28c8e17bc5",
+      "after_sha256": "420bfdc18d87d4174ce69e6ebbe1a6121c23a7fcdcb5b60ff6fbc901d843f27f"
+    },
+    {
+      "path": "vllm/transformers_utils/processors/deepseek_ocr.py",
+      "before_sha256": "c7404313e1e1cd0bfb5c2689d7dcce2b4c038e47e4f8cf5f99feaed3d957f387",
+      "after_sha256": "40385e4d11a406c7a3a274d2a2040d88a43c66353d3a90bf41bdf4ea8fb655aa"
+    },
+    {
+      "path": "vllm/transformers_utils/model_arch_config_convertor.py",
+      "before_sha256": "0bf103375c48adab1b3182fbcc1158c02cc71601e363fa42e9c8b42cc0aba96e",
+      "after_sha256": "e1480bc059124cd983bf265e4a66ab6ac671968cc0a5fc26290e3fb76f00d393"
+    },
+    {
+      "path": "vllm/config/model.py",
+      "before_sha256": "371d932b54f0bf2f3ebf6bee468ff9804b05110de55a6cda7edf240bea5da8c6",
+      "after_sha256": "86c6509fab529270043aa04aa8e97e2848658897524ba13a8984d6bf2d526000"
+    },
+    {
+      "path": "vllm/v1/attention/backend.py",
+      "before_sha256": "c524988a2223ec556bdb128a31c255075f0d07e7643e803b447975cd9c30a6b8",
+      "after_sha256": "fee9872460fd43b4a44e3fb28e3354ece15dbc3bd5430a1196ad703ab635a8c2"
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "before_sha256": "d2b8ec101122749e1a2610383d2ab74c5a21605e9d7995eb68192bc769986694",
+      "after_sha256": "eef68f50e7aaf05c89ce4d5278b57349eaadf254cfa878d150d3c490febda375"
+    },
+    {
+      "path": "vllm/v1/kv_cache_interface.py",
+      "before_sha256": "7e3c220998267190a622e216b2b125306807cf8be3ec1e9a8e84fe6e7a293003",
+      "after_sha256": "550d8dc226bd387df312d7c10f291c03e7bb507d5c1672235ead108a44a66856"
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/__init__.py",
+      "before_sha256": "ce20d1e8ca915634dabb27ab4ea5c147ea54edf8d36226b431c5e3ae291545db",
+      "after_sha256": "4585ca7b17cd006389c87d8cb2ac3635eefc36149884e246f820d0aee8096566"
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v2.py",
+      "before_sha256": "c580e5c53398820fed8177ede091578c8e07706089fde15094dc5265dcb30c9f",
+      "after_sha256": "e7cd542b36a8d182d985d1d82f99fccd0fdf624a701ef6e87f181b10da756714"
+    },
+    {
+      "path": "vllm/model_executor/models/config.py",
+      "before_sha256": "6f812bebdd0ffdd82bfe237971efd6614cfa22197e345c63e86a5564bc6f1333",
+      "after_sha256": "2cfe98c7d6ae30108c123b5a6b832ea2a9366f91471f8f39a1cfaa94f781b743"
+    },
+    {
+      "path": "vllm/tokenizers/registry.py",
+      "before_sha256": "4e49af61e314f9afcedc61a58c53ff3fe7141603b07351db9b99bbbce9ebd687",
+      "after_sha256": "2ffc101eb44a05ebd9482d32a4afb0fcc1d3796ce9286dcee8ca2f4029176258"
+    }
+  ],
+  "patch_sha256": "ce4d52ad5f481e3b355646e22e7e3bc6e08a48bfb6f173c38f51e82efba02840",
+  "ocr_source_commit": "d4f94d5e30773e85fd8a1c43349bae07c7d02a77"
+}

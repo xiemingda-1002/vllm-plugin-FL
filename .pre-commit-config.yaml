@@ -21,6 +21,8 @@ repos:
     -   id: detect-private-key
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
+        # Unified diff context lines can contain a single trailing space.
+        exclude: ^patches/unlimited_ocr/.*\.patch$
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.14.0
   hooks:
