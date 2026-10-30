@@ -41,6 +41,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_fl.dispatch import CachedOp
@@ -50,6 +51,9 @@ from vllm_fl.ops.fused_moe.layer import FusedMoEFL
 from vllm_fl.ops.layernorm import RMSNormFL as RMSNorm
 
 _compressor = CachedOp("deepseek_v4_compressor")
+_project = CachedOp("deepseek_v4_project")
+_save_state = CachedOp("deepseek_v4_save_state")
+_compress = CachedOp("deepseek_v4_compress")
 _hc_pre = CachedOp("deepseek_v4_hc_pre")
 _hc_post = CachedOp("deepseek_v4_hc_post")
 _hc_head = CachedOp("deepseek_v4_hc_head")
@@ -76,6 +80,12 @@ class DeepseekV4Compressor(nn.Module):
         if compress_ratio not in (4, 128):
             raise ValueError("Compression ratio must be 4 or 128")
         self.compress_ratio = compress_ratio
+        # Select once during construction so non-Ascend backends retain their
+        # existing dispatch surface without tracing a platform query.
+        self._use_ascend_compressor = (
+            current_platform.device_type == "npu"
+            and getattr(current_platform, "vendor_name", "ascend") == "ascend"
+        )
         self.norm_eps = rms_eps
         coff = 2 if compress_ratio == 4 else 1
         self.ape = nn.Parameter(
@@ -107,6 +117,28 @@ class DeepseekV4Compressor(nn.Module):
         output_positions,
         cos_sin_cache,
     ):
+        if not self._use_ascend_compressor:
+            kv, gate = _project(x, self.wkv.weight, self.wgate.weight)
+            _save_state(
+                kv,
+                gate,
+                self.ape,
+                positions,
+                slot_mapping,
+                state_cache,
+                self.compress_ratio,
+            )
+            return _compress(
+                state_cache,
+                state_block_table,
+                output_request_ids,
+                output_positions,
+                self.norm.weight,
+                cos_sin_cache,
+                compress_ratio=self.compress_ratio,
+                rms_eps=self.norm_eps,
+                output_dtype=x.dtype,
+            )
         return _compressor(
             x,
             self.wkv.weight,

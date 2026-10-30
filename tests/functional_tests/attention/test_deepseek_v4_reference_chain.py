@@ -798,3 +798,41 @@ def test_full_compressor_actual_shared_parent_high_pages():
         )
         del args, wide, output
     del parent
+
+
+@pytest.mark.parametrize("n,hidden,ratio,dim", [(10, 4096, 128, 512), (17, 65, 4, 5)])
+def test_full_compressor_projection_tail_and_slot_masks(n, hidden, ratio, dim):
+    # Place the activation at the end of its backing storage. A padded Cube
+    # row must not be loaded merely because it is later masked before the dot.
+    generator = torch.Generator().manual_seed(10030)
+    coff = 2 if ratio == 4 else 1
+    x = (torch.randn(n, hidden, generator=generator) * 0.03).bfloat16()
+    x[3].fill_(torch.nan)
+    wkv = (torch.randn(coff * dim, hidden, generator=generator) * 0.03).bfloat16()
+    wgate = (torch.randn(coff * dim, hidden, generator=generator) * 0.03).bfloat16()
+    ape = torch.randn(ratio, coff * dim, generator=generator) * 0.01
+    positions = torch.arange(n)
+    slots = positions.clone()
+    slots[3], slots[5] = -1, 2**40
+    empty = torch.empty(0, dtype=torch.int64)
+    cpu = [
+        x,
+        wkv,
+        wgate,
+        ape,
+        torch.full((4, 8, 2 * coff * dim), 7.125),
+        positions,
+        slots,
+        torch.tensor([[0, 1, 2, 3]]),
+        empty,
+        empty,
+        torch.ones(dim),
+        torch.empty(32, 0),
+        ratio,
+    ]
+    args = _full_to_device(cpu)
+    backing = torch.empty(16 * 1024 * 1024, dtype=x.dtype, device="npu")
+    args[0] = backing[-n * hidden :].view(n, hidden)
+    args[0].copy_(x)
+    assert args[0].storage_offset() + args[0].numel() == backing.numel()
+    assert _check_full_compressor(args).shape == (0, dim)

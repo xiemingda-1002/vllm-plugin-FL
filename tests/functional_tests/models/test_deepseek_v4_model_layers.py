@@ -239,6 +239,52 @@ def test_compressor_actual_module_prefill_decode(ratio, chunked):
     torch.testing.assert_close(state.cpu(), expected_state)
 
 
+@pytest.mark.parametrize("device_type,ratio", [("cpu", 4), ("cuda", 128)])
+def test_non_ascend_compressor_keeps_legacy_dispatch(monkeypatch, device_type, ratio):
+    # Emulate platform selection, while using the available NPU tensors to
+    # verify the unchanged legacy math. This is not a GPU execution test.
+    from types import SimpleNamespace
+
+    from vllm_fl.models import deepseek_v4 as model
+
+    monkeypatch.setattr(
+        model,
+        "current_platform",
+        SimpleNamespace(device_type=device_type, vendor_name=device_type),
+    )
+    module = _compressor(ratio)
+    assert not module._use_ascend_compressor
+    calls = []
+
+    def record(name, original):
+        def wrapped(*args, **kwargs):
+            calls.append(name)
+            return original(*args, **kwargs)
+
+        return wrapped
+
+    for name in ("project", "save_state", "compress"):
+        monkeypatch.setattr(model, "_" + name, record(name, getattr(model, "_" + name)))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Non-Ascend model required the Ascend-only Compressor entry")
+
+    monkeypatch.setattr(model, "_compressor", forbidden)
+    x = _data((ratio, 8), 0.04, torch.bfloat16)
+    positions = torch.arange(ratio, device="npu")
+    state = torch.zeros(1, ratio, 4 * (2 if ratio == 4 else 1) * 2, device="npu")
+    table = torch.zeros((1, 1), dtype=torch.int32, device="npu")
+    ends = torch.tensor([ratio - 1], device="npu")
+    angle = torch.arange(ratio, device="npu").float() * 0.013
+    rope = torch.stack([angle.cos(), angle.sin()], -1)
+    output = module(
+        x, positions, positions, state, table, torch.zeros_like(ends), ends, rope
+    )
+    expected = _compression_oracle(module, x, [ratio - 1], ratio, rope)
+    torch.testing.assert_close(output, expected, rtol=0.01, atol=0.01)
+    assert calls == ["project", "save_state", "compress"]
+
+
 def test_full_compressor_fake_has_no_kernel_launch(monkeypatch):
     from torch._subclasses.fake_tensor import FakeTensorMode
     from triton.runtime.jit import JITFunction

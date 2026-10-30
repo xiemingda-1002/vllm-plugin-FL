@@ -99,9 +99,13 @@ def _project_cube(
             h = (start * BK + tl.arange(0, BK)).to(tl.int64)
             x = tl.load(
                 X + m[:, None] * X0 + h[None, :] * X1,
-                valid[:, None] & (h[None, :] < H),
+                (m[:, None] < N) & (h[None, :] < H),
                 other=0,
             )
+            # Keep the memory bounds rectangular. Combining the runtime slot
+            # mask here makes Ascend lower a tail tile to a full BM-row copy
+            # followed by a select, which reads beyond the input allocation.
+            x = tl.where(valid[:, None], x, 0)
             w = tl.load(
                 W + c[:, None] * W0 + h[None, :] * W1,
                 (c[:, None] < C) & (h[None, :] < H),
