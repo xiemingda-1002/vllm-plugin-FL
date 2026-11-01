@@ -40,15 +40,21 @@ def load_function(path, name, class_name=None):
     return namespace[name]
 
 
-normalize = load_function("dispatch/backends/vendor/ascend/impl/attention/attention.py", "_rswa_mask_request_lengths")
+normalize = load_function(
+    "dispatch/backends/vendor/ascend/impl/attention/attention.py",
+    "_rswa_mask_request_lengths",
+)
 unpadded = load_function(
-    "dispatch/backends/vendor/ascend/impl/attention/utils.py", "unpadded", "AscendCommonAttentionMetadata"
+    "dispatch/backends/vendor/ascend/impl/attention/utils.py",
+    "unpadded",
+    "AscendCommonAttentionMetadata",
 )
 pad_query_starts = load_function(
     "worker/model_runner.py", "_pad_query_start_loc_for_fia", "ModelRunnerFL"
 )
 spec = importlib.util.spec_from_file_location(
-    "rswa_standard_mask", ROOT / "dispatch/backends/vendor/ascend/impl/attention/standard_mask.py"
+    "rswa_standard_mask",
+    ROOT / "dispatch/backends/vendor/ascend/impl/attention/standard_mask.py",
 )
 mask_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mask_module)

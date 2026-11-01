@@ -194,8 +194,10 @@ def export_metrics(output, summary, native_result, pages):
     coverage = summary["coverage"]
     table += [
         "",
-        f"Coverage: {coverage['selected_pages']}/{coverage['dataset_pages']}; "
-        f"empty Markdown retained: {coverage['empty_markdown']}.",
+        (
+            f"Coverage: {coverage['selected_pages']}/{coverage['dataset_pages']}; "
+            f"empty Markdown retained: {coverage['empty_markdown']}."
+        ),
         "CDM/TEDS/TEDS-S/Overall use 0–100; Edit uses 0–1. Reading order and TEDS-S do not enter Overall.",
         "Run status: " + json.dumps(coverage["run_status"], ensure_ascii=False),
         summary["comparison_note"],
