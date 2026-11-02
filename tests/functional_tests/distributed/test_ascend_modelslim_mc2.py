@@ -53,6 +53,7 @@ from vllm_fl.dispatch.backends.vendor.ascend.impl.w8a8_moe import (
     modelslim_w8a8_experts,
     modelslim_w8a8_prepare_experts,
 )
+from vllm_fl.distributed.device_communicators.npu_moe_runtime import NpuMoERuntime
 from vllm_fl.forward_context import set_forward_context
 from vllm_fl.ops.fused_moe.prepare_finalize import NpuMoEPrepareAndFinalize
 from vllm_fl.quantization.w8a8.modelslim import AscendModelSlimMoEMethod
@@ -103,6 +104,19 @@ def test_dynamic_experts_mc2_and_alltoall():
             init_workspace_manager(torch.device(f"npu:{LOCAL_RANK}"))
             ep, dp, tp = get_ep_group(), get_dp_group(), get_tp_group()
             assert (ep.world_size, dp.world_size, tp.world_size) == (16, 2, 8)
+            for option, value in (("enable_dbo", True), ("ubatch_size", 2)):
+                previous = getattr(config.parallel_config, option)
+                setattr(config.parallel_config, option, value)
+                try:
+                    with pytest.raises(NotImplementedError, match="DBO or ubatching"):
+                        NpuMoERuntime(
+                            ep.device_communicator,
+                            config,
+                            torch.device(f"npu:{LOCAL_RANK}"),
+                        )
+                    assert ep.device_communicator.moe_runtime is None
+                finally:
+                    setattr(config.parallel_config, option, previous)
             # DP assignments can map a logical local ordinal to another NPU.
             # A coordinator's logical device must not own model-side buffers.
             coordinator_device = ep.device_communicator.device

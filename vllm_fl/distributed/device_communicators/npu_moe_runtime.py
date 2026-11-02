@@ -39,6 +39,10 @@ class NpuMoERuntime:
     def __init__(self, communicator, config, device):
         from vllm.distributed import get_tp_group
 
+        if config.parallel_config.use_ubatching:
+            raise NotImplementedError(
+                "NPU MoE communication does not support DBO or ubatching"
+            )
         self.tp_group = get_tp_group()
         self.device = torch.device(device)
         if self.device.type != "npu" or self.device.index != torch.npu.current_device():
