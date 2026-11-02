@@ -33,6 +33,7 @@ from vllm_fl.compilation.graph_runtime import (
 )
 
 logger = init_logger(__name__)
+graph_replay_logger = init_logger("vllm.fl_graph_replay")
 
 
 # FL-specific: platform-agnostic weak_ref_tensors
@@ -156,6 +157,9 @@ class GraphWrapper:
         self.graph_runtime = graph_runtime
 
         self.first_run_finished = False
+        self._logged_replay_batches = (
+            set() if (vllm_config.additional_config or {}).get("graph_replay_log", False) else None
+        )
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
@@ -317,4 +321,13 @@ class GraphWrapper:
             if self.graph_runtime is not None else nullcontext()
         ):
             entry.graph.replay()
+        if (
+            self._logged_replay_batches is not None
+            and batch_descriptor not in self._logged_replay_batches
+        ):
+            graph_replay_logger.info(
+                "FL graph replay completed: mode=%s, padded_tokens=%d",
+                self.runtime_mode, batch_descriptor.num_tokens,
+            )
+            self._logged_replay_batches.add(batch_descriptor)
         return entry.output

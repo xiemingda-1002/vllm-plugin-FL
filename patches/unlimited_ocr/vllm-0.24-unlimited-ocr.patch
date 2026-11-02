@@ -1,0 +1,716 @@
+--- /dev/null
++++ b/vllm/model_executor/models/unlimited_ocr.py
+@@ -0,0 +1,261 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Inference-only Unlimited-OCR model compatible with HuggingFace weights.
++
++Unlimited-OCR (``baidu/Unlimited-OCR``) shares
++the exact DeepSeek-OCR (gundam, ``base_size=1024`` / ``image_size=640`` / crop)
++vision stack: a DeepEncoder (SAM-ViT-B + CLIP-L) followed by a linear MLP
++projector, with the same image-token tiling layout. The only difference is the
++language backbone, which is a DeepSeek-V2 *MoE* (64 routed + 2 shared experts,
++``first_k_dense_replace=1``) that uses plain multi-head attention
++(``use_mla=False``, ``qk_nope_head_dim == qk_rope_head_dim == 0``) instead of
++the dense MLA decoder used by DeepSeek-OCR.
++
++vLLM's ``DeepseekV2DecoderLayer`` already dispatches to the plain-MHA
++``DeepseekAttention`` whenever ``qk_nope_head_dim == qk_rope_head_dim == 0`` and
++builds the MoE blocks straight from the config, so the whole DeepSeek-OCR
++multimodal wrapper can be reused verbatim. Model-specific config (language
++backbone architecture, FlexAttention for R-SWA, vision encoder backend, and
++``rswa_window``) is applied in ``UnlimitedOCRForCausalLMConfig``.
++
++Attention backend: this v0.24 backport uses the Ascend R-SWA backend. Prompt
++and image tokens form a globally visible prefix; generated tokens additionally
++attend only a fixed sliding window (128) of recent tokens. The window is exposed
++as ``model_config.rswa_window`` and original prompt lengths are propagated as
++``rswa_prefix_lens``. CUDA custom masks and decode-gap KV eviction from the
++reference are not included. The full KV cache is retained, so memory still
++grows with the total sequence length.
++
++To suppress repetition on long documents, use ``NGramPerReqLogitsProcessor`` from
++this module (same request-level processor as DeepSeek-OCR) with::
++
++    SamplingParams(
++        temperature=0.0,
++        max_tokens=8192,
++        extra_args={"ngram_size": 35, "window_size": 128},
++    )
++
++Image processing
++----------------
++Unlimited-OCR supports up to 32 local crops (vs 6 for DeepSeek-OCR), i.e.
++``dynamic_preprocess`` runs with ``max_num=32``.
++
++Multi-image requests fall back to non-crop mode: crop ("gundam") mode is only
++used for single-image input. DeepSeek-OCR does *not* have this restriction.
++
++Because that fallback makes the per-image processor output depend on *how many*
++images are in the request, it breaks the assumption behind vLLM's per-item
++multimodal processing cache (``MultiModalProcessorOnlyCache``). We handle this
++the same way ``DeepseekVL2MultiModalProcessor`` does: only the single-image case
++(which always crops) is cached, while multi-image requests bypass the cache and
++are recomputed fresh -- see ``_cached_apply_hf_processor`` below. This keeps the
++processing cache consistent (verified by ``test_processing_correctness``).
++"""
++
++import math
++from collections.abc import Mapping, Sequence
++
++from vllm.config import VllmConfig
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.multimodal.inputs import MultiModalKwargsItems
++from vllm.multimodal.parse import (
++    ImageEmbeddingItems,
++    ImageProcessorItems,
++    ImageSize,
++    MultiModalDataItems,
++)
++from vllm.multimodal.processing import PromptReplacement, PromptUpdate
++from vllm.multimodal.processing.context import TimingContext
++from vllm.multimodal.processing.inputs import ProcessorInputs
++from vllm.multimodal.processing.processor import MultiModalProcessingInfo
++from vllm.transformers_utils.processors.deepseek_ocr import (
++    BASE_SIZE,
++    CROP_MODE,
++    IMAGE_SIZE,
++    count_tiles,
++)
++
++from .deepseek_ocr import (
++    DeepseekOCRDummyInputsBuilder,
++    DeepseekOCRForCausalLM,
++    DeepseekOCRMultiModalProcessor,
++    DeepseekOCRProcessingInfo,
++    NGramPerReqLogitsProcessor,
++)
++
++__all__ = [
++    "NGramPerReqLogitsProcessor",
++    "UnlimitedOCRForCausalLM",
++]
++
++# Unlimited-OCR supports up to 32 local crops (vs 6 for DeepSeek-OCR).
++_UNLIMITED_OCR_MAX_CROPS = 32
++
++
++class UnlimitedOCRProcessingInfo(DeepseekOCRProcessingInfo):
++    """ProcessingInfo for Unlimited-OCR: same as DeepSeek-OCR but with
++    max_crops=32 instead of 6.  The higher crop count allows tiling very large
++    document pages into up to 32 640×640 patches (dynamic_preprocess max_num=32).
++    """
++
++    def get_hf_config(self):
++        from vllm.transformers_utils.configs.unlimited_ocr import UnlimitedOCRConfig
++
++        return self.ctx.get_hf_config(UnlimitedOCRConfig)
++
++    def get_hf_processor(self, **kwargs: object):
++        from vllm.transformers_utils.processors.unlimited_ocr import (
++            UnlimitedOCRProcessor,
++        )
++
++        v1_processor_config = dict(
++            image_size=IMAGE_SIZE,
++            base_size=BASE_SIZE,
++            crop_mode=CROP_MODE,
++            strategy="v1",
++            max_crops=_UNLIMITED_OCR_MAX_CROPS,
++        )
++        return self.ctx.get_hf_processor(
++            UnlimitedOCRProcessor,
++            # Resolve server defaults before inserting the Gundam fallback.
++            **{**v1_processor_config, **self.ctx.get_merged_mm_kwargs(kwargs)},
++        )
++
++    def get_num_image_tokens(
++        self, *, image_width: int, image_height: int, cropping: bool | None = None,
++        image_size: int | None = None, base_size: int | None = None,
++        max_crops: int | None = None,
++    ) -> int:
++        patch_size = 16
++        downsample_ratio = 4
++        if cropping is None:
++            cropping = bool(self.ctx.get_merged_mm_kwargs({}).get("crop_mode", CROP_MODE))
++        if image_size is None or base_size is None or max_crops is None:
++            processor = self.get_hf_processor()
++            image_size = processor.image_size if image_size is None else image_size
++            base_size = processor.base_size if base_size is None else base_size
++            max_crops = processor.max_crops if max_crops is None else max_crops
++
++        # Honour the caller-supplied `cropping` flag: multi-image callers pass
++        # cropping=False to match UnlimitedOCRProcessor.tokenize_with_images.
++        if cropping:
++            if image_width <= image_size and image_height <= image_size:
++                crop_ratio = [1, 1]
++            else:
++                crop_ratio = count_tiles(
++                    image_width,
++                    image_height,
++                    max_num=max_crops,
++                    image_size=image_size,
++                )
++            num_width_tiles, num_height_tiles = crop_ratio
++        else:
++            num_width_tiles = num_height_tiles = 1
++
++        h = w = math.ceil((base_size // patch_size) / downsample_ratio)
++        h2 = w2 = math.ceil((image_size // patch_size) / downsample_ratio)
++
++        global_views_tokens = h * (w + 1)
++        if num_width_tiles > 1 or num_height_tiles > 1:
++            local_views_tokens = (num_height_tiles * h2) * (num_width_tiles * w2 + 1)
++        else:
++            local_views_tokens = 0
++
++        return global_views_tokens + local_views_tokens + 1
++
++    def get_image_size_with_most_features(self) -> ImageSize:
++        processor = self.get_hf_processor()
++        cropping = self.ctx.get_merged_mm_kwargs({}).get("crop_mode", CROP_MODE)
++        if not cropping:
++            return ImageSize(width=processor.image_size, height=processor.image_size)
++        # A 1xN grid uses the crop limit and maximizes row-separator tokens.
++        # Caps below two fall back to the single global view in the processor.
++        return ImageSize(
++            width=processor.image_size,
++            height=processor.image_size * max(1, processor.max_crops),
++        )
++
++
++class UnlimitedOCRMultiModalProcessor(DeepseekOCRMultiModalProcessor):
++    """Multimodal processor for Unlimited-OCR.
++
++    Disables crop mode for multi-image requests (to stay consistent with
++    ``UnlimitedOCRProcessor.tokenize_with_images``), and -- since that makes the
++    per-image output depend on the request's image count -- bypasses the
++    per-item processing cache for multi-image requests, exactly like
++    ``DeepseekVL2MultiModalProcessor``.
++
++    DeepSeek-OCR does *not* apply either of these.
++    """
++
++    def _get_prompt_updates(
++        self,
++        mm_items: MultiModalDataItems,
++        hf_processor_mm_kwargs: Mapping[str, object],
++        out_mm_kwargs: MultiModalKwargsItems,
++    ) -> Sequence[PromptUpdate]:
++        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
++
++        image_token_id = hf_processor.image_token_id
++        assert isinstance(image_token_id, int)
++
++        def get_replacement_unlimited_ocr(item_idx: int):
++            images = mm_items.get_items(
++                "image", (ImageEmbeddingItems, ImageProcessorItems)
++            )
++
++            if isinstance(images, ImageEmbeddingItems):
++                num_image_tokens = images.get_feature_size(item_idx)
++            else:
++                size = images.get_image_size(item_idx)
++
++                # Disable crop mode for multi-image input.
++                # UnlimitedOCRProcessor.tokenize_with_images applies the same
++                # fallback, so both paths must agree on the effective crop flag.
++                effective_cropping = bool(
++                    self.info.ctx.get_merged_mm_kwargs(hf_processor_mm_kwargs).get(
++                        "crop_mode", CROP_MODE
++                    )
++                ) and len(images) == 1
++
++                num_image_tokens = self.info.get_num_image_tokens(
++                    image_width=size.width,
++                    image_height=size.height,
++                    cropping=effective_cropping,
++                    image_size=hf_processor.image_size,
++                    base_size=hf_processor.base_size,
++                    max_crops=hf_processor.max_crops,
++                )
++            return [image_token_id] * num_image_tokens
++
++        return [
++            PromptReplacement(
++                modality="image",
++                target=[image_token_id],
++                replacement=get_replacement_unlimited_ocr,
++            )
++        ]
++
++    def _cached_apply_hf_processor(
++        self,
++        inputs: ProcessorInputs,
++        timing_ctx: TimingContext,
++    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
++        # The processor logic differs for single-image (crop) vs multi-image
++        # (no crop) requests. The processing cache assumes per-item output is
++        # invariant of how many images are passed per prompt, so we only cache
++        # the single-image case and recompute multi-image requests fresh.
++        if inputs.mm_data_items.get_count("image", strict=False) > 1:
++            return self._apply_hf_processor(inputs, timing_ctx)
++
++        return super()._cached_apply_hf_processor(inputs, timing_ctx)
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    UnlimitedOCRMultiModalProcessor,
++    info=UnlimitedOCRProcessingInfo,
++    dummy_inputs=DeepseekOCRDummyInputsBuilder,
++)
++class UnlimitedOCRForCausalLM(DeepseekOCRForCausalLM):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
+--- /dev/null
++++ b/vllm/transformers_utils/configs/unlimited_ocr.py
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# Unlimited-OCR (baidu/Unlimited-OCR) reuses
++# the DeepSeek-OCR multimodal layout (DeepEncoder = SAM-ViT-B + CLIP-L, a linear
++# MLP projector and a DeepSeek-V2 text backbone). The only architectural
++# difference is the language model, which is a DeepSeek-V2 *MoE* with plain
++# multi-head attention (``use_mla=False``) instead of the dense MLA backbone.
++# We therefore reuse ``DeepseekVLV2Config`` for parsing the nested config.
++
++from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekVLV2Config
++
++
++class UnlimitedOCRConfig(DeepseekVLV2Config):
++    model_type = "unlimited-ocr"
++
++    # An explicit ``__init__`` is required: Transformers v5 processes each
++    # concrete config class' ``__init__`` signature to build nested sub-configs,
++    # and an empty subclass (only overriding ``model_type``) would skip
++    # ``DeepseekVLV2Config.__init__``, leaving ``text_config`` unset.
++    def __init__(
++        self,
++        tile_tag: str = "2D",
++        global_view_pos: str = "head",
++        candidate_resolutions: tuple[tuple[int, int]] = ((384, 384),),
++        rswa_window: int = 128,
++        **kwargs,
++    ):
++        super().__init__(
++            tile_tag=tile_tag,
++            global_view_pos=global_view_pos,
++            candidate_resolutions=candidate_resolutions,
++            **kwargs,
++        )
++        self.rswa_window = rswa_window
+--- /dev/null
++++ b/vllm/transformers_utils/processors/unlimited_ocr.py
+@@ -0,0 +1,46 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Image processor for Unlimited-OCR (baidu/Unlimited-OCR)."""
++
++from PIL import Image
++
++from vllm.logger import init_logger
++from vllm.transformers_utils.processors.deepseek_ocr import DeepseekOCRProcessor
++
++logger = init_logger(__name__)
++
++
++class UnlimitedOCRProcessor(DeepseekOCRProcessor):
++    """DeepseekOCRProcessor variant for Unlimited-OCR.
++
++    The only behavioural difference from the base processor is a multi-image
++    safeguard: when more than one image is present, crop ("gundam") mode is
++    disabled.
++
++    Because the effective crop flag then depends on *how many* images are in the
++    request, the per-item processing output is no longer invariant of sibling
++    images. ``UnlimitedOCRMultiModalProcessor`` accounts for this by bypassing
++    the multimodal processing cache for multi-image requests (see its
++    ``_cached_apply_hf_processor``), so the two paths stay consistent.
++
++    DeepSeek-OCR does *not* have this restriction because its ``max_crops=6`` is
++    small enough to be safe for multi-image use.
++    """
++
++    def tokenize_with_images(
++        self,
++        conversation: str,
++        images: list[Image.Image],
++        bos: bool = True,
++        eos: bool = True,
++        cropping: bool = True,
++    ):
++        if len(images) > 1 and cropping:
++            logger.warning_once(
++                "Unlimited-OCR: crop mode is not supported for multi-image "
++                "input. Falling back to cropping=False."
++            )
++            cropping = False
++        return super().tokenize_with_images(
++            conversation, images, bos=bos, eos=eos, cropping=cropping
++        )
+--- /dev/null
++++ b/vllm/model_executor/layers/attention/rswa_attention.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from vllm.config.vllm import VllmConfig
++from vllm.model_executor.layers.attention import Attention
++from vllm.v1.kv_cache_interface import KVCacheSpec, RSWASpec, get_kv_quant_mode
++
++
++class RSWAAttention(Attention):
++    """Mark R-SWA layers while retaining the v0.24 full-attention KV layout.
++
++    The Ascend backend implements prefix-plus-window masking. The standard
++    FullAttentionManager retains every KV block in this minimal backport;
++    decode-gap eviction is intentionally outside its scope.
++    """
++
++    def __init__(self, *args, rswa_window: int, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        self._rswa_window = rswa_window
++
++    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
++        spec = super().get_kv_cache_spec(vllm_config)
++        if spec is None:
++            return None
++        return RSWASpec(
++            block_size=vllm_config.cache_config.block_size,
++            num_kv_heads=self.num_kv_heads,
++            head_size=self.head_size,
++            head_size_v=self.head_size_v,
++            dtype=self.kv_cache_torch_dtype,
++            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
++            rswa_window=self._rswa_window,
++        )
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -364,6 +364,7 @@
+     ),
+     "Cosmos3ForConditionalGeneration": ("cosmos3", "Cosmos3ForConditionalGeneration"),
+     "DeepseekVLV2ForCausalLM": ("deepseek_vl2", "DeepseekVLV2ForCausalLM"),
++    "UnlimitedOCRForCausalLM": ("unlimited_ocr", "UnlimitedOCRForCausalLM"),
+     "DeepseekOCRForCausalLM": ("deepseek_ocr", "DeepseekOCRForCausalLM"),
+     "DeepseekOCR2ForCausalLM": ("deepseek_ocr2", "DeepseekOCR2ForCausalLM"),
+     "DotsOCRForCausalLM": ("dots_ocr", "DotsOCRForCausalLM"),
+--- a/vllm/transformers_utils/configs/__init__.py
++++ b/vllm/transformers_utils/configs/__init__.py
+@@ -15,6 +15,7 @@
+ import importlib
+ 
+ _CLASS_TO_MODULE: dict[str, str] = {
++    "UnlimitedOCRConfig": "vllm.transformers_utils.configs.unlimited_ocr",
+     "AfmoeConfig": "vllm.transformers_utils.configs.afmoe",
+     "AXK1Config": "vllm.transformers_utils.configs.AXK1",
+     "BagelConfig": "vllm.transformers_utils.configs.bagel",
+@@ -91,6 +92,7 @@
+ }
+ 
+ __all__ = [
++    "UnlimitedOCRConfig",
+     "AfmoeConfig",
+     "AXK1Config",
+     "BagelConfig",
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -124,6 +124,7 @@
+     laguna="LagunaConfig",
+     lfm2_moe="Lfm2MoeConfig",
+     tarsier2="Tarsier2Config",
++    **{"unlimited-ocr": "UnlimitedOCRConfig"},
+ )
+ 
+ _SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators"}
+@@ -241,6 +242,11 @@
+                 dummy_config = PretrainedConfig(**dummy_kwargs)
+                 dummy_model_type = hf_overrides(dummy_config).model_type
+                 model_type = dummy_model_type.removeprefix("dummy_")
++
++        # ModelScope uses an underscore alias for the native model type.
++        if model_type in ("unlimited_ocr", "unlimited-ocr"):
++            model_type = "unlimited-ocr"
++            kwargs["model_type"] = model_type
+ 
+         if model_type in _PATCH_HF_VALIDATE_ROPE:
+             _patch_hf_transformers_validate_rope()
+--- a/vllm/model_executor/models/deepseek_ocr.py
++++ b/vllm/model_executor/models/deepseek_ocr.py
+@@ -220,8 +220,10 @@
+         patch_size = 16
+         downsample_ratio = 4
+ 
+-        if CROP_MODE:
+-            if image_width <= 640 and image_height <= 640:
++        # Use the caller-supplied `cropping` flag so that callers that disable
++        # crop mode for multi-image requests get a consistent token count.
++        if cropping:
++            if image_width <= IMAGE_SIZE and image_height <= IMAGE_SIZE:
+                 crop_ratio = [1, 1]
+             else:
+                 # find the closest aspect ratio to the target
+--- a/vllm/transformers_utils/processors/deepseek_ocr.py
++++ b/vllm/transformers_utils/processors/deepseek_ocr.py
+@@ -161,10 +161,12 @@
+         image_size: int = IMAGE_SIZE,
+         base_size: int = BASE_SIZE,
+         strategy: Literal["v1", "v2"] = "v1",
++        max_crops: int = MAX_CROPS,
+         **kwargs,
+     ):
+         self.image_size = image_size
+         self.base_size = base_size
++        self.max_crops = max_crops
+ 
+         # image token calculation strategy for
+         # Deepseek-OCR and Deepseek-OCR-2
+@@ -332,12 +334,14 @@
+                 crop_ratio = [1, 1]
+             elif cropping:
+                 images_crop_raw, crop_ratio = dynamic_preprocess(
+-                    image, image_size=self.image_size
++                    image, image_size=self.image_size, max_num=self.max_crops
+                 )
+             else:
+                 crop_ratio = [1, 1]
+ 
+-            if not cropping:
++            # Reference Base/Large modes preserve aspect ratio and pad directly.
++            # Only the small non-crop modes explicitly resize to a square.
++            if not cropping and self.image_size <= 640:
+                 image = image.resize((self.image_size, self.image_size))
+ 
+             global_view = ImageOps.pad(
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -59,8 +59,8 @@
+                     return qk_rope_head_dim + qk_nope_head_dim
+ 
+         # NOTE: Some configs may set head_dim=None in the config
+-        if getattr(self.hf_text_config, "head_dim", None) is not None:
+-            return self.hf_text_config.head_dim
++        if (head_dim := getattr(self.hf_text_config, "head_dim", None)) is not None and head_dim > 0:
++            return head_dim
+ 
+         # NOTE: Some models (such as PLaMo2.1) use `hidden_size_per_head`
+         if getattr(self.hf_text_config, "hidden_size_per_head", None) is not None:
+--- a/vllm/config/model.py
++++ b/vllm/config/model.py
+@@ -1246,6 +1246,11 @@
+         return self.model_arch_config.is_deepseek_mla
+ 
+     @property
++    def rswa_window(self) -> int | None:
++        value = getattr(self.hf_config, "rswa_window", None)
++        return int(value) if value is not None else None
++
++    @property
+     def is_mm_prefix_lm(self) -> bool:
+         return self.model_arch_config.is_mm_prefix_lm
+ 
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -455,6 +455,10 @@
+     where bidirectional attention should apply. None for text-only
+     batches or non-PrefixLM models."""
+ 
++    rswa_prefix_lens: torch.Tensor | None = None
++    """Original per-request prompt lengths (including image tokens).
++    May be CPU int32; builders copy to their device buffers as needed."""
++
+     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
+     _seq_lens_cpu: torch.Tensor | None = None
+     _num_computed_tokens_cpu: torch.Tensor | None = None
+@@ -539,6 +543,7 @@
+             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
+             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+             is_prefilling=maybe_slice_reqs(self.is_prefilling),
++            rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+         )
+ 
+ 
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2336,6 +2336,9 @@
+                 req_doc_ranges[req_idx] = image_doc_ranges
+ 
+         cm_base = CommonAttentionMetadata(
++            rswa_prefix_lens=(
++                num_prompt_tokens_cpu if self.model_config.rswa_window is not None else None
++            ),
+             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
+             seq_lens=self.seq_lens[:num_reqs_padded],
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -435,6 +435,38 @@
+     """Marker for hidden-state cache layers used by extract_hidden_states."""
+ 
+     pass
++
++
++@dataclass(frozen=True, kw_only=True)
++class RSWASpec(FullAttentionSpec):
++    """R-SWA marker; v0.24 retains full KV while the backend masks old decode tokens."""
++    rswa_window: int
++
++    @classmethod
++    def merge(cls, specs: list[RSWASpec]) -> RSWASpec:
++        assert all(isinstance(spec, RSWASpec) for spec in specs), (
++            "All attention layers in the same KV cache group must be RSWASpec."
++        )
++        rswa_windows = {spec.rswa_window for spec in specs}
++        assert len(rswa_windows) == 1, (
++            f"All R-SWA layers must share the same rswa_window, got {rswa_windows}"
++        )
++        # Delegate common field merging to the parent, then reattach rswa_window.
++        base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
++        return cls(
++            block_size=base.block_size,
++            num_kv_heads=base.num_kv_heads,
++            head_size=base.head_size,
++            head_size_v=base.head_size_v,
++            dtype=base.dtype,
++            kv_quant_mode=base.kv_quant_mode,
++            page_size_padded=base.page_size_padded,
++            indexes_kv_by_block_stride=base.indexes_kv_by_block_stride,
++            sliding_window=base.sliding_window,
++            attention_chunk_size=base.attention_chunk_size,
++            non_causal=base.non_causal,
++            rswa_window=rswa_windows.pop(),
++        )
+ 
+ 
+ @dataclass(frozen=True, kw_only=True)
+--- a/vllm/model_executor/layers/attention/__init__.py
++++ b/vllm/model_executor/layers/attention/__init__.py
+@@ -18,7 +18,10 @@
+     StaticSinkAttention,
+ )
+ 
++from vllm.model_executor.layers.attention.rswa_attention import RSWAAttention
++
+ __all__ = [
++    "RSWAAttention",
+     "Attention",
+     "ChunkedLocalAttention",
+     "CrossAttention",
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -45,7 +45,7 @@
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.activation import SiluAndMul
+-from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.attention import Attention, RSWAAttention
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.fused_moe import (
+     FusedMoE,
+@@ -173,15 +173,28 @@
+             max_position=max_position_embeddings,
+             rope_parameters=config.rope_parameters,
+         )
+-        self.attn = Attention(
+-            self.num_heads,
+-            self.head_dim,
+-            self.scaling,
+-            num_kv_heads=self.num_kv_heads,
+-            cache_config=cache_config,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.attn",
+-        )
++        rswa_window = getattr(vllm_config.model_config.hf_config, "rswa_window", None)
++        if rswa_window is not None:
++            self.attn = RSWAAttention(
++                self.num_heads,
++                self.head_dim,
++                self.scaling,
++                num_kv_heads=self.num_kv_heads,
++                cache_config=cache_config,
++                quant_config=quant_config,
++                prefix=f"{prefix}.attn",
++                rswa_window=rswa_window,
++            )
++        else:
++            self.attn = Attention(
++                self.num_heads,
++                self.head_dim,
++                self.scaling,
++                num_kv_heads=self.num_kv_heads,
++                cache_config=cache_config,
++                quant_config=quant_config,
++                prefix=f"{prefix}.attn",
++            )
+ 
+     def forward(
+         self,
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -45,6 +45,44 @@
+         # Ernie4.5-VL conditionally executes text/vision MoE branches, so
+         # fast_moe_cold_start can silently produce incorrect execution order.
+         vllm_config.compilation_config.fast_moe_cold_start = False
++
++
++class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
++    @staticmethod
++    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
++        # Ascend chooses its own attention and vision backends. CUDA backends in
++        # this 0.24 backport do not implement R-SWA masks.
++        from vllm.platforms import current_platform
++
++        # FL exposes vendor_name; native vLLM-Ascend identifies its NPU
++        # platform through the Ascend device-control contract instead.
++        vendor = getattr(current_platform, "vendor_name", None)
++        is_ascend = vendor == "ascend" or (
++            vendor is None
++            and getattr(current_platform, "device_control_env_var", None)
++            == "ASCEND_RT_VISIBLE_DEVICES"
++        )
++        if not (
++            current_platform.is_out_of_tree()
++            and current_platform.device_type == "npu"
++            and is_ascend
++        ):
++            raise ValueError("Unlimited-OCR 0.24 backport requires the Ascend R-SWA backend")
++        if vllm_config.cache_config.enable_prefix_caching:
++            vllm_config.cache_config.enable_prefix_caching = False
++            logger.info("Unlimited-OCR: disabling prefix caching for R-SWA")
++
++    @staticmethod
++    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
++        text_config = model_config.hf_config.text_config
++        text_config.architectures = ["DeepseekV2ForCausalLM"]
++        window = getattr(model_config.hf_config, "rswa_window", 128)
++        if window is None:
++            window = 128
++        if int(window) <= 0:
++            raise ValueError("Unlimited-OCR rswa_window must be positive")
++        model_config.hf_config.rswa_window = int(window)
++        text_config.rswa_window = int(window)
+ 
+ 
+ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
+@@ -669,6 +707,7 @@
+ 
+ 
+ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
++    "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
+     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
+     "ColQwen3_5": ColQwen3_5Config,
+     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+
+--- a/vllm/tokenizers/registry.py
++++ b/vllm/tokenizers/registry.py
+@@ -31,7 +31,9 @@
+ # temporary workaround and better long term solutions are:
+ # - Add model type to MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS in transformers (better)
+ # - Fix tokenizer_class on the hub for the affected models (best)
+-_MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {"step3_vl", "step3p7"}
++_MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
++    "step3_vl", "step3p7", "unlimited-ocr",
++}
+ 
+ _VLLM_TOKENIZERS = {
+     "deepseek_v32": ("deepseek_v32", "DeepseekV32Tokenizer"),

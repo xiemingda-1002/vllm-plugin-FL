@@ -1145,6 +1145,60 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
         return decode_metadata
 
+    def build_for_dsv4_mtp_decode(self, cad, draft_index: int):
+        """SWA-only, one-query follow-up step; keep every step's storage separate.
+
+        The proposer retains the generic builder for step zero and all profile,
+        mixed/prefill and unsupported cases. No target metadata is mutated here.
+        """
+        if (self.compressor_ratio > 1 or self.spec_slot_mapping is None
+                or not 1 <= draft_index <= len(self.spec_slot_mapping)
+                or cad.max_query_len != 1 or cad.graph_pad_size != -1
+                or cad.num_actual_tokens != cad.num_reqs
+                or cad.num_input_tokens != cad.num_reqs or cad.num_reqs <= 0):
+            raise ValueError("DSv4 fast metadata requires an unpadded single-query SWA draft step")
+        count = cad.num_reqs
+        index = draft_index - 1
+        positions = cad.positions[:count].long()
+        # One lookup/copy pair, shared by wrapper and decode metadata. The
+        # generic path indexes RoPE once for common and once for decode.
+        cos, sin = get_cos_and_sin_dsa(positions, use_cache=True, draft_index=draft_index)
+        slots = self.spec_slot_mapping[index][:count]
+        slots.copy_(DeviceOperator.format_dsa_slot_mapping(cad.slot_mapping[:count], self.block_size))
+        query_start = cad.query_start_loc[:count + 1]
+        lengths = cad.seq_lens[:count]
+        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
+        raw_sas = metadata_op(
+            **DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device),
+            num_heads_q=self.model_config.hf_config.num_attention_heads // get_tensor_model_parallel_world_size(),
+            num_heads_kv=1, head_dim=self.model_config.get_head_size(),
+            cu_seqlens_q=query_start, cu_seqlens_ori_kv=self.cu_seqlens_ori_kv,
+            cu_seqlens_cmp_kv=self.cu_seqlens_cmp_kv, seqused_q=self.seqused_q,
+            seqused_kv=lengths, max_seqlen_q=1, max_seqlen_kv=cad.max_seq_len,
+            batch_size=count, cmp_ratio=1, ori_mask_mode=4, cmp_mask_mode=3,
+            ori_win_left=self.model_config.hf_config.sliding_window - 1,
+            ori_win_right=0, layout_q="TND", layout_kv="PA_ND",
+            has_ori_kv=True, has_cmp_kv=False,
+        )
+        sas = self.spec_sas_metadata[index]
+        sas[:1024].copy_(raw_sas[:1024])
+        # SWA attention consumes SAS, not compressed-attention indexer QLI.
+        decode = AscendDSADecodeMetadata(
+            input_positions=None, block_table=cad.block_table_tensor[:count],
+            seq_lens=lengths, max_seqlen_kv=None, max_seqlen_q=None,
+            seq_lens_list=None, max_seq_lens=None, slot_mapping=slots,
+            block_size=self.block_size, query_start_loc=query_start,
+            sin=sin[:count, ...], cos=cos[:count, ...], sas_metadata=sas,
+            qli_metadata=None,
+        )
+        return self.metadata_cls(
+            num_actual_tokens=count, num_input_tokens=count, slot_mapping=None,
+            query_start_loc=None, seq_lens=None, block_tables=None, sin=sin, cos=cos,
+            num_decodes=count, num_decode_tokens=count, num_prefills=0,
+            head_dim=self.model_config.get_head_size(), attn_state=cad.attn_state,
+            decode=decode, prefill=None,
+        )
+
     def build_for_drafting(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
@@ -1461,6 +1515,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
+        self._reuse_dsv4_attention_output = bool(
+            (self.vllm_config.additional_config or {}).get("dsv4_backend_opt", False))
 
         # indexer param
         if self.indexer is not None:
@@ -1738,7 +1794,14 @@ class AscendDSAImpl(DSAAttentionImpl):
         prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]
         decode_hidden_states = hidden_states[:decode_tokens]
 
-        o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        # Pure, unpadded prefill/decode can feed its attention result directly
+        # into inverse RoPE and o_proj. Mixed/padded/layout-mismatched batches
+        # retain the original contiguous staging tensor and copy behavior.
+        can_reuse = (self._reuse_dsv4_attention_output
+                     and has_prefill != has_decode
+                     and actual_tokens == o_proj_input_shape[0])
+        o_proj_input = None if can_reuse else torch.empty(
+            o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
         wait_for_kv_layer_from_connector(layer_name)
         if has_prefill:
@@ -1749,17 +1812,32 @@ class AscendDSAImpl(DSAAttentionImpl):
                 kv_cache,
                 attn_metadata,
             )  # type: ignore[arg-type]
-            o_proj_input[decode_tokens:actual_tokens] = output_prefill
+            if (o_proj_input is None and output_prefill.shape == o_proj_input_shape
+                    and output_prefill.dtype == hidden_states.dtype and output_prefill.is_contiguous()):
+                o_proj_input = output_prefill
+            else:
+                if o_proj_input is None:
+                    o_proj_input = torch.empty(o_proj_input_shape,
+                        dtype=hidden_states.dtype, device=hidden_states.device)
+                o_proj_input[decode_tokens:actual_tokens] = output_prefill
             cos = attn_metadata[0].prefill.cos[layer_name]
             sin = attn_metadata[0].prefill.sin[layer_name]
 
         if has_decode:
             assert attn_metadata[0].decode is not None
             output_decode = self._forward_decode(layer_name, decode_hidden_states, kv_cache, attn_metadata)
-            o_proj_input[:decode_tokens] = output_decode
+            if (o_proj_input is None and output_decode.shape == o_proj_input_shape
+                    and output_decode.dtype == hidden_states.dtype and output_decode.is_contiguous()):
+                o_proj_input = output_decode
+            else:
+                if o_proj_input is None:
+                    o_proj_input = torch.empty(o_proj_input_shape,
+                        dtype=hidden_states.dtype, device=hidden_states.device)
+                o_proj_input[:decode_tokens] = output_decode
             cos = attn_metadata[0].decode.cos[layer_name]
             sin = attn_metadata[0].decode.sin[layer_name]
 
+        assert o_proj_input is not None, "DSA metadata contains no executable segment"
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
 
