@@ -21,6 +21,9 @@ def npu_rotary_embedding(
     is_neox_style: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply current Ascend RoPE dispatch with a functional tensor contract."""
+    if query.dtype == torch.float32:
+        from .fp32_reference import torch_rotary
+        return torch_rotary(positions, query, key, cos_sin_cache, head_size, rotary_dim, is_neox_style)
     import torch_npu
 
     query_shape, key_shape = query.shape, key.shape

@@ -209,6 +209,17 @@ class GraphWrapper:
             return self.runnable(*args, **kwargs)
 
         forward_context = get_forward_context()
+        if (current_platform.device_type == "npu"
+                and self.vllm_config.model_config.dtype == torch.float32
+                and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL):
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.fp32_graph import prepare_graph
+            if not prepare_graph(self, forward_context):
+                saved = forward_context.cudagraph_runtime_mode
+                forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                try:
+                    return self.runnable(*args, **kwargs)
+                finally:
+                    forward_context.cudagraph_runtime_mode = saved
         batch_descriptor = forward_context.batch_descriptor
         graph_runtime_mode = forward_context.cudagraph_runtime_mode
 
