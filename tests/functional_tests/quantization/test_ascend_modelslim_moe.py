@@ -21,6 +21,73 @@ def _providers():
     return native, reference
 
 
+@pytest.mark.parametrize("scoring", ["softmax", "sigmoid"])
+@pytest.mark.parametrize("groups", [1, 8])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_grouped_router_and_graph(scoring, groups, with_bias, renormalize):
+    from inspect import unwrap
+
+    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+        grouped_topk as upstream,
+    )
+
+    from vllm_fl.dispatch import CachedOp
+
+    torch.manual_seed(96)
+    logits = torch.randn((4, 256), device="npu")
+    bias = torch.randn(256, device="npu") if with_bias else None
+    selected_groups = 1 if groups == 1 else 2
+    route = CachedOp("grouped_topk")
+
+    def forward():
+        scores = logits if scoring == "sigmoid" else logits.softmax(-1)
+        return route(
+            scores,
+            groups,
+            selected_groups,
+            8,
+            renormalize,
+            2.5,
+            bias,
+            int(scoring == "sigmoid"),
+        )
+
+    def check(output):
+        expected = unwrap(upstream)(
+            logits,
+            logits,
+            8,
+            renormalize,
+            groups,
+            selected_groups,
+            scoring,
+            2.5,
+            bias,
+        )
+        torch.testing.assert_close(
+            output[1].sort(-1).values,
+            expected[1].sort(-1).values,
+        )
+        actual_order = output[1].argsort(-1)
+        target_order = expected[1].argsort(-1)
+        torch.testing.assert_close(
+            output[0].gather(1, actual_order),
+            expected[0].gather(1, target_order),
+        )
+
+    check(forward())
+    for _ in range(3):
+        forward()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = forward()
+    logits.copy_(torch.randn_like(logits))
+    graph.replay()
+    torch.npu.synchronize()
+    check(output)
+
+
 def _case(dtype, ids, first_expert=0, global_num_experts=2):
     native, reference = _providers()
     torch.manual_seed(83)

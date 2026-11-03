@@ -18,6 +18,17 @@ def register_deepseek_v4():
     )
 
 
+@cache
+def register_glm52():
+    """Register only the lazy GLM-5.2 target model on Ascend."""
+    from vllm.model_executor.models import ModelRegistry
+
+    ModelRegistry.register_model(
+        "GlmMoeDsaForCausalLM",
+        "vllm_fl.models.glm52:GlmMoeDsaForCausalLM",
+    )
+
+
 def apply_ascend_patches():
     """Apply all Ascend-specific patches."""
     global _patches_applied

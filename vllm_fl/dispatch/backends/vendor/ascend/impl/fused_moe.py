@@ -11,6 +11,59 @@ import torch.nn.functional as F
 import torch_npu
 
 
+def grouped_topk(
+    scores,
+    n_group,
+    topk_group,
+    topk,
+    renormalize,
+    routed_scaling_factor,
+    bias,
+    scoring_func=0,
+):
+    """Tensor grouped routing with the framework's precomputed-score ABI."""
+    if scoring_func not in (0, 1):
+        raise ValueError("Grouped routing accepts scores or sigmoid logits")
+    if (
+        n_group <= 0
+        or scores.shape[-1] % n_group
+        or not 0 < topk_group <= n_group
+        or not 0 < topk <= topk_group * (scores.shape[-1] // n_group)
+    ):
+        raise ValueError("Invalid grouped expert routing dimensions")
+    # ABI 0 already contains probabilities; applying softmax again would
+    # change routing weights. ABI 1 contains logits for sigmoid scoring.
+    original = scores.sigmoid() if scoring_func else scores
+    biased = original if bias is None else original + bias.unsqueeze(0)
+    grouped = biased.reshape(scores.shape[0], n_group, -1)
+    group_scores = (
+        grouped.amax(dim=-1)
+        if bias is None
+        else grouped.topk(2, dim=-1).values.sum(dim=-1)
+    )
+    from vllm import envs
+
+    selected = group_scores.topk(
+        topk_group,
+        dim=-1,
+        sorted=envs.VLLM_BATCH_INVARIANT,
+    ).indices
+    mask = torch.zeros_like(group_scores).scatter_(1, selected, 1)
+    masked = biased.masked_fill(
+        ~mask.unsqueeze(-1).expand_as(grouped).reshape_as(biased).bool(),
+        float("-inf"),
+    )
+    indices = masked.topk(
+        topk,
+        dim=-1,
+        sorted=envs.VLLM_BATCH_INVARIANT,
+    ).indices
+    weights = original.gather(1, indices)
+    if renormalize:
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+    return (weights * routed_scaling_factor).to(torch.float32), indices.to(torch.int32)
+
+
 def topk_softmax(topk_weights, topk_ids, token_expert_indices, gating_output, renormalize):
     """Tensor reference for FL's softmax router; its scratch output is unused."""
     scores = gating_output.float().softmax(dim=-1)

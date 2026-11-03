@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ModelSlim dynamic W8A8 configuration, Linear and modular MoE adapters."""
+"""ModelSlim W8A8 configuration, Linear and modular MoE adapters."""
 
 import json
 from functools import cache
@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
+    RowParallelLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -46,11 +47,11 @@ _EXPERT_SHARDS = (
 
 
 class AscendModelSlimConfig(QuantizationConfig):
-    """Load dynamic/FLOAT metadata without implicitly enabling a model.
+    """Load static/dynamic/FLOAT metadata without implicitly enabling a model.
 
     Checkpoint naming belongs to the model's hf_to_vllm_mapper; absent a mapper,
-    names are preserved. Quantized attention/cache and static INT8 need their
-    own methods. Registration is an explicit action by platform integration.
+    names are preserved. Quantized attention/cache require separate methods.
+    Registration is an explicit action by platform integration.
     """
 
     def __init__(self, quant_config=None, *, weight_nz_mode=1):
@@ -60,6 +61,7 @@ class AscendModelSlimConfig(QuantizationConfig):
         self.weight_nz_mode = weight_nz_mode
         self.packed_modules_mapping = {
             "gate_up_proj": ["gate_proj", "up_proj"],
+            "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         }
         self.hf_to_vllm_mapper = None
         self.quant_description = {}
@@ -72,7 +74,7 @@ class AscendModelSlimConfig(QuantizationConfig):
             if (
                 key.endswith((".weight", ".weight_scale", ".weight_offset"))
                 or key == "model_quant_type"
-            ) and value not in ("FLOAT", "W8A8_DYNAMIC"):
+            ) and value not in ("FLOAT", "W8A8_DYNAMIC", "W8A8"):
                 raise NotImplementedError(
                     f"Unsupported ModelSlim type {value!r} at {key}"
                 )
@@ -164,6 +166,8 @@ class AscendModelSlimConfig(QuantizationConfig):
         if quant_type == "FLOAT":
             # The existing FL MoE factory retains its unquantized method path.
             return None if is_moe else UnquantizedLinearMethod()
+        if quant_type == "W8A8" and not is_moe:
+            return AscendW8A8StaticLinearMethod(self.weight_nz_mode)
         if quant_type != "W8A8_DYNAMIC":
             raise NotImplementedError(f"Unsupported ModelSlim type {quant_type!r}")
         if is_moe:
@@ -278,6 +282,174 @@ class AscendW8A8DynamicLinearMethod(LinearMethodBase):
 
 
 _prepare = CachedOp("modelslim_w8a8_prepare_experts")
+
+
+_static_linear = CachedOp("modelslim_w8a8_static_linear")
+
+
+def _load_static_input_parameter(param, loaded_weight, loaded_shard_id=None, **kwargs):
+    """Retain each packed input scalar until post-load equality validation."""
+    if loaded_weight.numel() != 1:
+        raise ValueError("ModelSlim static activation metadata must be scalar")
+    shard_id = kwargs.get("shard_id", loaded_shard_id)
+    if shard_id is None:
+        shards = range(param.numel())
+    elif isinstance(shard_id, tuple):
+        shards = shard_id
+    else:
+        shards = (shard_id,)
+    for shard in shards:
+        if isinstance(shard, str):
+            shard = {"q": 0, "k": 1, "v": 2}[shard]
+        if not 0 <= shard < param.numel():
+            raise ValueError("Invalid ModelSlim packed activation shard")
+        value = loaded_weight.reshape(()).to(device=param.device, dtype=param.dtype)
+        if param._modelslim_loaded_shards[shard] and not torch.equal(
+            param.data[shard], value
+        ):
+            raise ValueError("Conflicting ModelSlim activation scalar reload")
+        param.data[shard].copy_(value)
+        param._modelslim_loaded_shards[shard] = True
+
+
+class AscendW8A8StaticLinearMethod(LinearMethodBase):
+    """Static per-tensor activation INT8 with checkpoint dequantization scales."""
+
+    def __init__(self, weight_nz_mode=1):
+        if weight_nz_mode not in (0, 1, 2):
+            raise ValueError("weight_nz_mode must be 0, 1 or 2")
+        self.weight_nz_mode = weight_nz_mode
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if params_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError("ModelSlim static Linear requires BF16/FP16")
+        n = sum(output_partition_sizes)
+        layer.params_dtype = params_dtype
+        weight = torch.nn.Parameter(
+            torch.empty(n, input_size_per_partition, dtype=torch.int8),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight, extra_weight_attrs)
+        layer.register_parameter("weight", weight)
+        for name, dtype in (
+            ("quant_bias", torch.int32),
+            (
+                "deq_scale",
+                torch.float32 if params_dtype == torch.bfloat16 else torch.int64,
+            ),
+        ):
+            param = torch.nn.Parameter(torch.empty(n, dtype=dtype), requires_grad=False)
+            set_weight_attrs(param, {"output_dim": 0})
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.register_parameter(name, param)
+        for name, initializer in (
+            ("weight_scale", torch.ones),
+            ("weight_offset", torch.zeros),
+        ):
+            param = torch.nn.Parameter(
+                initializer(n, 1, dtype=params_dtype),
+                requires_grad=False,
+            )
+            set_weight_attrs(param, {"output_dim": 0})
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.register_parameter(name, param)
+        # Packed shards share x and therefore must agree on its quantizer.
+        # A fused-on-disk scalar fills all slots; separately loaded shards
+        # retain their own slots so post-load cannot silently use last-wins.
+        for name, dtype in (
+            ("input_scale", params_dtype),
+            ("input_offset", torch.int8),
+        ):
+            param = torch.nn.Parameter(
+                torch.empty(len(output_partition_sizes), dtype=dtype),
+                requires_grad=False,
+            )
+            set_weight_attrs(param, extra_weight_attrs)
+            param.weight_loader = _load_static_input_parameter
+            param._modelslim_loaded_shards = [False] * len(output_partition_sizes)
+            layer.register_parameter(name, param)
+
+    def get_computed_params(self) -> set[str]:
+        # Native static checkpoints may omit these descriptive parameters.
+        # Compensation/dequantization and activation scalars remain required.
+        return {"weight_scale", "weight_offset"}
+
+    def process_weights_after_loading(self, layer):
+        if layer.weight.dtype != torch.int8 or layer.weight.ndim != 2:
+            raise ValueError("Expected ModelSlim static [N,K] int8 weight")
+        for name in ("input_scale", "input_offset"):
+            param = getattr(layer, name)
+            if not all(param._modelslim_loaded_shards):
+                raise ValueError(f"Missing ModelSlim static {name} shard")
+            if not torch.equal(param.data, param.data[:1].expand_as(param.data)):
+                raise ValueError(f"Packed ModelSlim static {name} values must agree")
+        if (
+            not torch.isfinite(layer.input_scale).all().item()
+            or not (layer.input_scale > 0).all().item()
+        ):
+            raise ValueError("ModelSlim static input_scale must be finite and positive")
+        n, k = layer.weight.shape
+        if layer.quant_bias.shape != (n,) or layer.deq_scale.shape != (n,):
+            raise ValueError(
+                "Expected static compensation and dequantization scale [N]"
+            )
+        # Retain one logical activation quantizer and prepare native vectors
+        # once, before graph capture. npu_quantize requires x's floating dtype.
+        scale = layer.input_scale.data[:1].clone()
+        offset = layer.input_offset.data[:1].clone()
+        layer.input_scale.data = scale
+        layer.input_offset.data = offset
+        layer.register_buffer(
+            "aclnn_input_scale_reciprocal", scale.reciprocal().repeat(k)
+        )
+        layer.register_buffer(
+            "aclnn_input_offset", offset.to(layer.params_dtype).repeat(k)
+        )
+        weight, deq_scale = _prepare_weight(
+            layer.weight.data.transpose(0, 1).contiguous(),
+            layer.deq_scale.data,
+            self.weight_nz_mode,
+        )
+        layer.weight.data = weight
+        layer.deq_scale.data = deq_scale
+        layer.weight_scale.data = layer.weight_scale.data.flatten()
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
+
+    def apply(self, layer, x, bias=None):
+        if x.dtype not in (layer.params_dtype, torch.int8):
+            raise ValueError(
+                "Static Linear input must match its BF16/FP16 dtype or INT8"
+            )
+        if x.ndim < 2 or x.shape[-1] != layer.weight.shape[0]:
+            raise ValueError("Expected [..., K] input matching prepared static [K,N]")
+        if bias is not None and bias.shape != (layer.weight.shape[1],):
+            raise ValueError("Expected static Linear bias [N]")
+        # Only Row outputs are summed across TP ranks. Column/replicated
+        # outputs need their own full compensation on every participating rank.
+        quant_bias = layer.quant_bias
+        if isinstance(layer, RowParallelLinear) and layer.tp_rank != 0:
+            quant_bias = None
+        shape = (*x.shape[:-1], layer.weight.shape[1])
+        return _static_linear(
+            x.reshape(-1, x.shape[-1]).contiguous(),
+            layer.weight,
+            layer.deq_scale,
+            layer.aclnn_input_scale_reciprocal,
+            layer.aclnn_input_offset,
+            quant_bias,
+            bias,
+            layer.params_dtype,
+        ).reshape(shape)
 
 
 class AscendModelSlimMoEMethod(FusedMoEMethodBase):

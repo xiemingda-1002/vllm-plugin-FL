@@ -269,7 +269,6 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
-    KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     is_residual_scattered_for_sp,
     prepare_kernel_block_sizes,
@@ -1225,8 +1224,10 @@ class ModelRunnerFL(
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
-        self._kv_block_zeroer = KVBlockZeroer(
-            self.device,
+        from vllm_fl.worker.kv_cache_utils import create_kv_block_zeroer
+
+        self._kv_block_zeroer = create_kv_block_zeroer(
+            device=self.device,
             pin_memory=PIN_MEMORY,
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self._kernel_block_sizes,

@@ -65,6 +65,20 @@ class VLLMFLBackendBase(ABC):
         """Prepare logical INT8 [K,N] weights and per-output-channel scales."""
         raise NotImplementedError
 
+    def modelslim_w8a8_static_linear(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        deq_scale: torch.Tensor,
+        input_scale_reciprocal: torch.Tensor,
+        input_offset: torch.Tensor,
+        quant_bias: torch.Tensor | None,
+        bias: torch.Tensor | None,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Static INT8 Linear with distinct compensation and model biases."""
+        raise NotImplementedError
+
     def modelslim_w8a8_dynamic_linear(
         self,
         x: torch.Tensor,
@@ -226,6 +240,23 @@ class VLLMFLBackendBase(ABC):
         hc_eps: float,
     ) -> torch.Tensor:
         """Collapse HC streams [T,C,D] to [T,D] with FP32 mixing parameters."""
+        raise NotImplementedError
+
+    def sparse_mla_attention(
+        self, query: torch.Tensor, query_rope: torch.Tensor,
+        key_cache: torch.Tensor, rope_cache: torch.Tensor,
+        indices: torch.Tensor, block_table: torch.Tensor,
+        query_ends: torch.Tensor, seq_lens: torch.Tensor, scale: float,
+    ) -> torch.Tensor:
+        """Paged latent MLA with separate contiguous BF16 RoPE storage."""
+        raise NotImplementedError
+
+    def sparse_mla_indexer(
+        self, query: torch.Tensor, key_cache: torch.Tensor,
+        weights: torch.Tensor, block_table: torch.Tensor,
+        query_ends: torch.Tensor, seq_lens: torch.Tensor, topk: int,
+    ) -> torch.Tensor:
+        """Return causal logical sparse indices, padded with -1."""
         raise NotImplementedError
 
     def paged_cache_write(

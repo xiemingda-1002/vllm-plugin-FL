@@ -42,3 +42,39 @@ def modelslim_w8a8_dynamic_linear(x, weight, weight_scale, bias=None):
         bias=bias,
         output_dtype=x.dtype,
     )
+
+
+def modelslim_w8a8_static_linear(
+    x,
+    weight,
+    deq_scale,
+    input_scale_reciprocal,
+    input_offset,
+    quant_bias,
+    bias,
+    output_dtype,
+):
+    """Native static activation quantization and checkpoint-compensated GEMM."""
+    import torch_npu
+
+    if x.dtype != torch.int8:
+        x = torch_npu.npu_quantize(
+            x,
+            input_scale_reciprocal,
+            input_offset,
+            torch.qint8,
+            -1,
+            False,
+        )
+    output = torch_npu.npu_quant_matmul(
+        x,
+        weight,
+        deq_scale,
+        bias=quant_bias,
+        output_dtype=output_dtype,
+    )
+    # Model bias follows Linear's skip_bias_add/rank semantics at the caller;
+    # it is distinct from the mandatory INT32 quantization compensation.
+    if bias is not None:
+        output = output + bias
+    return output

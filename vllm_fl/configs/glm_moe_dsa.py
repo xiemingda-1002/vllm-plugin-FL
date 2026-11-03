@@ -43,6 +43,7 @@ class GlmMoeDsaConfig(DeepseekV2Config):
         if head_dim is not None:
             self.head_dim = head_dim
         if rope_parameters is not None:
+            self.rope_parameters = dict(rope_parameters)
             self.rope_theta = rope_parameters.get(
                 "rope_theta", getattr(self, "rope_theta", 10000.0)
             )

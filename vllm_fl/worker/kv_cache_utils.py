@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -28,16 +29,17 @@ def bind_kv_cache(
         getattr(current_platform, "vendor_name", None) == "iluvatar"
         and current_platform.device_type == "cuda"
     )
-    ascend_v4 = (
+    ascend_leaves = (
         getattr(current_platform, "vendor_name", None) == "ascend"
         and current_platform.device_type == "npu"
         and bool(kv_caches)
         and all(
             getattr(forward_context[name], "_fl_deepseek_v4_cache", False)
+            or getattr(forward_context[name], "_fl_sparse_mla_cache", False)
             for name in kv_caches
         )
     )
-    if not (iluvatar or ascend_v4):
+    if not (iluvatar or ascend_leaves):
         upstream_bind_kv_cache(
             kv_caches, forward_context, runner_kv_caches, num_attn_module
         )
@@ -59,3 +61,63 @@ def bind_kv_cache(
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
+
+
+class _PageSizeZeroers:
+    def __init__(self, zeroers):
+        self.zeroers = zeroers
+
+    def zero_block_ids(self, block_ids):
+        for zeroer in self.zeroers:
+            zeroer.zero_block_ids(block_ids)
+
+
+def create_kv_block_zeroer(**kwargs):
+    """Use the upstream zero kernel for each real Ascend page size.
+
+    Independent contiguous cache components need not have equal byte widths.
+    Padding their pages would break the native attention input layout.
+    """
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.worker.utils import KVBlockZeroer
+
+    if getattr(current_platform, "vendor_name", None) != "ascend":
+        return KVBlockZeroer(**kwargs)
+    groups = list(kwargs["attn_groups_iter"])
+    sizes = kwargs["kernel_block_sizes"]
+    context = kwargs["static_forward_context"]
+    excluded = kwargs.get("runner_only_attn_layers") or set()
+    buckets = defaultdict(list)
+    for group in groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, FullAttentionSpec):
+            continue
+        if group.kv_cache_group_id >= len(sizes):
+            continue
+        kernel_bs = sizes[group.kv_cache_group_id]
+        dim = group.backend.get_kv_cache_block_dim(
+            kernel_bs,
+            spec.num_kv_heads,
+            spec.head_size,
+            cache_dtype_str=kwargs["cache_dtype"],
+        )
+        names_by_size = defaultdict(list)
+        for name in group.layer_names:
+            if name in excluded:
+                continue
+            cache = context[name].kv_cache
+            if isinstance(cache, torch.Tensor):
+                page_bytes = (
+                    cache.stride(dim)
+                    * cache.element_size()
+                    * (spec.block_size // kernel_bs)
+                )
+                names_by_size[page_bytes].append(name)
+        for page_bytes, names in names_by_size.items():
+            buckets[page_bytes].append(replace(group, layer_names=names))
+    return _PageSizeZeroers(
+        [
+            KVBlockZeroer(**{**kwargs, "attn_groups_iter": bucket})
+            for bucket in buckets.values()
+        ]
+    )

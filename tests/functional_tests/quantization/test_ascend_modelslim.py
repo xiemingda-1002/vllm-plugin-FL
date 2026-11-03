@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ModelSlim configuration, weight loading and dynamic Linear NPU contracts."""
+"""ModelSlim configuration, weight loading and Linear NPU contracts."""
 
 import json
 
@@ -137,22 +137,24 @@ def test_external_mapper_idempotence():
     assert config.get_layer_quant_type("wrapped.model.proj") == "W8A8_DYNAMIC"
 
 
-def test_generic_dense_names_and_framework_packing():
+@pytest.mark.parametrize("quant_type", ["W8A8_DYNAMIC", "W8A8"])
+def test_generic_dense_names_and_framework_packing(quant_type):
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.model_loader.utils import configure_quant_config
 
     from vllm_fl.quantization.w8a8.modelslim import (
         AscendModelSlimConfig,
         AscendW8A8DynamicLinearMethod,
+        AscendW8A8StaticLinearMethod,
     )
 
     description = {
-        "layers.0.attn.w1.weight": "W8A8_DYNAMIC",
-        "layers.0.attn.w3.weight": "W8A8_DYNAMIC",
+        "layers.0.attn.w1.weight": quant_type,
+        "layers.0.attn.w3.weight": quant_type,
     }
     config = AscendModelSlimConfig(description)
     assert config.quant_description == description
-    assert config.get_layer_quant_type("layers.0.attn.w1") == "W8A8_DYNAMIC"
+    assert config.get_layer_quant_type("layers.0.attn.w1") == quant_type
 
     class DenseModel(torch.nn.Module):
         packed_modules_mapping = {"pair": ["w1", "w3"]}
@@ -162,7 +164,9 @@ def test_generic_dense_names_and_framework_packing():
     torch.nn.Module.__init__(layer)
     assert isinstance(
         config.get_quant_method(layer, "layers.0.attn.pair"),
-        AscendW8A8DynamicLinearMethod,
+        AscendW8A8DynamicLinearMethod
+        if quant_type == "W8A8_DYNAMIC"
+        else AscendW8A8StaticLinearMethod,
     )
     assert DenseModel.packed_modules_mapping == {"pair": ["w1", "w3"]}
     assert config.quant_description == description
@@ -250,7 +254,7 @@ def test_deepseek_descriptor_mapper_loading_order(tmp_path):
 @pytest.mark.parametrize(
     "description",
     [
-        {"a.weight": "W8A8"},
+        {"a.weight": "W8A8_STATIC_UNKNOWN"},
         {"a.weight": "W4A8_DYNAMIC"},
         {"kv_cache_type": "C8"},
         {"fa_quant_type": "W8A8_DYNAMIC"},
@@ -261,6 +265,78 @@ def test_unsupported_types(description):
 
     with pytest.raises(NotImplementedError):
         AscendModelSlimConfig(description)
+
+
+def _make_static_layer(dtype, tp_rank=None, *, unequal_scale=False):
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from vllm_fl.quantization.w8a8.modelslim import AscendW8A8StaticLinearMethod
+
+    layer = torch.nn.Module() if tp_rank is None else object.__new__(RowParallelLinear)
+    if tp_rank is not None:
+        torch.nn.Module.__init__(layer)
+        layer.tp_rank = tp_rank
+    method = AscendW8A8StaticLinearMethod(0)
+    with torch.device("npu"):
+        method.create_weights(
+            layer,
+            64,
+            [32, 32],
+            64,
+            64,
+            dtype,
+            weight_loader=default_weight_loader,
+        )
+    weight = torch.randint(-5, 6, (64, 64), dtype=torch.int8, device="npu")
+    layer.weight.data.copy_(weight)
+    layer.quant_bias.data.fill_(16)
+    scale = torch.full((64,), 0.00390625, dtype=torch.float32, device="npu")
+    if dtype == torch.float16:
+        import torch_npu
+
+        scale = torch_npu.npu_trans_quant_param(scale)
+    layer.deq_scale.data.copy_(scale)
+    for shard in (0, 1):
+        value = 0.5 if unequal_scale and shard == 1 else 0.25
+        for name, number in (("input_scale", value), ("input_offset", 3)):
+            param = getattr(layer, name)
+            param.weight_loader(param, torch.tensor([number]), shard)
+    method.process_weights_after_loading(layer)
+    return layer, method, weight
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tp_rank", [None, 0, 1])
+def test_static_compensation_and_graph_replay(dtype, tp_rank):
+    torch.manual_seed(907)
+    layer, method, weight = _make_static_layer(dtype, tp_rank)
+    x = torch.randn((2, 3, 64), dtype=dtype, device="npu")
+    bias = torch.randn(64, dtype=dtype, device="npu")
+
+    def check(output):
+        quant = (x.float() * 4 + 3).round().clamp(-128, 127)
+        compensation = 0 if tp_rank == 1 else 16
+        expected = ((quant @ weight.float().T + compensation) * 0.00390625).to(
+            dtype
+        ) + bias
+        torch.testing.assert_close(output, expected, rtol=0.01, atol=0.02)
+
+    check(method.apply(layer, x, bias))
+    for _ in range(3):
+        method.apply(layer, x, bias)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = method.apply(layer, x, bias)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.npu.synchronize()
+    check(output)
+
+
+def test_static_packed_quantizers_must_agree():
+    with pytest.raises(ValueError, match="must agree"):
+        _make_static_layer(torch.bfloat16, unequal_scale=True)
 
 
 def test_registration_idempotent(monkeypatch):

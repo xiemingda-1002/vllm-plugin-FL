@@ -89,6 +89,9 @@ def register_builtins(registry: OpRegistry) -> None:
     ]
 
     for op_name in (
+        "grouped_topk",
+        "sparse_mla_attention",
+        "sparse_mla_indexer",
         "deepseek_v4_compressor",
         "deepseek_v4_sparse_attention",
         "deepseek_v4_index_quant",
@@ -100,6 +103,7 @@ def register_builtins(registry: OpRegistry) -> None:
         "gdn_prefill",
         "modelslim_w8a8_prepare_weight",
         "modelslim_w8a8_dynamic_linear",
+        "modelslim_w8a8_static_linear",
         "modelslim_w8a8_grouped_experts",
     ):
         impls.append(

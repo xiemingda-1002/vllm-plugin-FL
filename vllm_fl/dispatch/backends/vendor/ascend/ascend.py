@@ -45,6 +45,21 @@ class AscendBackend(Backend):
         return AscendBackend._available
 
     # ==================== Operator Implementations ====================
+    def grouped_topk(self, *args, **kwargs):
+        from .impl.fused_moe import grouped_topk
+
+        return grouped_topk(*args, **kwargs)
+
+    def sparse_mla_attention(self, *args, **kwargs):
+        from .impl.sparse_mla import sparse_mla_attention
+
+        return sparse_mla_attention(*args, **kwargs)
+
+    def sparse_mla_indexer(self, *args, **kwargs):
+        from .impl.sparse_mla import sparse_mla_indexer
+
+        return sparse_mla_indexer(*args, **kwargs)
+
     def deepseek_v4_compressor(self, *args, **kwargs):
         from .impl.compressor import deepseek_v4_compressor
 
@@ -90,6 +105,11 @@ class AscendBackend(Backend):
         from .impl.quantization import modelslim_w8a8_prepare_weight
 
         return modelslim_w8a8_prepare_weight(*args, **kwargs)
+
+    def modelslim_w8a8_static_linear(self, *args, **kwargs):
+        from .impl.quantization import modelslim_w8a8_static_linear
+
+        return modelslim_w8a8_static_linear(*args, **kwargs)
 
     def modelslim_w8a8_dynamic_linear(self, *args, **kwargs):
         from .impl.quantization import modelslim_w8a8_dynamic_linear
@@ -222,6 +242,13 @@ class AscendBackend(Backend):
         """
         if use_mla:
             if use_sparse:
+                from vllm.config import get_current_vllm_config_or_none
+
+                config = get_current_vllm_config_or_none()
+                if config is not None and (
+                    config.model_config.hf_text_config.model_type == "glm_moe_dsa"
+                ):
+                    return "vllm_fl.attention.sparse_mla.SparseMLABackend"
                 raise NotImplementedError(
                     "MLA with sparse attention is not implemented for Ascend yet."
                 )
