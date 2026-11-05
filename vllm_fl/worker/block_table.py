@@ -146,6 +146,10 @@ class BlockTable:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        import os
+        if os.environ.get("VLLM_FL_ASCEND_SLOT_MAPPING", "triton") == "torch":
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.fp32_reference import torch_slot_mapping
+            return torch_slot_mapping(self, num_reqs, query_start_loc, positions)
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank

@@ -604,6 +604,7 @@ class AscendAttentionBackend(AttentionBackend):
     Uses torch_npu operators directly for high-performance attention on
     Huawei Ascend NPUs.
     """
+    supported_dtypes = [torch.float16, torch.bfloat16, torch.float32]
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -733,6 +734,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         vllm_config: VllmConfig,
     ) -> None:
         """Rebind live regular-attention metadata after FULL replay enqueue."""
+        if vllm_config.model_config.dtype == torch.float32:
+            # FP32 reference graphs use live device buffers, not FIA task handles.
+            return
         from vllm_fl.compilation.graph_params import get_graph_params
 
         graph_params = get_graph_params()
@@ -1199,6 +1203,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """Forward pass for encoder-only attention."""
         assert attn_metadata is not None
 
+        # PIECEWISE pads the model token dimension to a capture size. Attention
+        # runs outside the graph and its TND lengths describe real tokens only.
+        num_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_tokens]
+        key = key[:num_tokens]
+        value = value[:num_tokens]
+
         if attn_metadata.causal:
             # Use sparse_mode 3 in causal scenario
             return torch_npu.npu_fusion_attention(
@@ -1284,6 +1295,52 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Returns:
             Output tensor of shape [num_tokens, num_heads * head_size]
         """
+        # Encoder pooling has no paged KV cache. Keep the native packed-TND
+        # fused attention path ahead of the decoder-only FP32 fallback.
+        if self.attn_type == AttentionType.ENCODER_ONLY:
+            if output is None:
+                raise ValueError("Encoder attention requires an output buffer")
+            if output_scale is not None or output_block_scale is not None:
+                raise NotImplementedError("Encoder output quantization is unsupported")
+            if attn_metadata is None:
+                return output.zero_()
+            result = self._forward_encoder_attention(query, key, value, attn_metadata, output)
+            target = output.view(-1, self.num_heads, self.head_size)
+            target[:result.shape[0]].copy_(result)
+            # Keep the capture-sized output contract without leaking stale data
+            # from padded rows into subsequent graph segments.
+            target[result.shape[0]:].zero_()
+            return output
+
+        if query.dtype == torch.float32:
+            from ..fp32_reference import fp32_paged_attention
+            if output is None:
+                raise ValueError("FP32 attention requires an output buffer")
+            parallel = self.vllm_config.parallel_config
+            if (parallel.tensor_parallel_size != 1
+                    or parallel.prefill_context_parallel_size != 1
+                    or parallel.decode_context_parallel_size != 1
+                    or self.sliding_window is not None):
+                raise NotImplementedError(
+                    "FP32 reference attention requires TP=1, PCP=1, DCP=1 "
+                    "without sliding window")
+            if self.attn_type != AttentionType.DECODER:
+                raise NotImplementedError("FP32 reference supports causal decoder attention only")
+            if attn_metadata is not None and not attn_metadata.causal:
+                raise NotImplementedError("FP32 reference requires causal attention")
+            if output_scale is not None or output_block_scale is not None:
+                raise NotImplementedError("FP32 reference attention does not support quantized output")
+            if attn_metadata is None:
+                return output.zero_()
+            from vllm.forward_context import get_forward_context
+            from vllm.config.compilation import CUDAGraphMode
+            if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                from ..fp32_graph import full_attention
+                return full_attention(layer, self, query, key, value, kv_cache, attn_metadata, output)
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            return fp32_paged_attention(query, key, value, self.key_cache, self.value_cache,
+                attn_metadata, self.num_heads, self.num_kv_heads, self.head_size, self.scale, output)
+
         assert output is not None, "Output tensor must be provided."
 
         if output_scale is not None or output_block_scale is not None:
