@@ -201,8 +201,18 @@ class GraphWrapper:
 
     def clear_graphs(self) -> None:
         self.concrete_graph_entries.clear()
+        self.__dict__.get("_fp32_decode_states", {}).clear()
 
     def __call__(self, *args, **kwargs):
+        if (current_platform.device_type == "npu"
+                and self.vllm_config.model_config.dtype == torch.float32
+                and self.runtime_mode == CUDAGraphMode.FULL):
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.fp32_graph import graph_owner
+            with graph_owner(self):
+                return self._call_impl(*args, **kwargs)
+        return self._call_impl(*args, **kwargs)
+
+    def _call_impl(self, *args, **kwargs):
         if not is_forward_context_available():
             # No forward context means we are outside the normal
             # inference path (e.g. a vision encoder forward pass).
@@ -211,7 +221,8 @@ class GraphWrapper:
         forward_context = get_forward_context()
         if (current_platform.device_type == "npu"
                 and self.vllm_config.model_config.dtype == torch.float32
-                and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL):
+                and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and self.runtime_mode == CUDAGraphMode.FULL):
             from vllm_fl.dispatch.backends.vendor.ascend.impl.fp32_graph import prepare_graph
             if not prepare_graph(self, forward_context):
                 saved = forward_context.cudagraph_runtime_mode

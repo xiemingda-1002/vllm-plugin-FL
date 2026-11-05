@@ -1316,8 +1316,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
             from ..fp32_reference import fp32_paged_attention
             if output is None:
                 raise ValueError("FP32 attention requires an output buffer")
-            if self.vllm_config.parallel_config.tensor_parallel_size != 1 or self.sliding_window is not None:
-                raise NotImplementedError("FP32 reference attention requires TP=1 without sliding window")
+            parallel = self.vllm_config.parallel_config
+            if (parallel.tensor_parallel_size != 1
+                    or parallel.prefill_context_parallel_size != 1
+                    or parallel.decode_context_parallel_size != 1
+                    or self.sliding_window is not None):
+                raise NotImplementedError(
+                    "FP32 reference attention requires TP=1, PCP=1, DCP=1 "
+                    "without sliding window")
+            if self.attn_type != AttentionType.DECODER:
+                raise NotImplementedError("FP32 reference supports causal decoder attention only")
+            if attn_metadata is not None and not attn_metadata.causal:
+                raise NotImplementedError("FP32 reference requires causal attention")
             if output_scale is not None or output_block_scale is not None:
                 raise NotImplementedError("FP32 reference attention does not support quantized output")
             if attn_metadata is None:

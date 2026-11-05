@@ -1,0 +1,124 @@
+[
+  {
+    "limit": 4096,
+    "block_size": 128,
+    "outer_autocast": "torch.bfloat16",
+    "actual_graph_replays": 3,
+    "max_abs_errors": [
+      1.1920928955078125e-07,
+      2.384185791015625e-07,
+      5.960464477539063e-08
+    ],
+    "cache_replacement_invalidates": true,
+    "hf32": false
+  },
+  {
+    "limit": 4096,
+    "block_size": 128,
+    "outer_autocast": "torch.float16",
+    "actual_graph_replays": 3,
+    "max_abs_errors": [
+      1.1920928955078125e-07,
+      5.960464477539063e-08,
+      0.0
+    ],
+    "cache_replacement_invalidates": true,
+    "hf32": false
+  },
+  {
+    "limit": 8192,
+    "block_size": 128,
+    "outer_autocast": "torch.bfloat16",
+    "actual_graph_replays": 3,
+    "max_abs_errors": [
+      1.7881393432617188e-07,
+      1.1920928955078125e-07,
+      0.0
+    ],
+    "cache_replacement_invalidates": true,
+    "hf32": false
+  },
+  {
+    "limit": 8192,
+    "block_size": 128,
+    "outer_autocast": "torch.float16",
+    "actual_graph_replays": 3,
+    "max_abs_errors": [
+      5.960464477539063e-08,
+      1.1920928955078125e-07,
+      5.960464477539063e-08
+    ],
+    "cache_replacement_invalidates": true,
+    "hf32": false
+  },
+  {
+    "limit": 4097,
+    "block_size": 64,
+    "outer_autocast": "torch.bfloat16",
+    "actual_graph_replays": 3,
+    "max_abs_errors": [
+      5.960464477539063e-08,
+      1.1920928955078125e-07,
+      0.0
+    ],
+    "cache_replacement_invalidates": true,
+    "hf32": false
+  },
+  {
+    "limit": 4097,
+    "block_size": 64,
+    "outer_autocast": "torch.float16",
+    "actual_graph_replays": 3,
+    "max_abs_errors": [
+      5.960464477539063e-08,
+      1.1920928955078125e-07,
+      0.0
+    ],
+    "cache_replacement_invalidates": true,
+    "hf32": false
+  },
+  {
+    "unsupported_configurations": [
+      {
+        "case": "TP",
+        "full": false
+      },
+      {
+        "case": "TP",
+        "full": true
+      },
+      {
+        "case": "PCP",
+        "full": false
+      },
+      {
+        "case": "PCP",
+        "full": true
+      },
+      {
+        "case": "DCP",
+        "full": false
+      },
+      {
+        "case": "DCP",
+        "full": true
+      },
+      {
+        "case": "noncausal",
+        "full": false
+      },
+      {
+        "case": "noncausal",
+        "full": true
+      },
+      {
+        "case": "cross_attention",
+        "full": false
+      },
+      {
+        "case": "cross_attention",
+        "full": true
+      }
+    ]
+  }
+]
