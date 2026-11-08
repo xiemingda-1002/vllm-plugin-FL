@@ -144,6 +144,9 @@ class GraphWrapper:
         )
 
         self.first_run_finished = False
+        self._logged_replay_batches = (
+            set() if (vllm_config.additional_config or {}).get("graph_replay_log", False) else None
+        )
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
@@ -331,4 +334,18 @@ class GraphWrapper:
                 entry.graph.replay()
         else:
             entry.graph.replay()
+        if self._logged_replay_batches is not None and batch_descriptor not in self._logged_replay_batches:
+            logger.info("FL graph replay completed: mode=%s, padded_tokens=%d", self.runtime_mode, batch_descriptor.num_tokens)
+            self._logged_replay_batches.add(batch_descriptor)
+            import json
+            import os
+            from pathlib import Path
+
+            if directory := os.environ.get("VLLM_FL_OCR_AUDIT_DIR"):
+                root = Path(directory)
+                root.mkdir(parents=True, exist_ok=True)
+                (root / f"replay-{os.getpid()}-{batch_descriptor.num_tokens}.json").write_text(
+                    json.dumps({"mode": str(self.runtime_mode), "padded_tokens": batch_descriptor.num_tokens}),
+                    encoding="utf-8",
+                )
         return entry.output

@@ -24,10 +24,11 @@ performance than generic implementations.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar, List, Optional, Tuple, Type
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,7 @@ logger = logging.getLogger(__name__)
 _TORCH_NPU_AVAILABLE = False
 try:
     import torch_npu
+
     _TORCH_NPU_AVAILABLE = True
 
     # NPU compatibility: Replace torch.Event and torch.cuda.Stream with NPU versions
@@ -93,24 +95,160 @@ def using_paged_attention(
         return False
     if head_size == _FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE:
         return True
-    if (
-        vllm_config.compilation_config.cudagraph_mode
-        != CUDAGraphMode.FULL_DECODE_ONLY
-    ):
+    if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         return False
 
     additional_config = vllm_config.additional_config or {}
     pa_shape_list = additional_config.get("pa_shape_list", [])
     if not isinstance(pa_shape_list, (list, tuple)) or any(
-        not isinstance(size, int) or isinstance(size, bool)
-        for size in pa_shape_list
+        not isinstance(size, int) or isinstance(size, bool) for size in pa_shape_list
     ):
         raise TypeError("additional_config.pa_shape_list must contain integers")
     return runtime_shape in pa_shape_list
 
 
+@dataclass
+class RswaAttentionGroup:
+    request_start: int
+    request_end: int
+    token_start: int
+    token_end: int
+    actual_seq_lengths_q: list[int]
+    attn_mask: torch.Tensor
+
+
+def _build_grouped_rswa_masks(
+    builder,
+    prefix_lens,
+    seq_lens,
+    query_lens,
+    num_decodes,
+    num_decode_tokens,
+    max_kv_len,
+    rswa_window,
+):
+    """Group only ordered, unpadded mixed batches; never allocate the full mask."""
+    lengths = query_lens.tolist()
+    count = len(lengths)
+    if not 0 < num_decodes < count:
+        return None
+    if (
+        any(q != 1 for q in lengths[:num_decodes])
+        or any(q <= 1 for q in lengths[num_decodes:])
+        or sum(lengths[:num_decodes]) != num_decode_tokens
+    ):
+        return None
+    if prefix_lens.numel() != count or seq_lens.numel() != count:
+        return None
+    groups = []
+    token_start = 0
+    for start, end in ((0, num_decodes), (num_decodes, count)):
+        cumulative = []
+        total = 0
+        for length in lengths[start:end]:
+            total += length
+            cumulative.append(total)
+        mask = builder.get_rswa_attn_mask(
+            prefix_lens=prefix_lens[start:end],
+            seq_lens=seq_lens[start:end],
+            query_lens=query_lens[start:end],
+            max_kv_len=max_kv_len,
+            max_query_len=max(lengths[start:end]),
+            rswa_window=rswa_window,
+        )
+        groups.append(
+            RswaAttentionGroup(
+                start,
+                end,
+                token_start,
+                token_start + total,
+                cumulative,
+                mask,
+            )
+        )
+        token_start += total
+    return tuple(groups)
+
+
+def _run_grouped_rswa_fia(
+    fia,
+    groups,
+    query,
+    key,
+    value,
+    block_table,
+    actual_seq_lengths_kv,
+    block_size,
+    num_heads,
+    num_kv_heads,
+    head_size,
+    scale,
+    output,
+):
+    """Use shared paged KV and disjoint query/output intervals for both groups."""
+    for group in groups:
+        result, _ = fia(
+            query=query[group.token_start : group.token_end],
+            key=key,
+            value=value,
+            block_table=block_table[
+                group.request_start : group.request_end
+            ].contiguous(),
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=group.actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv[
+                group.request_start : group.request_end
+            ],
+            num_key_value_heads=num_kv_heads,
+            num_heads=num_heads,
+            scale=scale,
+            sparse_mode=0,
+            atten_mask=group.attn_mask,
+            pre_tokens=_SWA_INT_MAX,
+            next_tokens=_SWA_INT_MAX,
+        )
+        output[group.token_start : group.token_end] = result.view(
+            group.token_end - group.token_start,
+            num_heads,
+            head_size,
+        )
+    return output
+
+
+def _rswa_mask_request_lengths(
+    prefix_lens: torch.Tensor,
+    query_lens: torch.Tensor,
+    num_actual_reqs: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exclude runner-declared padding from the mask, preserving FIA inputs."""
+    if num_actual_reqs is None:
+        return prefix_lens, query_lens
+    num_reqs = query_lens.numel()
+    if (
+        not isinstance(num_actual_reqs, int)
+        or isinstance(num_actual_reqs, bool)
+        or not 0 <= num_actual_reqs <= num_reqs
+    ):
+        raise ValueError(
+            f"R-SWA actual request count must be in [0, {num_reqs}], "
+            f"got {num_actual_reqs!r}"
+        )
+    if num_actual_reqs == num_reqs:
+        return prefix_lens, query_lens
+    # FULL decode buckets give dummy rows a query extent, even though their
+    # sequence length is zero. They must produce no valid mask queries. Use
+    # the explicit real-request boundary; a real zero-prefix row is not padding.
+    prefix_lens = prefix_lens.clone()
+    query_lens = query_lens.clone()
+    prefix_lens[num_actual_reqs:] = 0
+    query_lens[num_actual_reqs:] = 0
+    return prefix_lens, query_lens
+
+
 class AscendAttentionState(Enum):
     """Attention state for Ascend backend."""
+
     PrefillNoCache = 0
     PrefillCacheHit = 1
     DecodeOnly = 2
@@ -161,13 +299,13 @@ def get_ascend_dummy_attention_state(
     """Match rc1's explicit phase for capture, warmup, and idle dummies."""
     if create_mixed_batch:
         raise NotImplementedError(
-            "create_mixed_batch is used for warmup deepgemm; Ascend "
-            "does not support it"
+            "create_mixed_batch is used for warmup deepgemm; Ascend does not support it"
         )
     if speculative_method == "mtp":
         return (
             AscendAttentionState.SpecDecoding
-            if use_mla else AscendAttentionState.ChunkedPrefill
+            if use_mla
+            else AscendAttentionState.ChunkedPrefill
         )
     return AscendAttentionState.DecodeOnly
 
@@ -212,7 +350,7 @@ class AscendMetadata:
     """Metadata for Ascend attention."""
 
     # Basic properties
-    attn_mask: Optional[torch.Tensor] = None
+    attn_mask: torch.Tensor | None = None
     attn_state: AscendAttentionState = AscendAttentionState.PrefillNoCache
 
     # Token counts
@@ -223,20 +361,23 @@ class AscendMetadata:
 
     # Sequence lengths
     seq_lens: torch.Tensor = None
-    seq_lens_list: List[int] = None
-    actual_seq_lengths_q: List[int] = None
+    seq_lens_list: list[int] = None
+    actual_seq_lengths_q: list[int] = None
 
     query_start_loc: torch.Tensor = None
-    max_query_len: Optional[int] = None
+    max_query_len: int | None = None
 
     # KV Cache properties
     block_tables: torch.Tensor = None
     slot_mapping: torch.Tensor = None
 
+    rswa_prefix_lens: torch.Tensor | None = None
+    rswa_window: int | None = None
+    rswa_groups: tuple[RswaAttentionGroup, ...] | None = None
+    sparse_mode: int | None = None
+
     causal: bool = True
     model_runner_type: str = ""
-
-
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -247,8 +388,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     reorder_batch_threshold: ClassVar[int] = 1
 
     # Class-level mask builder cache
-    _mask_builder: ClassVar[Optional[AttentionMaskBuilder]] = None
-    _mask_builder_device: ClassVar[Optional[torch.device]] = None
+    _mask_builder: ClassVar[AttentionMaskBuilder | None] = None
+    _mask_builder_device: ClassVar[torch.device | None] = None
 
     def __init__(
         self,
@@ -263,7 +404,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self.device = device
         self.max_num_blocks_per_req = cdiv(
             self.model_config.max_model_len,
-            AscendAttentionBackend.get_supported_kernel_block_sizes()[0]
+            AscendAttentionBackend.get_supported_kernel_block_sizes()[0],
         )
 
         self.speculative_config = vllm_config.speculative_config
@@ -281,12 +422,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         if cls._mask_builder is None or cls._mask_builder_device != self.device:
             cls._mask_builder = AttentionMaskBuilder(self.device)
             cls._mask_builder_device = self.device
+        # The cache is shared across models; refresh the policy on every access.
+        cls._mask_builder.ocr_mode = (
+            os.environ.get("VLLM_FL_OCR_TORCH_NPU", "0") == "1"
+            and getattr(getattr(self.model_config, "hf_config", None), "model_type", None)
+            == "unlimited-ocr"
+        )
         return cls._mask_builder
 
     def _make_attention_mask(
         self,
         attn_state: AscendAttentionState,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """
         Create attention mask based on attention state.
 
@@ -322,11 +469,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         """Build AscendMetadata from common attention metadata."""
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[:num_reqs + 1]
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
 
         # Split decodes and prefills
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             self._split_decodes_and_prefills(common_attn_metadata)
+        )
 
         block_table = common_attn_metadata.block_table_tensor
         # The private buffer is the authoritative CPU view in current vLLM;
@@ -348,7 +496,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_mask = self._make_attention_mask(attn_state)
 
         query_start_loc = query_start_loc_cpu.pin_memory().to(
-            self.device, non_blocking=True)
+            self.device, non_blocking=True
+        )
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
         seq_lens_list = seq_lens.tolist()
@@ -360,9 +509,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         if len(seq_lens_list) < num_reqs_fia:
             padding_len = num_reqs_fia - len(seq_lens_list)
             seq_lens_list += [1] * padding_len
-            seq_lens = torch.cat(
-                [seq_lens, seq_lens.new_ones(padding_len)]
-            )
+            seq_lens = torch.cat([seq_lens, seq_lens.new_ones(padding_len)])
         if block_table is not None and block_table.shape[0] < num_reqs_fia:
             block_table = torch.cat(
                 [
@@ -376,6 +523,115 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 ],
                 dim=0,
             )
+
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        rswa_window = getattr(self.model_config, "rswa_window", None)
+        rswa_prefix_lens = getattr(common_attn_metadata, "rswa_prefix_lens", None)
+        sparse_mode = None
+        rswa_groups = None
+        if rswa_window is not None:
+            if (
+                not isinstance(rswa_window, int)
+                or isinstance(rswa_window, bool)
+                or rswa_window <= 0
+            ):
+                raise ValueError(
+                    f"rswa_window must be a positive integer, got {rswa_window!r}"
+                )
+            if rswa_window > self.model_config.max_model_len:
+                raise ValueError(
+                    f"rswa_window {rswa_window} exceeds max_model_len {self.model_config.max_model_len}"
+                )
+            if not getattr(common_attn_metadata, "causal", True):
+                raise ValueError("R-SWA requires causal attention")
+            if rswa_prefix_lens is None:
+                raise RuntimeError(
+                    "R-SWA is enabled but prompt lengths are missing; "
+                    "the model runner must propagate prompt_lens/num_prompt_tokens"
+                )
+            if not isinstance(rswa_prefix_lens, torch.Tensor):
+                raise TypeError(
+                    f"R-SWA prompt lengths must be a torch.Tensor, got {type(rswa_prefix_lens).__name__}"
+                )
+            if rswa_prefix_lens.numel() < num_reqs:
+                raise RuntimeError(
+                    f"R-SWA prompt lengths are shorter than the request batch: {rswa_prefix_lens.numel()} < {num_reqs}"
+                )
+
+            quant_config = self.vllm_config.quant_config
+            if quant_config is not None and getattr(
+                quant_config, "enable_c8_quant", False
+            ):
+                raise NotImplementedError(
+                    "R-SWA is not supported with C8 KV-cache quantization on Ascend; "
+                    "disable C8 quantization or unset rswa_window"
+                )
+
+            rswa_prefix_lens = rswa_prefix_lens[:num_reqs_fia]
+            if rswa_prefix_lens.shape[0] < num_reqs_fia:
+                padding_len = num_reqs_fia - rswa_prefix_lens.shape[0]
+                rswa_prefix_lens = torch.cat(
+                    [rswa_prefix_lens, rswa_prefix_lens.new_zeros(padding_len)]
+                )
+            rswa_prefix_lens, rswa_query_lens = _rswa_mask_request_lengths(
+                rswa_prefix_lens,
+                query_lens_cpu[:num_reqs_fia],
+                getattr(common_attn_metadata, "rswa_num_actual_reqs", None),
+            )
+            # CANN FIA sparse_mode=0 validates the explicit R-SWA mask S2
+            # against the configured maximum model length, so keep the mask
+            # width fixed at max_model_len and rely on seq_lens to mask unused
+            # KV positions for each request.
+            max_kv_len = self.model_config.max_model_len
+            ocr_mode = (
+                os.environ.get("VLLM_FL_OCR_TORCH_NPU", "0") == "1"
+                and getattr(getattr(self.model_config, "hf_config", None), "model_type", None)
+                == "unlimited-ocr"
+            )
+            grouped = os.environ.get(
+                "VLLM_FL_RSWA_GROUPED_MASK", "1" if ocr_mode else "0"
+            )
+            if grouped not in ("0", "1"):
+                raise ValueError("VLLM_FL_RSWA_GROUPED_MASK must be 0 or 1")
+            if (
+                grouped == "1"
+                and attn_state == AscendAttentionState.ChunkedPrefill
+                and self.vllm_config.speculative_config is None
+                and getattr(common_attn_metadata, "graph_pad_size", -1) < 0
+                and getattr(common_attn_metadata, "rswa_num_actual_reqs", None)
+                in (None, num_reqs_fia)
+                and bool(actual_seq_lengths_q)
+                and actual_seq_lengths_q[-1] == num_actual_tokens
+            ):
+                rswa_groups = _build_grouped_rswa_masks(
+                    self._get_mask_builder(),
+                    rswa_prefix_lens,
+                    seq_lens[:num_reqs_fia],
+                    rswa_query_lens,
+                    num_decodes,
+                    num_decode_tokens,
+                    max_kv_len,
+                    rswa_window,
+                )
+            if rswa_groups is not None:
+                attn_mask = None
+                if not getattr(self, "_rswa_grouped_logged", False):
+                    logger.info(
+                        "FL R-SWA grouped mask active: decode_requests=%s, prefill_requests=%s",
+                        num_decodes,
+                        num_reqs_fia - num_decodes,
+                    )
+                    self._rswa_grouped_logged = True
+            else:
+                attn_mask = self._get_mask_builder().get_rswa_attn_mask(
+                    prefix_lens=rswa_prefix_lens,
+                    seq_lens=seq_lens[:num_reqs_fia],
+                    query_lens=rswa_query_lens,
+                    max_kv_len=max_kv_len,
+                    max_query_len=common_attn_metadata.max_query_len,
+                    rswa_window=rswa_window,
+                )
+            sparse_mode = 0
 
         return AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -391,8 +647,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             attn_state=attn_state,
             num_prefills=num_prefills,
             num_decodes=num_decodes,
-            causal=getattr(common_attn_metadata, 'causal', True),
+            causal=getattr(common_attn_metadata, "causal", True),
             model_runner_type=self.model_config.runner_type,
+            rswa_prefix_lens=rswa_prefix_lens,
+            rswa_window=rswa_window,
+            rswa_groups=rswa_groups,
+            sparse_mode=sparse_mode,
         )
 
     def _split_decodes_and_prefills(self, common_attn_metadata):
@@ -420,7 +680,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     def build_for_cudagraph_capture(
         self,
         common_attn_metadata,
-        model: Optional[nn.Module] = None,
+        model: nn.Module | None = None,
     ):
         """Build metadata for CUDA graph capture (ACL graph on Ascend)."""
         return self.build_for_graph_capture(
@@ -433,7 +693,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self,
         common_attn_metadata,
         attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,
-        model: Optional[nn.Module] = None,
+        model: nn.Module | None = None,
     ):
         """Build metadata for graph capture."""
         if attn_state == AscendAttentionState.DecodeOnly:
@@ -468,6 +728,7 @@ class AscendAttentionBackend(AttentionBackend):
     Uses torch_npu operators directly for high-performance attention on
     Huawei Ascend NPUs.
     """
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -475,11 +736,11 @@ class AscendAttentionBackend(AttentionBackend):
         return "CUSTOM"
 
     @staticmethod
-    def get_impl_cls() -> Type["AscendAttentionBackendImpl"]:
+    def get_impl_cls() -> type[AscendAttentionBackendImpl]:
         return AscendAttentionBackendImpl
 
     @staticmethod
-    def get_builder_cls() -> Type["AscendAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type[AscendAttentionMetadataBuilder]:
         return AscendAttentionMetadataBuilder
 
     @staticmethod
@@ -489,13 +750,13 @@ class AscendAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def swap_blocks(
-        src_kv_cache: List[torch.Tensor],
-        dst_kv_cache: List[torch.Tensor],
+        src_kv_cache: list[torch.Tensor],
+        dst_kv_cache: list[torch.Tensor],
         src_to_dst: torch.Tensor,
     ) -> None:
         src_key_cache, src_value_cache = src_kv_cache[0], src_kv_cache[1]
@@ -503,14 +764,14 @@ class AscendAttentionBackend(AttentionBackend):
         src_indices = src_to_dst[:, 0]
         dst_indices = src_to_dst[:, 1]
 
-        dst_key_cache[dst_indices] = src_key_cache[src_indices].to(
-            dst_key_cache.device)
+        dst_key_cache[dst_indices] = src_key_cache[src_indices].to(dst_key_cache.device)
         dst_value_cache[dst_indices] = src_value_cache[src_indices].to(
-            dst_key_cache.device)
+            dst_key_cache.device
+        )
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
         src_indices = src_to_dists[:, 0]
@@ -543,12 +804,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         head_size: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[List[float]],
-        sliding_window: Optional[int],
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
         kv_cache_dtype: str,
-        logits_soft_cap: Optional[float],
+        logits_soft_cap: float | None,
         attn_type: str,
-        kv_sharing_target_layer_name: Optional[str],
+        kv_sharing_target_layer_name: str | None,
         **kwargs,
     ) -> None:
         if not _TORCH_NPU_AVAILABLE:
@@ -567,11 +828,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sliding_window = sliding_window
 
         if alibi_slopes is not None:
-            alibi_slopes = torch.tensor(
-                alibi_slopes,
-                dtype=torch.float32,
-                device="npu"
-            )
+            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
 
@@ -677,6 +934,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         vllm_config.model_config.hf_text_config, "sliding_window"
                     ):
                         block_table = live.block_tables
+                    if live.rswa_window is not None:
+                        # FIA retains captured pointers: update their contents in place.
+                        for captured, updated, label in (
+                            (param.attn_mask, live.attn_mask, "R-SWA mask"),
+                            (param.block_table, live.block_tables, "block table"),
+                        ):
+                            if (
+                                captured is not None
+                                and updated is not None
+                                and captured is not updated
+                            ):
+                                if captured.shape != updated.shape:
+                                    raise RuntimeError(
+                                        f"Ascend graph {label} shape changed"
+                                    )
+                                captured.copy_(updated)
+                        block_table = param.block_table
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=param.query,
@@ -739,7 +1013,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor],
+        kv_cache: tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
     ):
         """Reshape and cache key/value tensors."""
@@ -753,11 +1027,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 slots = slots.to(torch.int32)
             # Use torch_npu reshape_and_cache
             torch_npu._npu_reshape_and_cache(
-                key=key[:attn_metadata.num_actual_tokens],
-                value=value[:attn_metadata.num_actual_tokens],
+                key=key[: attn_metadata.num_actual_tokens],
+                value=value[: attn_metadata.num_actual_tokens],
                 key_cache=self.key_cache,
                 value_cache=self.value_cache,
-                slot_indices=slots[:attn_metadata.num_actual_tokens]
+                slot_indices=slots[: attn_metadata.num_actual_tokens],
             )
         return key, value
 
@@ -777,11 +1051,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query, key, value, attn_metadata, output, layer
             )
 
-        key, value, block_size, block_table, actual_seq_lengths_kv = \
+        key, value, block_size, block_table, actual_seq_lengths_kv = (
             self._get_fia_params(key, value, attn_metadata)
+        )
 
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
+
+        if attn_metadata.rswa_groups is not None:
+            if (
+                block_table is None
+                or attn_metadata.attn_state != AscendAttentionState.ChunkedPrefill
+            ):
+                raise RuntimeError("Grouped R-SWA requires cache-backed ChunkedPrefill")
+            return _run_grouped_rswa_fia(
+                torch_npu.npu_fused_infer_attention_score,
+                attn_metadata.rswa_groups,
+                query,
+                key,
+                value,
+                block_table,
+                actual_seq_lengths_kv,
+                block_size,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.scale,
+                output,
+            )
 
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             key = key[:num_tokens]
@@ -789,7 +1086,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         mask_args = {}
         sparse_mode = 0
-        if attn_metadata.causal:
+        if attn_metadata.rswa_window is not None:
+            mask_args.update(
+                atten_mask=attn_metadata.attn_mask,
+                pre_tokens=_SWA_INT_MAX,
+                next_tokens=_SWA_INT_MAX,
+            )
+        elif attn_metadata.causal:
             sparse_mode = 4 if self.sliding_window is not None else 3
             mask_args["atten_mask"] = attn_metadata.attn_mask
             if self.sliding_window is not None:
@@ -866,29 +1169,43 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params = get_graph_params()
         graph_params.require_shape(num_tokens)
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
-        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
-        pre_tokens = self.sliding_window or _SWA_INT_MAX
-        next_tokens = 0 if self.sliding_window else _SWA_INT_MAX
+        sparse_mode = (
+            0
+            if attn_metadata.rswa_window is not None
+            else 4
+            if self.sliding_window
+            else 3
+            if attn_metadata.causal
+            else 0
+        )
+        pre_tokens = (
+            self.sliding_window
+            if self.sliding_window and attn_metadata.rswa_window is None
+            else _SWA_INT_MAX
+        )
+        next_tokens = (
+            0
+            if self.sliding_window and attn_metadata.rswa_window is None
+            else _SWA_INT_MAX
+        )
         workspace = graph_params.workspaces[num_tokens]
         if workspace is None:
-            workspace = (
-                torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    sparse_mode=sparse_mode,
-                    pre_tokens=pre_tokens,
-                    next_tokens=next_tokens,
-                    scale=self.scale,
-                )
+            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+                scale=self.scale,
             )
             graph_params.workspaces[num_tokens] = workspace
 
@@ -938,24 +1255,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             workspace=workspace,
             out=[output, softmax_lse],
         )
-        graph_params.handles[num_tokens].append(
-            torch.npu.graph_task_group_end(stream)
-        )
+        graph_params.handles[num_tokens].append(torch.npu.graph_task_group_end(stream))
         return output
 
     def forward_paged_attention(
         self,
         query: torch.Tensor,
         attn_metadata: AscendMetadata,
-        output: Optional[torch.Tensor] = None,
+        output: torch.Tensor | None = None,
         layer: AttentionLayer | None = None,
     ) -> torch.Tensor:
         """Forward pass using paged attention for decode."""
         forward_context = get_forward_context()
         if getattr(forward_context, "capturing", False):
-            return self._capture_paged_attention(
-                query, attn_metadata, output, layer
-            )
+            return self._capture_paged_attention(query, attn_metadata, output, layer)
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -965,7 +1278,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             scale_value=self.scale,
             block_table=attn_metadata.block_tables,
             context_lens=attn_metadata.seq_lens,
-            out=output
+            out=output,
         )
         return output
 
@@ -1029,9 +1342,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             out=output,
             workspace=workspace,
         )
-        graph_params.handles[num_tokens].append(
-            torch.npu.graph_task_group_end(stream)
-        )
+        graph_params.handles[num_tokens].append(torch.npu.graph_task_group_end(stream))
         return output
 
     def _forward_encoder_attention(
@@ -1077,7 +1388,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor],
+        kv_cache: tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
         layer: AttentionLayer | None = None,
@@ -1089,14 +1400,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and self.sliding_window is None
+            and attn_metadata.rswa_window is None
             and using_paged_attention(num_tokens, self.vllm_config, self.head_size)
         ):
-            output = self.forward_paged_attention(
-                query, attn_metadata, output, layer
-            )
+            output = self.forward_paged_attention(query, attn_metadata, output, layer)
         else:
             output = self.forward_fused_infer_attention(
-                query, key, value, attn_metadata, output, layer)
+                query, key, value, attn_metadata, output, layer
+            )
 
         return output
 
@@ -1106,11 +1417,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor],
+        kv_cache: tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
-        output: Optional[torch.Tensor] = None,
-        output_scale: Optional[torch.Tensor] = None,
-        output_block_scale: Optional[torch.Tensor] = None,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass with Ascend attention.
@@ -1161,13 +1472,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Handle pooling model branch (encoder attention)
         if attn_metadata.model_runner_type == "pooling":
             attn_output = self._forward_encoder_attention(
-                query, key, value, attn_metadata, output)
+                query, key, value, attn_metadata, output
+            )
             output[:num_tokens] = attn_output[:num_tokens]
             return output
 
         # Standard forward
         output = self.forward_impl(
-            query, key, value, kv_cache, attn_metadata, output, layer)
+            query, key, value, kv_cache, attn_metadata, output, layer
+        )
         return output
 
 

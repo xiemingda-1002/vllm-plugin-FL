@@ -18,9 +18,7 @@ from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_EVALUATOR = HERE.parent / "ocr_paper_eval_20261026" / "evaluator_v1_5"
-if (HERE / "evaluators" / "evaluator_v1_5").is_dir():
-    DEFAULT_EVALUATOR = HERE / "evaluators" / "evaluator_v1_5"
+DEFAULT_EVALUATOR = HERE / "evaluators" / "evaluator_v1_5"
 DEFAULT_DATASET = HERE / "test_images" / "omnidocbench_v1_5" / "OmniDocBench.json"
 NATIVE_SHA256 = "90a4cf4628321cf53191bd20e0109b5935032feedc8c6e502a3fa46a9181a51c"
 TARGETS = dict(

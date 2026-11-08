@@ -13,8 +13,8 @@ import importlib
 import os
 
 from .config import get_vendor_device_map
-from .registry import OpRegistry
 from .logger_manager import get_logger
+from .registry import OpRegistry
 
 logger = get_logger()
 
@@ -134,18 +134,23 @@ def register_builtins(registry: OpRegistry) -> None:
     Args:
         registry: Registry to register into
     """
-    # Register FlagGems (DEFAULT) implementations
-    try:
-        from .backends.flaggems.register_ops import register_builtins as register_flaggems
+    if os.environ.get("VLLM_FL_OCR_TORCH_NPU", "0") != "1":
+        # Register FlagGems (DEFAULT) implementations
+        try:
+            from .backends.flaggems.register_ops import (
+                register_builtins as register_flaggems,
+            )
 
-        register_flaggems(registry)
-        logger.debug("Registered FlagGems operators")
-    except Exception as e:
-        logger.warning(f"Failed to register FlagGems operators: {e}")
+            register_flaggems(registry)
+            logger.debug("Registered FlagGems operators")
+        except Exception as e:
+            logger.warning(f"Failed to register FlagGems operators: {e}")
 
     # Register PyTorch (REFERENCE) implementations
     try:
-        from .backends.reference.register_ops import register_builtins as register_reference
+        from .backends.reference.register_ops import (
+            register_builtins as register_reference,
+        )
 
         register_reference(registry)
         logger.debug("Registered Reference operators")
@@ -163,5 +168,3 @@ def register_builtins(registry: OpRegistry) -> None:
             logger.debug(f"Registered {plugin_count} external plugins")
     except Exception as e:
         logger.debug(f"Plugin discovery failed: {e}")
-
-

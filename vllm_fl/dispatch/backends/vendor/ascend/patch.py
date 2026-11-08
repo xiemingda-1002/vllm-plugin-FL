@@ -1,6 +1,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 _patches_applied = False
@@ -11,6 +12,13 @@ def apply_ascend_patches():
     if _patches_applied:
         return
     _patches_applied = True
+    if os.environ.get("VLLM_FL_OCR_TORCH_NPU", "0") == "1":
+        # OCR has no FLA/GDN/Mamba layers: keep unrelated optional packages
+        # out of the model's import closure.
+        patch_op_cls()
+        patch_fused_moe()
+        patch_sampler_filter()
+        return
     # Patch modules for Ascend platform
     patch_causal_conv1d()
     patch_fla_ops()
