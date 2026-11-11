@@ -610,14 +610,14 @@ class ModelRunnerFL(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        from vllm_fl.models.ocr_runtime import configure_ocr_runtime, ocr_runtime_enabled
+        from vllm_fl.models.ocr_runtime import (
+            configure_ocr_runtime,
+            get_ocr_sampler_cls,
+            ocr_runtime_enabled,
+        )
 
         configure_ocr_runtime(self.vllm_config)
-        sampler_cls = Sampler
-        if ocr_runtime_enabled():
-            from vllm_fl.models.ocr_sampler import OCRSampler
-
-            sampler_cls = OCRSampler
+        sampler_cls = get_ocr_sampler_cls() if ocr_runtime_enabled() else Sampler
         self.sampler = sampler_cls(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
@@ -2266,7 +2266,7 @@ class ModelRunnerFL(
         self.seq_lens[num_reqs:].fill_(0)
 
         if self.common_attention_metadata_graph is None:
-            from vllm_fl.models.ocr_slots import compute_ocr_slot_mapping
+            from vllm_fl.models.ocr_runtime import compute_ocr_slot_mapping
 
             if not compute_ocr_slot_mapping(
                 self.input_batch.block_table,
@@ -5478,7 +5478,7 @@ class ModelRunnerFL(
                 ocr_manifest = audit_ocr_model(self.model)
                 if ocr_manifest:
                     logger.info("FL OCR compute audit: %s", ocr_manifest)
-                    from vllm_fl.models.ocr_execution_audit import install_execution_audit
+                    from vllm_fl.models.ocr_runtime import install_execution_audit
 
                     install_execution_audit(self.model)
                 get_state_cls = getattr(self.model, "get_legacy_model_state_cls", None)
