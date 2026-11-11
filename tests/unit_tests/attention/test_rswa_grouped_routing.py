@@ -155,3 +155,17 @@ def test_metadata_grouped_routing(
         assert result.attn_mask is None and calls == [(2, 1), (2, 5)], (name, calls)
     else:
         assert len(calls) == 1 and result.attn_mask is not None, (name, calls)
+
+
+def test_full_padding_uses_explicit_real_request_boundary():
+    prefix, query = torch.tensor([2, 0, 99]), torch.tensor([1, 1, 1])
+    real_prefix, real_query = module._rswa_mask_request_lengths(prefix, query, 2)
+    assert real_prefix.tolist() == [2, 0, 0]
+    assert real_query.tolist() == [1, 1, 0]
+    assert prefix.tolist() == [2, 0, 99]
+
+    builder = mask.AttentionMaskBuilder(torch.device("cpu"))
+    attention_mask = builder.get_rswa_attn_mask(
+        real_prefix, torch.tensor([8, 5, 0]), real_query, 32, 1, 4
+    )
+    assert torch.all(attention_mask[2] == 1)
