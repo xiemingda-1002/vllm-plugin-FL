@@ -8,10 +8,10 @@ This backend provides operator implementations using the FlagGems library.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Union
 
 import torch
-import os
 
 from vllm_fl.dispatch.backends.base import Backend
 
@@ -32,6 +32,8 @@ class FlagGemsBackend(Backend):
 
     def is_available(self) -> bool:
         """Check if FlagGems is available."""
+        if os.environ.get("VLLM_FL_OCR_TORCH_NPU", "0") == "1":
+            return False
         if FlagGemsBackend._available is None:
             try:
                 import flag_gems  # noqa F401

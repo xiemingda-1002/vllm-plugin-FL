@@ -610,7 +610,15 @@ class ModelRunnerFL(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        self.sampler = Sampler(
+        from vllm_fl.models.ocr_runtime import (
+            configure_ocr_runtime,
+            get_ocr_sampler_cls,
+            ocr_runtime_enabled,
+        )
+
+        configure_ocr_runtime(self.vllm_config)
+        sampler_cls = get_ocr_sampler_cls() if ocr_runtime_enabled() else Sampler
+        self.sampler = sampler_cls(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
         )
@@ -2258,11 +2266,19 @@ class ModelRunnerFL(
         self.seq_lens[num_reqs:].fill_(0)
 
         if self.common_attention_metadata_graph is None:
-            self.input_batch.block_table.compute_slot_mapping(
+            from vllm_fl.models.ocr_runtime import compute_ocr_slot_mapping
+
+            if not compute_ocr_slot_mapping(
+                self.input_batch.block_table,
                 num_reqs,
-                self.query_start_loc.gpu[: num_reqs + 1],
+                req_indices_gpu,
                 self.positions[:total_num_scheduled_tokens],
-            )
+            ):
+                self.input_batch.block_table.compute_slot_mapping(
+                    num_reqs,
+                    self.query_start_loc.gpu[: num_reqs + 1],
+                    self.positions[:total_num_scheduled_tokens],
+                )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2494,6 +2510,15 @@ class ModelRunnerFL(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
         )
+
+        if getattr(self.model_config, "rswa_window", None) is not None:
+            # Preserve the original image/text prefix through chunking/reorder.
+            cm_base.rswa_prefix_lens = (
+                torch.zeros_like(num_prompt_tokens_cpu)
+                if for_cudagraph_capture else num_prompt_tokens_cpu.clone()
+            )
+            cm_base.rswa_prefix_lens[num_reqs:] = 0
+            cm_base.rswa_num_actual_reqs = num_reqs
 
         if self.use_ascend_attention:
             phase = (
@@ -3596,6 +3621,14 @@ class ModelRunnerFL(
             if batch_desc_num_reqs is not None
             else num_reqs
         )
+
+        if (
+            getattr(self.model_config, "rswa_window", None) is not None
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.uniform_decode_query_len == 1
+        ):
+            # One padded request per token keeps capture/replay mask B fixed.
+            num_reqs_padded = num_tokens_padded
 
         if (
             num_tokens_padded
@@ -5440,6 +5473,14 @@ class ModelRunnerFL(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                from vllm_fl.models.ocr_runtime import audit_ocr_model
+
+                ocr_manifest = audit_ocr_model(self.model)
+                if ocr_manifest:
+                    logger.info("FL OCR compute audit: %s", ocr_manifest)
+                    from vllm_fl.models.ocr_runtime import install_execution_audit
+
+                    install_execution_audit(self.model)
                 get_state_cls = getattr(self.model, "get_legacy_model_state_cls", None)
                 if get_state_cls is not None:
                     self.model_state = get_state_cls()(self)
@@ -5531,6 +5572,11 @@ class ModelRunnerFL(
         # All model modules are loaded now, while compilation and CUDA Graph
         # capture have not started yet. Resolve CachedOps outside either graph.
         prewarm_cached_ops()
+        from vllm_fl.models.ocr_runtime import audit_ocr_dispatch
+
+        ocr_dispatch = audit_ocr_dispatch()
+        if ocr_dispatch:
+            logger.info("FL OCR resolved dispatch: %s", ocr_dispatch)
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
