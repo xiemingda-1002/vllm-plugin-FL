@@ -2,12 +2,13 @@
 
 ## Model weights
 
-Set `model` in the [example](../examples/minimax_m31_offline_inference.py)
-to the local MiniMax-M3.1-Flash checkpoint directory in your deployment
-environment:
+Pass your local MiniMax-M3.1-Flash checkpoint directory with the required
+`--model` argument to the [example](../examples/minimax_m31_offline_inference.py).
+The example does not require source edits. To inspect the command line without
+loading vLLM or the chip runtime:
 
-```python
-model="/path/to/MiniMax-M3.1-Flash"
+```bash
+python examples/minimax_m31_offline_inference.py --help
 ```
 
 See the official
@@ -42,8 +43,22 @@ From the repository root, inside the configured environment:
 export VLLM_FL_FLAGOS_BLACKLIST_APPEND=pow_scalar,reciprocal,add,gelu,fused_moe,to_copy,copy_,sub,full,w8a8_dynamic_per_token_linear
 
 VLLM_PLUGINS=fl USE_FLAGGEMS=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    python examples/minimax_m31_offline_inference.py
+    python examples/minimax_m31_offline_inference.py --model /path/to/MiniMax-M3.1-Flash
 ```
 
 `VLLM_FL_FLAGOS_BLACKLIST_APPEND` disables the listed FlagGems operators while
 preserving platform defaults. Other FlagGems operators remain enabled.
+
+## Fused quantization targets
+
+Dense attention and vision QKV projections use the three checkpoint names
+`q_proj`, `k_proj`, and `v_proj`. Sparse attention additionally fuses
+`index_q_proj` and `index_k_proj` into its QKV projection. The plugin supplies
+the five-member mapping only to that sparse linear layer's quantization
+configuration, preserving the shared dense/vision mapping and other rules.
+
+When using per-layer quantization targets or exclusions, all members of a
+fused projection must follow the upstream vLLM matching rules. Sparse QKV
+requires all five member targets to match; partially excluding its members
+raises the upstream mixed-scheme error. Whole-layer and layer-type targets
+continue through the original vLLM matching path.

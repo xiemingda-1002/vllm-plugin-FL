@@ -5,12 +5,23 @@
 See docs/minimax-m31.md for checkpoint configuration and environment requirements.
 """
 
-from vllm import LLM, SamplingParams
+import argparse
 
-if __name__ == "__main__":
-    # Replace this placeholder with your local model checkpoint path.
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Path to the local MiniMax-M3.1-Flash checkpoint.",
+    )
+    args = parser.parse_args()
+
+    # Parse help and validate the command line before loading the chip runtime.
+    from vllm import LLM, SamplingParams
+
     llm = LLM(
-        model="/path/to/MiniMax-M3.1-Flash",
+        model=args.model,
         tensor_parallel_size=8,
         trust_remote_code=True,
         block_size=128,
@@ -32,3 +43,7 @@ if __name__ == "__main__":
     outputs = llm.chat(messages, SamplingParams(max_tokens=64, temperature=0.0))
     for output in outputs:
         print(f"Generated: {output.outputs[0].text!r}")
+
+
+if __name__ == "__main__":
+    main()

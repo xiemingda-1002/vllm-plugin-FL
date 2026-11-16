@@ -10,8 +10,16 @@ from vllm.models.minimax_m3 import (
     MiniMaxM3SparseForCausalLM,
     MiniMaxM3SparseForConditionalGeneration,
 )
+from vllm.platforms import current_platform
 
 from .minimax_m3_registration import add_fused_quantization_mapping
+
+if current_platform.is_cuda():
+    from vllm.models.minimax_m3.nvidia import model as _upstream_model
+
+    from vllm_fl.quantization.minimax_m3 import install_indexer_quantization_mapping
+
+    install_indexer_quantization_mapping(_upstream_model)
 
 for _model_cls in (
     MiniMaxM3SparseForCausalLM,
