@@ -50,6 +50,7 @@ class AscendBackend(Backend):
     def minimax_m3_sparse_kernels(self):
         from .impl.minimax_m3_sparse import MiniMaxM3SparseKernels
 
+        MiniMaxM3SparseKernels.prepare()
         return MiniMaxM3SparseKernels
 
     def qkv_rmsnorm_rope(self, *args, **kwargs):

@@ -190,6 +190,15 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
+        if getattr(current_platform, "vendor_name", None) == "ascend":
+            from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_minimax_m3 import (
+                apply_minimax_m3_patches,
+            )
+
+            # Spawned workers receive an already-constructed VllmConfig and
+            # need their own process-local adapters before model construction.
+            apply_minimax_m3_patches(vllm_config)
+
         if fl_envs.USE_FLAGGEMS:
             import flag_gems
 

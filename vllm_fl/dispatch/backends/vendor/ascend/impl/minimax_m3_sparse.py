@@ -1,52 +1,77 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Same-layout M3 cache, indexer and sparse-attend kernel bundle.
+# Copyright (c) 2026 BAAI. All rights reserved.
+"""Vendor adapter for the public MiniMax operator bundle.
 
-Methods mutate caches/output and must be called directly once selected: no
-dispatcher exception fallback is safe after a partial cache write. Metadata,
-allocation and the enclosing opaque op remain owned by the model/runtime.
+Framework code owns metadata, cache/workspace allocation and graph lifetime.
+The selected bundle calls operator APIs directly; execution errors never retry.
 """
 
+import os
+
 import torch
+from flaggems_vllm import (
+    apply_minimax_m3_rotary_ascend,
+    attend_minimax_m3_sparse_ascend,
+    fused_minimax_m3_qknorm_rope_kv_insert_ascend,
+    insert_minimax_m3_index_cache_ascend,
+    insert_minimax_m3_kv_cache_ascend,
+    load_minimax_m3_ascend_native,
+    minimax_m3_index_decode_ascend,
+    minimax_m3_index_score_ascend,
+    minimax_m3_index_topk_ascend,
+    prepare_minimax_m3_gemma_weight_ascend,
+)
 
 
 class MiniMaxM3SparseKernels:
     cache_contract = "minimax_m3_paged_v1"
     replay_contract = "persistent_metadata_v1"
 
+    qknorm_rope_cache = staticmethod(fused_minimax_m3_qknorm_rope_kv_insert_ascend)
+    rotary = staticmethod(apply_minimax_m3_rotary_ascend)
+    gemma_weight = staticmethod(prepare_minimax_m3_gemma_weight_ascend)
+    index_score = staticmethod(minimax_m3_index_score_ascend)
+    index_topk = staticmethod(minimax_m3_index_topk_ascend)
+    index_decode = staticmethod(minimax_m3_index_decode_ascend)
+    insert_main_cache = staticmethod(insert_minimax_m3_kv_cache_ascend)
+    insert_index_cache = staticmethod(insert_minimax_m3_index_cache_ascend)
+    attend = staticmethod(attend_minimax_m3_sparse_ascend)
+
     @staticmethod
-    def insert_main_cache(cache, slots, key, value, block_size, *, plane_major):
-        from .linearnorm.minimax_m3_qknorm_rope import _insert_kv
-
-        _insert_kv(cache, slots, key, value, block_size, plane_major=plane_major)
+    def prepare():
+        """Load and check the independent vendor payload before cache writes."""
+        activation = getattr(torch.ops.npu, "npu_clipped_swiglu", None)
+        required = {"alpha", "limit", "bias", "interleaved"}
+        schemas = getattr(activation, "_schemas", {})
+        if not callable(activation) or not any(
+            required.issubset({arg.name for arg in schema.arguments})
+            for schema in schemas.values()
+        ):
+            raise RuntimeError(
+                "MiniMax-M3 requires the compatible NPU clipped-SwiGLU API"
+            )
+        if os.environ.get("VLLM_FL_M3_NPU_SPARSE_ATTN", "1") == "1":
+            load_minimax_m3_ascend_native()
+            if not callable(
+                getattr(
+                    torch.ops._flaggems_m3_ascend, "npu_sparse_attention_score", None
+                )
+            ):
+                raise RuntimeError(
+                    "MiniMax-M3 operator bundle lacks native sparse attention"
+                )
 
     @staticmethod
-    def insert_index_cache(cache, slots, key, block_size):
-        from .linearnorm.minimax_m3_qknorm_rope import _insert_index_k
-
-        _insert_index_k(cache, slots, key, block_size)
+    def activation(x, *, alpha, limit, bias):
+        # This is a genuine vendor API adapter, not a reference implementation.
+        return torch.ops.npu.npu_clipped_swiglu(
+            x,
+            alpha=alpha,
+            limit=limit,
+            bias=bias,
+            interleaved=False,
+        )
 
     @staticmethod
     def run_attention(layer, query, index_query, output):
-        # Keep the existing indexer + attend ordering and capture boundary.
+        # Keep the runtime-owned indexer/attend ordering and capture boundary.
         layer._run_attention(query, index_query, output)
-
-    @staticmethod
-    def attend(
-        query, cache, topk, block_table, seq_lens, query_lens,
-        num_kv_heads, scale, block_size, output, *, plane_major,
-    ):
-        if cache.ndim != 5 or cache.shape[0 if plane_major else 1] != 2:
-            raise ValueError("MiniMax main cache does not match its declared layout")
-        key, value = (cache[0], cache[1]) if plane_major else (cache[:, 0], cache[:, 1])
-        result = torch.ops._C_ascend.npu_sparse_attention_score(
-            query, key, value, topk, block_table,
-            selectNumIdx=(topk >= 0).sum(dim=-1).to(dtype=torch.int32),
-            actualSeqLengths=query_lens,
-            actualSeqLengthsKv=seq_lens,
-            numKeyValueHeads=num_kv_heads,
-            scaleValue=scale,
-            blockSize=block_size,
-            topK=topk.shape[-1],
-            innerPrecise=4,
-        )
-        output.copy_(result)

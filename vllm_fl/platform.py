@@ -478,6 +478,13 @@ class PlatformFL(Platform):
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
+        if getattr(cls, "vendor_name", None) == "ascend" and model_config is not None:
+            from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_minimax_m3 import (
+                apply_minimax_m3_patches,
+            )
+
+            apply_minimax_m3_patches(vllm_config)
+
         parallel_config.worker_cls = "vllm_fl.worker.worker.WorkerFL"
 
         cache_config = vllm_config.cache_config

@@ -28,7 +28,11 @@ def get_minimax_sparse_kernels():
         raise ValueError("MiniMax provider must preserve minimax_m3_paged_v1 caches")
     if getattr(kernels, "replay_contract", None) != "persistent_metadata_v1":
         raise ValueError("MiniMax provider must preserve persistent metadata replay")
-    for method in ("insert_main_cache", "insert_index_cache", "run_attention", "attend"):
+    for method in (
+        "insert_main_cache", "insert_index_cache", "run_attention", "attend",
+        "qknorm_rope_cache", "rotary", "gemma_weight", "activation",
+        "index_score", "index_topk", "index_decode",
+    ):
         if not callable(getattr(kernels, method, None)):
             raise TypeError(f"MiniMax sparse provider must supply {method}")
     return kernels

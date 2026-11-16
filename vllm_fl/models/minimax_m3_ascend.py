@@ -254,7 +254,11 @@ def _gemma_plus_one(layer, module_name: str, cache_attr: str) -> torch.Tensor:
     cached = getattr(layer, cache_attr, None)
     if cached is not None:
         return cached
-    return 1.0 + getattr(layer, module_name).weight
+    from vllm_fl.dispatch.backends.vendor.ascend.attention_selector import (
+        get_minimax_sparse_kernels,
+    )
+
+    return get_minimax_sparse_kernels().gemma_weight(getattr(layer, module_name).weight)
 
 
 def cache_gemma_plus_one_weights(model) -> int:
@@ -263,7 +267,12 @@ def cache_gemma_plus_one_weights(model) -> int:
     Called after weight loading. Falls back to computing on the fly (see
     :func:`_gemma_plus_one`) so a missed module is correct, only slower.
     """
-    cached = 0
+    from vllm_fl.dispatch.backends.vendor.ascend.attention_selector import (
+        get_minimax_sparse_kernels,
+    )
+
+    kernels = get_minimax_sparse_kernels()
+    prepared = []
     for module in model.modules():
         for module_name, weight_attr, cache_attr in _GEMMA_PLUS_ONE_ATTRS:
             norm = getattr(module, module_name, None)
@@ -277,9 +286,12 @@ def cache_gemma_plus_one_weights(model) -> int:
             if weight is None:
                 continue
             # Detach: this is a derived constant, not a trainable parameter.
-            object.__setattr__(module, cache_attr, (1.0 + weight).detach())
-            cached += 1
-    return cached
+            prepared.append((module, cache_attr, kernels.gemma_weight(weight)))
+    # Publish only after every derived weight succeeds. A computation failure
+    # leaves prior caches intact and propagates; it never retries another API.
+    for module, cache_attr, weight in prepared:
+        object.__setattr__(module, cache_attr, weight)
+    return len(prepared)
 
 
 def _qkv_rmsnorm_rope(
@@ -349,7 +361,6 @@ def _install_official_gemma_rmsnorm() -> bool:
         return True
 
     _up.MiniMAXGemmaRMSNorm = _Official
-    _Official._fl_official_swap = True  # type: ignore[attr-defined]
     _rmsnorm_patched = True
     logger.info(
         "MiniMax-M3: MiniMAXGemmaRMSNorm -> vLLM GemmaRMSNorm (CustomOp contract; "
@@ -368,15 +379,9 @@ class _GemmaPlusOneCacheMixin:
 
     def load_weights(self, weights):
         result = super().load_weights(weights)
-        try:
-            n = cache_gemma_plus_one_weights(self)
-            if n:
-                logger.info(
-                    "MiniMax-M3: precomputed 1+w for %d Gemma norms "
-                    "(removes per-step Adds on constant weights)", n
-                )
-        except Exception as exc:  # pragma: no cover - cache is an optimisation
-            logger.warning("MiniMax-M3: Gemma 1+w caching skipped: %s", exc)
+        n = cache_gemma_plus_one_weights(self)
+        if n:
+            logger.info("MiniMax-M3: prepared %d derived Gemma weights", n)
         return result
 
 
@@ -580,7 +585,8 @@ def install_ascend_minimax_m3_model() -> bool:
         return False
 
     _register_ops()
-    _install_official_gemma_rmsnorm()
+    if not _install_official_gemma_rmsnorm():
+        raise RuntimeError("MiniMax-M3 requires the upstream GemmaRMSNorm layer")
 
     from vllm.models.minimax_m3.nvidia import model as _up
 

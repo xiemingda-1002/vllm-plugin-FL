@@ -86,3 +86,42 @@ NVIDIA compatibility exclusions are loaded automatically from `nvidia.yaml`.
 No deployment blacklist append or CUDA/NCCL workaround is required. Validate
 both modes with the original model gates when updating FlagGems or the fused
 release.
+
+## MiniMax-M3 on Ascend
+
+The Ascend MiniMax-M3 adapters require the matching FlagGems-vllm MiniMax
+operator bundle independently of `VLLM_FL_USE_FLAGGEMS_VLLM`. The pinned CUDA
+release above does not supply these Ascend APIs. Do not substitute that release
+for the paired MiniMax operator build. Missing or incompatible APIs fail before
+any upstream MiniMax adapter is installed.
+
+The operator bundle provides normalization/RoPE, indexer, cache insertion,
+derived Gemma weights, and sparse attention through public `flaggems_vllm`
+exports. Its sparse attention library uses the independent
+`_flaggems_m3_ascend` Torch namespace and its own CANN operator package; it must
+be built with the target Torch/NPU/CANN toolchain. It does not reuse the plugin's
+`_C_ascend` sparse-attention payload. Cache allocation, slot/block metadata,
+workspace ownership, and graph lifetime remain in the framework.
+
+Use BF16 model weights and `--kv-cache-dtype auto`. Quantized cache formats are
+rejected before mutation. The fused Ascend QK-norm/cache API supports head size
+128, a positive even rotary dimension up to 128, contiguous BF16 QKV, and BF16
+cos/sin cache. Other shapes or formats require an operator implementation that
+explicitly supports the same contract. MiniMax vision rotary supports partial
+NeoX and interleaved rotation through its dedicated public API.
+
+Adapters are installed only for Ascend MiniMax configurations, both during
+platform configuration and in freshly spawned workers. Activation and vision
+rotary bindings remain local to MiniMax modules; no FlashInfer package stub,
+global rotary/activation OOT replacement, or extra model registry is installed.
+Required installation failures roll back Python bindings and propagate to the
+caller. Operator schemas are prepared as inert process-lifetime capabilities
+before bindings change; a schema-registration failure requires a fresh process.
+
+The paired source changes must be delivered and assigned an immutable,
+team-accessible operator release/commit before replacing the shared CI pin.
+Until that release exists, the ordinary CI installer is not a MiniMax Ascend
+installation recipe. Hardware verification must use the paired build, not an
+unmodified public release. Restart the process when changing provider policy or
+updating the operator bundle; stateful cache execution never retries another
+backend after an error.
