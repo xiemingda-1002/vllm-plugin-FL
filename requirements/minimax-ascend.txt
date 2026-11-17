@@ -1,0 +1,13 @@
+# Optional MiniMax BF16 Ascend provider ABI pins; not the default FL runtime.
+# Use an isolated A3 CANN environment and the source-build recipe in
+# docs/minimax-m3-ascend.md. Do not install into another vendor's environment.
+torch==2.10.0
+torch-npu==2.10.0.post2
+torchvision==0.25.0
+torchaudio==2.10.0
+triton-ascend==3.2.1
+transformers==5.13.0
+# vLLM v0.24.0, built with VLLM_TARGET_DEVICE=empty on Ascend.
+vllm @ git+https://github.com/vllm-project/vllm.git@ee0da84ab9e04ac7610e28580af62c365e898389
+# Official vllm-ascend v0.24.0rc1, including its A3 native build payload.
+vllm-ascend @ git+https://github.com/vllm-project/vllm-ascend.git@412cda26814ff70c326f6eb6510f1b610f67bbc0

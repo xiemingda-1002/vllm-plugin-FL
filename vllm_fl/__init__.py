@@ -5,7 +5,6 @@ import logging
 import os
 import sys
 
-
 # torch.float4_e2m1fn_x2 exists only in CUDA builds of PyTorch 2.7+.
 # vllm.ir.tolerances references it at module level, so we inject a sentinel
 # before any vllm.ir import can happen.
@@ -20,8 +19,11 @@ else:
         _torch.float4_e2m1fn_x2 = _torch.uint8
 del _torch
 
+from vllm_fl.models.minimax_m3_ascend_runtime import enabled as _minimax_ascend_enabled
+
 try:
-    from vllm_fl.utils import get_op_config as _get_op_config
+    if not _minimax_ascend_enabled():
+        from vllm_fl.utils import get_op_config as _get_op_config
 except ModuleNotFoundError as exc:
     # The native GLM5-Next baseline reuses only this package's config/model
     # modules and deliberately does not install or activate FlagGems.
@@ -153,6 +155,15 @@ def _init_vendor_device():
 
 def register():
     """Register the FL platform."""
+    if _minimax_ascend_enabled():
+        from vllm_fl.models.minimax_m3_ascend_runtime import (
+            PLATFORM_PATH,
+            check_dependencies,
+        )
+
+        check_dependencies()
+        return PLATFORM_PATH
+
     _init_vendor_device()
 
     # PlatformFL is accelerator-shaped. For the standard FlagGems ARM target,
@@ -246,6 +257,12 @@ def _patch_ascend_torch_accelerator() -> None:
 
 def register_model():
     """Register FL-specific models not yet upstream."""
+    if _minimax_ascend_enabled():
+        from vllm_fl.models.minimax_m3_ascend_runtime import register_general_plugins
+
+        register_general_plugins()
+        return
+
     _patch_ascend_torch_accelerator()
 
     # General plugins are loaded independently in spawned model-inspection and

@@ -35,7 +35,12 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | BAAI/bge-m3 | Supported | [implementation](./vllm_fl/models/bge_m3.py) |
 | MiniMax-M2.7 | Supported | [implementation](./examples/minimax_m27_offline_inference.py) |
 | MiniMax-M3.1-Flash | Supported | [example](./examples/minimax_m31_offline_inference.py) / [deployment guide](./docs/minimax-m31.md) |
+| MiniMax-M3 BF16 (Ascend A3) | Integrated; target hardware unverified | [example](./examples/minimax_m3_ascend_offline_inference.py) / [runtime guide](./docs/minimax-m3-ascend.md) |
 | HY4-Preview | Merging (NVIDIA) | [installation](#hy4-on-nvidia) |
+
+The opt-in [MiniMax-M3 BF16 Ascend A3 runtime](./docs/minimax-m3-ascend.md)
+reuses the complete, fixed-version vendor platform in a dedicated process.
+Its integration status does not claim end-to-end hardware validation.
 
 ### Supported Chips
 
