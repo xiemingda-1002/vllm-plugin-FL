@@ -48,17 +48,3 @@ VLLM_PLUGINS=fl USE_FLAGGEMS=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 
 `VLLM_FL_FLAGOS_BLACKLIST_APPEND` disables the listed FlagGems operators while
 preserving platform defaults. Other FlagGems operators remain enabled.
-
-## Fused quantization targets
-
-Dense attention and vision QKV projections use the three checkpoint names
-`q_proj`, `k_proj`, and `v_proj`. Sparse attention additionally fuses
-`index_q_proj` and `index_k_proj` into its QKV projection. The plugin supplies
-the five-member mapping only to that sparse linear layer's quantization
-configuration, preserving the shared dense/vision mapping and other rules.
-
-When using per-layer quantization targets or exclusions, all members of a
-fused projection must follow the upstream vLLM matching rules. Sparse QKV
-requires all five member targets to match; partially excluding its members
-raises the upstream mixed-scheme error. Whole-layer and layer-type targets
-continue through the original vLLM matching path.
